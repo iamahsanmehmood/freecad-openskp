@@ -37,6 +37,12 @@ import time
 import FreeCAD as App
 import Part
 
+# Captured before this module defines its own `open()` below (FreeCAD's
+# own import-module contract requires that exact name) - export() needs
+# the real builtin to write the output file, not FreeCAD's file-open
+# handler this module itself becomes.
+_real_open = open
+
 INCH_TO_MM = 25.4
 IDENTITY_13 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
 
@@ -238,3 +244,75 @@ def insert(filename, docname):
         doc = App.newDocument(docname)
     App.ActiveDocument = doc
     return import_skp(filename, doc)
+
+
+def _wire_points_inches(wire, placement):
+    """A wire's ordered vertex points, in world space (via the object's
+    global placement) and converted from FreeCAD's native millimetres
+    back to SketchUp's native inches. No closing/repeated final point -
+    openskp's add_face expects the polygon open, matching how
+    OrderedVertexes already returns it."""
+    pts = []
+    for v in wire.OrderedVertexes:
+        p = placement.multVec(v.Point)
+        pts.append((p.x / INCH_TO_MM, p.y / INCH_TO_MM, p.z / INCH_TO_MM))
+    return pts
+
+
+def _add_shape_faces(builder, shape, placement, stats):
+    for face in shape.Faces:
+        outer = face.OuterWire
+        outer_pts = _wire_points_inches(outer, placement)
+        if len(outer_pts) < 3:
+            stats["faces_skipped"] += 1
+            continue
+        holes = []
+        for w in face.Wires:
+            if w.isSame(outer):
+                continue
+            hole_pts = _wire_points_inches(w, placement)
+            if len(hole_pts) >= 3:
+                holes.append(hole_pts)
+        try:
+            builder.add_face(outer_pts, holes=holes)
+            stats["faces_written"] += 1
+        except Exception:
+            # A degenerate/non-planar/self-intersecting face from
+            # arbitrary FreeCAD geometry (e.g. a curved NURBS face
+            # flattened badly, or a sliver from a boolean operation)
+            # isn't something openskp's writer can represent - skip it
+            # rather than aborting the whole export.
+            stats["faces_skipped"] += 1
+
+
+def export(exportList, filename):
+    """Called by FreeCAD when exporting to .skp (File > Export).
+
+    Every Part::Feature (and anything else exposing a real .Shape) in
+    exportList is flattened into a single, flat set of faces at the
+    root of a new .skp file - global placement resolved so nested/linked
+    objects land in the right position. No component/group structure is
+    reconstructed (there's no reliable way to infer "this should be one
+    reusable component" purely from arbitrary FreeCAD geometry), and
+    materials/layers aren't carried over - geometry only, matching the
+    import side's own stated scope.
+    """
+    from openskp import create
+
+    builder = create()
+    stats = {"faces_written": 0, "faces_skipped": 0, "objects_skipped": 0}
+
+    for obj in exportList:
+        if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
+            stats["objects_skipped"] += 1
+            continue
+        placement = obj.getGlobalPlacement() if hasattr(obj, "getGlobalPlacement") else obj.Placement
+        _add_shape_faces(builder, obj.Shape, placement, stats)
+
+    with _real_open(filename, "wb") as f:
+        f.write(builder.to_bytes())
+
+    print(
+        f"openskp export: {stats['faces_written']} faces written, "
+        f"{stats['faces_skipped']} skipped, {stats['objects_skipped']} objects skipped"
+    )

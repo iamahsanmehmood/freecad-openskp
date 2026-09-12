@@ -7,16 +7,32 @@ this addon.
 
 ## What it does
 
-Parses a `.skp` file's real geometry (planar faces and loops, not a
-triangulated mesh) and rebuilds it as native FreeCAD `Part.Face` /
-`Part.Compound` B-rep geometry — walking the full placed scene graph
+**Import** parses a `.skp` file's real geometry (planar faces and loops,
+not a triangulated mesh) and rebuilds it as native FreeCAD `Part.Face` /
+`Part.Compound` B-rep geometry - walking the full placed scene graph
 (components, groups, nested instances) and composing world-space
 transforms, so a component placed 50 times ends up in the right 50
 places, not just modeled once.
 
-**Not yet carried over:** materials, layers, and layer visibility. Geometry
-only, for now — a face's shape and position import correctly; its color and
-which layer it lives on do not (yet).
+Each *unique* component/group definition's geometry is built exactly
+once and cached; every placement after the first is a cheap
+`Shape.copy()` + `transformShape()`, not a rebuild from scratch. This
+matters a lot in practice - see the large-file numbers below.
+
+**Export** (File -> Export, or File -> Save As with a .skp extension)
+flattens the selected FreeCAD objects' faces (global placement
+resolved, so translated/nested objects land in the right world
+position) into a new .skp file - each face's outer boundary and any
+holes preserved. There's no way to infer "this should be one reusable
+component" purely from arbitrary FreeCAD geometry, so export doesn't
+reconstruct component/group structure - everything lands flat at the
+file's root. Round-trip-verified: exported coordinates match the
+original geometry exactly (see tests/test_export.py).
+
+**Not yet carried over, either direction:** materials, layers, and layer
+visibility. Geometry only, for now - a face's shape and position import
+and export correctly; its color and which layer it lives on do not
+(yet).
 
 ## Installation
 
