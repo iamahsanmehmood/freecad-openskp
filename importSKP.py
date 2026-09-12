@@ -1,4 +1,4 @@
-"""FreeCAD importer for native SketchUp (.skp) files, built on OpenSKP.
+"""FreeCAD importer/exporter for native SketchUp (.skp) files, built on OpenSKP.
 
 Reads a .skp file's raw parse output (planar faces/loops, not a
 triangulated mesh) and builds real B-rep Part.Face/Part.Compound

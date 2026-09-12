@@ -1,7 +1,8 @@
-# OpenSKP Importer for FreeCAD
+# OpenSKP Import/Export for FreeCAD
 
-Native SketchUp (`.skp`) import for FreeCAD — built on [OpenSKP](https://github.com/iamahsanmehmood/openskp),
-an MIT-licensed, from-scratch `.skp` reader. No Trimble SDK, no SketchUp
+Native SketchUp (`.skp`) import **and export** for FreeCAD — built on
+[OpenSKP](https://github.com/iamahsanmehmood/openskp), an MIT-licensed,
+from-scratch `.skp` reader/writer. No Trimble SDK, no SketchUp
 installation, no compiled extension — pure Python, vendored directly into
 this addon.
 
