@@ -112,7 +112,7 @@ def _make_face_shape(definition, face):
             return None
 
 
-def _get_local_shape(definition, model, stats, shape_cache, visiting):
+def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=None):
     """Returns `definition`'s own geometry (its faces plus every nested
     instance's geometry, transformed into this definition's local
     space), built exactly once per unique definition and cached by
@@ -137,7 +137,7 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting):
         child_def = model.definitions.get(inst.ref_idx)
         if child_def is None:
             continue
-        child_local = _get_local_shape(child_def, model, stats, shape_cache, visiting)
+        child_local = _get_local_shape(child_def, model, stats, shape_cache, visiting, progress)
         if child_local is None:
             continue
         stats["placements"] += 1
@@ -149,10 +149,15 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting):
     shape_cache[key] = result
 
     # A real building-scale file can have thousands of unique definitions;
-    # each print flush is cheap next to the geometric-kernel work already
-    # happening, and a totally silent multi-minute call looks identical to
-    # a hang from the outside - print every 200 so it doesn't.
-    if len(shape_cache) % 200 == 0:
+    # a totally silent multi-minute call looks identical to a hang from
+    # the outside without some visible sign of progress. The GUI gets
+    # FreeCAD's own native progress bar (Base.ProgressIndicator, the same
+    # mechanism its Draft/DXF importer uses); the console print is the
+    # fallback for headless/freecadcmd runs, where there's no status bar
+    # to draw a bar in at all.
+    if progress is not None:
+        progress.next()
+    elif len(shape_cache) % 200 == 0:
         print(f"  ...{len(shape_cache)} unique definitions built so far")
 
     return result
@@ -182,7 +187,26 @@ def import_skp(filepath, doc=None):
     t0 = time.time()
     stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0}
     shape_cache: dict = {}
-    root_shape = _get_local_shape(model.root, model, stats, shape_cache, frozenset())
+
+    # FreeCAD's own native progress bar (the same Base.ProgressIndicator
+    # its Draft/DXF importer uses) - visible in the GUI's status bar
+    # during the build phase, so a multi-minute import on a large file
+    # shows real, moving progress instead of looking frozen. Total step
+    # count is an upper bound (every definition in the file, not just the
+    # ones actually reachable from the placed scene graph) since the
+    # exact reachable count isn't known without doing the walk first -
+    # close enough for a progress indicator, not exact enough to promise
+    # a precise percentage.
+    progress = None
+    if App.GuiUp:
+        progress = App.Base.ProgressIndicator()
+        progress.start("Building SketchUp geometry...", max(1, len(model.definitions) + 1))
+
+    try:
+        root_shape = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
+    finally:
+        if progress is not None:
+            progress.stop()
 
     if root_shape is not None:
         obj = doc.addObject("Part::Feature", "SketchUpImport")
