@@ -5,21 +5,40 @@ triangulated mesh) and builds real B-rep Part.Face/Part.Compound
 geometry - matching FreeCAD's own CAD-kernel semantics far better than
 importing a triangle soup would.
 
+Instancing: a real building-scale file can place the same component
+definition thousands of times (a stud, a bolt, a window). Building full
+B-rep geometry from scratch for every PLACEMENT rather than every
+UNIQUE definition is not just slower, it's a different complexity class
+- confirmed on a real 5,554-instance/2,747-unique-definition production
+file, where the naive approach required 358,198 individual Part.Face
+constructions (each a real OCC geometric-kernel call) for what is
+actually only 216,981 unique faces. Each unique definition's local-space
+shape is built exactly once and cached; every placement after the first
+is a cheap Shape.copy() + transformShape(), not a rebuild.
+
 Coordinate/unit handling: SketchUp stores geometry in inches; FreeCAD's
-native unit is millimetres, so every point is scaled by 25.4 on the way
-in. SketchUp's own instance-placement matrix is a flat 13-element
-[row-major 3x3 rotation/scale (9) + translation (3) + trailing scale
-scalar (1)] form - verified directly against openskp's own transform_point/
+native unit is millimetres, so every point is scaled by 25.4 once, at
+the point where local-space faces are first built. SketchUp's own
+instance-placement matrix is a flat 13-element [row-major 3x3
+rotation/scale (9) + translation (3) + trailing scale scalar (1)] form
+- verified directly against openskp's own transform_point/
 multiply_matrices in _core.py, not the (currently incorrect) "16-element
-column-major" docstring on the Instance dataclass itself.
+column-major" docstring on the Instance dataclass itself. Only the
+translation component needs the inches->mm scale factor applied when
+converting to a FreeCAD.Matrix; the 3x3 rotation/scale part is a
+dimensionless ratio, unaffected by units.
 """
 from __future__ import annotations
 
 import os
 import sys
+import time
 
 import FreeCAD as App
 import Part
+
+INCH_TO_MM = 25.4
+IDENTITY_13 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
 
 # Vendored copy of the openskp package (pure Python, no compiled wheel) -
 # lets this addon work standalone without asking users to separately
@@ -28,40 +47,16 @@ _VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
 if _VENDOR_DIR not in sys.path:
     sys.path.insert(0, _VENDOR_DIR)
 
-INCH_TO_MM = 25.4
-IDENTITY_13 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
 
-
-def _transform_point(m, p):
-    x, y, z = p
-    return (
-        m[0] * x + m[1] * y + m[2] * z + m[9],
-        m[3] * x + m[4] * y + m[5] * z + m[10],
-        m[6] * x + m[7] * y + m[8] * z + m[11],
+def _to_freecad_matrix(m13):
+    """13-element openskp instance matrix -> FreeCAD.Matrix (row-major
+    4x4), scaling only the translation component to millimetres."""
+    return App.Matrix(
+        m13[0], m13[1], m13[2], m13[9] * INCH_TO_MM,
+        m13[3], m13[4], m13[5], m13[10] * INCH_TO_MM,
+        m13[6], m13[7], m13[8], m13[11] * INCH_TO_MM,
+        0.0, 0.0, 0.0, 1.0,
     )
-
-
-def _multiply(parent, child):
-    """Same math as openskp._core.multiply_matrices - composes two
-    13-element instance-placement matrices, parent-then-child."""
-    p_r0 = [parent[0], parent[1], parent[2], parent[9]]
-    p_r1 = [parent[3], parent[4], parent[5], parent[10]]
-    p_r2 = [parent[6], parent[7], parent[8], parent[11]]
-    c_c0 = [child[0], child[3], child[6], 0]
-    c_c1 = [child[1], child[4], child[7], 0]
-    c_c2 = [child[2], child[5], child[8], 0]
-    c_c3 = [child[9], child[10], child[11], 1]
-
-    def dot(row, col):
-        return sum(r * c for r, c in zip(row, col))
-
-    out = [0.0] * 13
-    out[0], out[1], out[2] = dot(p_r0, c_c0), dot(p_r0, c_c1), dot(p_r0, c_c2)
-    out[3], out[4], out[5] = dot(p_r1, c_c0), dot(p_r1, c_c1), dot(p_r1, c_c2)
-    out[6], out[7], out[8] = dot(p_r2, c_c0), dot(p_r2, c_c1), dot(p_r2, c_c2)
-    out[9], out[10], out[11] = dot(p_r0, c_c3), dot(p_r1, c_c3), dot(p_r2, c_c3)
-    out[12] = parent[12] * child[12]
-    return out
 
 
 def _loop_points(definition, loop):
@@ -74,14 +69,12 @@ def _loop_points(definition, loop):
         v = definition.vertices.get(vid)
         if v is None:
             return None
-        pts.append((v.x, v.y, v.z))
+        pts.append((v.x * INCH_TO_MM, v.y * INCH_TO_MM, v.z * INCH_TO_MM))
     return pts
 
 
-def _make_wire(points_inches, world_matrix):
-    world_pts = [_transform_point(world_matrix, p) for p in points_inches]
-    mm_pts = [(x * INCH_TO_MM, y * INCH_TO_MM, z * INCH_TO_MM) for x, y, z in world_pts]
-    vecs = [App.Vector(*p) for p in mm_pts]
+def _make_wire(points_mm):
+    vecs = [App.Vector(*p) for p in points_mm]
     if len(vecs) < 3:
         return None
     if vecs[0] != vecs[-1]:
@@ -92,13 +85,16 @@ def _make_wire(points_inches, world_matrix):
         return None
 
 
-def _make_face_shape(definition, face, world_matrix):
+def _make_face_shape(definition, face):
+    """Builds one face's shape in the definition's own LOCAL space
+    (no world transform applied - that happens once per placement,
+    cheaply, via _to_freecad_matrix + transformShape)."""
     wires = []
     for loop in face.loops:
         pts = _loop_points(definition, loop)
         if pts is None:
             return None
-        wire = _make_wire(pts, world_matrix)
+        wire = _make_wire(pts)
         if wire is None:
             return None
         wires.append(wire)
@@ -116,55 +112,87 @@ def _make_face_shape(definition, face, world_matrix):
             return None
 
 
-def _walk(model, definition, world_matrix, shapes, stats, seen_ids, depth=0):
-    if depth > 64 or id(definition) in seen_ids:
-        return
-    seen_ids = seen_ids | {id(definition)}
+def _get_local_shape(definition, model, stats, shape_cache, visiting):
+    """Returns `definition`'s own geometry (its faces plus every nested
+    instance's geometry, transformed into this definition's local
+    space), built exactly once per unique definition and cached by
+    identity for the lifetime of this import call."""
+    key = id(definition)
+    if key in shape_cache:
+        return shape_cache[key]
+    if key in visiting:
+        return None  # a real cycle in the instance graph - bail, don't spin
+    visiting = visiting | {key}
+
+    shapes = []
     for face in definition.faces.values():
-        stats["faces_seen"] += 1
-        shape = _make_face_shape(definition, face, world_matrix)
+        stats["faces_built"] += 1
+        shape = _make_face_shape(definition, face)
         if shape is not None:
             shapes.append(shape)
         else:
             stats["faces_skipped"] += 1
+
     for inst in definition.instances:
         child_def = model.definitions.get(inst.ref_idx)
         if child_def is None:
             continue
-        child_world = _multiply(world_matrix, inst.matrix)
-        _walk(model, child_def, child_world, shapes, stats, seen_ids, depth + 1)
+        child_local = _get_local_shape(child_def, model, stats, shape_cache, visiting)
+        if child_local is None:
+            continue
+        stats["placements"] += 1
+        placed = child_local.copy()
+        placed.transformShape(_to_freecad_matrix(inst.matrix))
+        shapes.append(placed)
+
+    result = Part.makeCompound(shapes) if shapes else None
+    shape_cache[key] = result
+
+    # A real building-scale file can have thousands of unique definitions;
+    # each print flush is cheap next to the geometric-kernel work already
+    # happening, and a totally silent multi-minute call looks identical to
+    # a hang from the outside - print every 200 so it doesn't.
+    if len(shape_cache) % 200 == 0:
+        print(f"  ...{len(shape_cache)} unique definitions built so far")
+
+    return result
 
 
 def import_skp(filepath, doc=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
-    Every planar face in the model (walked through the full placed scene
-    graph, definitions/instances resolved and transformed to world space)
-    becomes one Part.Face; all faces are grouped into a single
-    Part::Feature compound. Materials/layers are not yet carried over -
-    geometry only, for now.
+    Every placed instance's geometry (walked through the full scene
+    graph, definitions resolved and cached, each unique definition's
+    shape built exactly once) becomes part of a single Part::Feature
+    compound. Materials/layers are not yet carried over - geometry
+    only, for now.
     """
     import openskp
 
     if doc is None:
         doc = App.ActiveDocument or App.newDocument("SketchUpImport")
 
+    print(f"openskp: parsing {os.path.basename(filepath)} "
+          "(can take a while for a large file - this is real work, not a hang)...")
+    t0 = time.time()
     skp = openskp.SkpFile.open(filepath)
     model = skp.parse()
+    print(f"openskp: parsed in {time.time() - t0:.1f}s, building geometry...")
 
-    shapes = []
-    stats = {"faces_seen": 0, "faces_skipped": 0}
-    _walk(model, model.root, IDENTITY_13, shapes, stats, set())
+    t0 = time.time()
+    stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0}
+    shape_cache: dict = {}
+    root_shape = _get_local_shape(model.root, model, stats, shape_cache, frozenset())
 
-    if shapes:
-        compound = Part.makeCompound(shapes)
+    if root_shape is not None:
         obj = doc.addObject("Part::Feature", "SketchUpImport")
-        obj.Shape = compound
+        obj.Shape = root_shape
 
     doc.recompute()
     print(
-        f"openskp import: {stats['faces_seen']} faces seen, "
-        f"{len(shapes)} imported, {stats['faces_skipped']} skipped"
+        f"openskp: {len(shape_cache)} unique definitions built in {time.time() - t0:.1f}s "
+        f"({stats['faces_built']} faces, {stats['faces_skipped']} skipped), "
+        f"{stats['placements']} instances placed"
     )
     return doc
 
@@ -186,5 +214,3 @@ def insert(filename, docname):
         doc = App.newDocument(docname)
     App.ActiveDocument = doc
     return import_skp(filename, doc)
-
-
