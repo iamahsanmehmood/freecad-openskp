@@ -44,27 +44,26 @@ jobs:
           fi
           echo "freecadcmd=$FREECADCMD" >> "$GITHUB_OUTPUT"
 
-      # Asks FreeCAD's own embedded interpreter for its own sys.executable
-      # rather than guessing a bin/ path - the AppImage's internal layout
-      # isn't part of any stable public contract, so this stays correct
-      # even if it changes between FreeCAD versions.
-      - name: Locate FreeCAD's embedded Python interpreter
-        id: pyloc
-        run: |
-          echo "import sys; print('PYEXE=' + sys.executable)" > _locate_python.py
-          OUT=$("${{ steps.locate.outputs.freecadcmd }}" _locate_python.py)
-          echo "$OUT"
-          PYEXE=$(echo "$OUT" | grep '^PYEXE=' | cut -d= -f2-)
-          rm _locate_python.py
-          echo "pyexe=$PYEXE" >> "$GITHUB_OUTPUT"
-
-      # The vendored openskp package needs these to even import (mapbox_earcut
-      # + numpy are eager imports in _core.py; shapely is a lazy fallback path)
-      # - not a compiled extension of this addon's own, so a normal pip install
-      # into FreeCAD's own embedded interpreter is enough.
+      # `freecadcmd` reports its OWN path as sys.executable (confirmed by
+      # running it) - it's a custom launcher, not a python.exe stand-in, so
+      # it doesn't understand "-m pip" at the shell level ("unrecognised
+      # option '-m'"). Calling pip's own internal API from inside a script
+      # freecadcmd runs works around that without needing a second, separate
+      # python binary that may or may not exist at a guessable path.
+      #
+      # The vendored openskp package needs these to even import
+      # (mapbox_earcut + numpy are eager imports in _core.py; shapely is a
+      # lazy fallback path) - not a compiled extension of this addon's own,
+      # so pip into FreeCAD's embedded interpreter is enough.
       - name: Install openskp's runtime dependencies
         if: steps.cache-freecad.outputs.cache-hit != 'true'
-        run: ${{ steps.pyloc.outputs.pyexe }} -m pip install --quiet mapbox_earcut shapely numpy
+        run: |
+          cat > _pip_install.py <<'PYEOF'
+          from pip._internal.cli.main import main as _pip_main
+          raise SystemExit(_pip_main(["install", "--quiet", "mapbox_earcut", "shapely", "numpy"]))
+          PYEOF
+          ${{ steps.locate.outputs.freecadcmd }} _pip_install.py
+          rm _pip_install.py
 
       - name: Run import tests
         run: ${{ steps.locate.outputs.freecadcmd }} tests/test_import.py
