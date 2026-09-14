@@ -64,10 +64,10 @@ jobs:
       # into FreeCAD's own embedded interpreter is enough.
       - name: Install openskp's runtime dependencies
         if: steps.cache-freecad.outputs.cache-hit != 'true'
-        run: "${{ steps.pyloc.outputs.pyexe }}" -m pip install --quiet mapbox_earcut shapely numpy
+        run: ${{ steps.pyloc.outputs.pyexe }} -m pip install --quiet mapbox_earcut shapely numpy
 
       - name: Run import tests
-        run: "${{ steps.locate.outputs.freecadcmd }}" tests/test_import.py
+        run: ${{ steps.locate.outputs.freecadcmd }} tests/test_import.py
 
       - name: Run export tests
-        run: "${{ steps.locate.outputs.freecadcmd }}" tests/test_export.py
+        run: ${{ steps.locate.outputs.freecadcmd }} tests/test_export.py
