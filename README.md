@@ -37,15 +37,24 @@ and export correctly; its color and which layer it lives on do not
 
 ## Installation
 
-Via FreeCAD's Addon Manager once published there, or manually:
+Not yet published on FreeCAD's Addon Manager. Two ways to install manually:
+
+**Download (no git required)**: grab the zip from the
+[latest release](https://github.com/iamahsanmehmood/freecad-openskp/releases/latest),
+extract it, and copy the resulting `OpenSKPImporter` folder into FreeCAD's
+`Mod/` directory.
+
+**Git clone (to track updates)**:
 
 ```bash
 git clone https://github.com/iamahsanmehmood/freecad-openskp.git
 ```
 
-Copy (or symlink) the cloned folder into FreeCAD's `Mod/` directory
-(`Help → About → "Report an issue"` shows your `Mod/` path if unsure),
-restart FreeCAD, then **File → Open** or **File → Import** a `.skp` file.
+Copy (or symlink) the cloned folder into FreeCAD's `Mod/` directory.
+
+Either way, `Help → About → "Report an issue"` shows your `Mod/` path if
+unsure. Restart FreeCAD, then **File → Open** or **File → Import** a `.skp`
+file.
 
 ## Verification status, stated plainly
 
