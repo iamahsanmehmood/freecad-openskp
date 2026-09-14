@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Builds the same install-ready zip as a manual release: repo content
+      # minus .git/tests/__pycache__, under an OpenSKPImporter/ prefix so
+      # extracting it drops straight into FreeCAD's Mod/ directory.
+      - name: Build release zip
+        run: |
+          python3 - <<'PYEOF'
+          import zipfile, os
+
+          TAG = os.environ["GITHUB_REF_NAME"]
+          OUT = f"freecad-openskp-{TAG}.zip"
+          PREFIX = "OpenSKPImporter"
+          EXCLUDE_DIRS = {".git", "tests", "__pycache__", ".github"}
+
+          with zipfile.ZipFile(OUT, "w", zipfile.ZIP_DEFLATED) as zf:
+              for root, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+                  for fn in files:
+                      full = os.path.join(root, fn)
+                      rel = os.path.relpath(full, ".")
+                      arcname = os.path.join(PREFIX, rel).replace("\\", "/")
+                      zf.write(full, arcname)
+          print("wrote", OUT)
+          PYEOF
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "$TAG" "freecad-openskp-${TAG}.zip" \
+            --title "$TAG" \
+            --generate-notes

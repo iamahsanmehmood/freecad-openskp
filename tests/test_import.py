@@ -19,6 +19,15 @@ FIXTURES_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "fixtures"
 )
 
+# Expected (faces, invalid, nan_area) per fixture - from the README's own
+# "Verification status" table. A real regression (a suddenly-degenerate
+# import) must fail this test, not just print a different number - that's
+# the whole point of pinning these rather than only checking "didn't crash."
+EXPECTED = {
+    "SU_File.skp": (32, 0, 0),
+    "capilla_quiroz_v17.skp": (192, 0, 0),
+}
+
 
 def check(fixture_name):
     path = os.path.join(FIXTURES_DIR, fixture_name)
@@ -30,11 +39,14 @@ def check(fixture_name):
         faces = objs[0].Shape.Faces
         invalid = [f for f in faces if not f.isValid()]
         nan_area = [f for f in faces if math.isnan(f.Area)]
-        print(
-            f"{fixture_name}: {len(faces)} faces, "
-            f"{len(invalid)} invalid, {len(nan_area)} NaN-area"
-        )
-        return len(faces), len(invalid), len(nan_area)
+        got = (len(faces), len(invalid), len(nan_area))
+        print(f"{fixture_name}: {got[0]} faces, {got[1]} invalid, {got[2]} NaN-area")
+        expected = EXPECTED.get(fixture_name)
+        if expected is not None:
+            assert got == expected, (
+                f"{fixture_name}: expected {expected} (faces, invalid, nan_area), got {got}"
+            )
+        return got
     finally:
         App.closeDocument(doc.Name)
 
@@ -43,6 +55,11 @@ def check(fixture_name):
 # (e.g. "test_import"), not "__main__" like a normal Python interpreter -
 # so this runs unconditionally at import time rather than behind an
 # `if __name__ == "__main__"` guard, which would silently never fire here.
+_checked = 0
 for _name in os.listdir(FIXTURES_DIR):
     if _name.endswith(".skp"):
         check(_name)
+        _checked += 1
+assert _checked == len(EXPECTED), (
+    f"expected to check {len(EXPECTED)} fixtures, found {_checked} .skp files in {FIXTURES_DIR}"
+)
