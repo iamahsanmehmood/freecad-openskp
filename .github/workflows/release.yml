@@ -31,6 +31,12 @@ jobs:
               for root, dirs, files in os.walk("."):
                   dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
                   for fn in files:
+                      # os.walk() picks up OUT itself mid-write (it lives in
+                      # the same directory being walked) without this - found
+                      # by actually running this same script in the
+                      # blender-openskp sibling repo, not guessed.
+                      if fn.endswith(".zip"):
+                          continue
                       full = os.path.join(root, fn)
                       rel = os.path.relpath(full, ".")
                       arcname = os.path.join(PREFIX, rel).replace("\\", "/")
