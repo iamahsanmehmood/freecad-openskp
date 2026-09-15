@@ -5,7 +5,8 @@
 Round-trips real FreeCAD geometry (a face with a hole, plus a
 translated box) through export() and back through openskp's own
 Python reader, checking structure (loop counts) and exact coordinates
-survive the mm<->inch conversion.
+survive the mm<->inch conversion. Also checks layer (SketchUp "tag")
+export: each object's own Label becomes its exported layer.
 """
 import os
 import sys
@@ -57,6 +58,18 @@ def run():
     loop_counts = sorted(len(f.loops) for f in model.root.faces.values())
     assert loop_counts == [1, 1, 1, 1, 1, 1, 2], loop_counts
 
+    # Layer export: obj1 ("FaceWithHole", 1 face) and obj2 ("Box", 6
+    # faces) have different Labels, so must land in 2 distinct Face.layer
+    # groups of the right size - not just "some layer got written."
+    layer_names = sorted(l.name for l in model.layers)
+    assert layer_names == ["Box", "FaceWithHole", "Layer0"], layer_names
+    by_layer = {}
+    for f in model.root.faces.values():
+        by_layer.setdefault(f.layer, 0)
+        by_layer[f.layer] += 1
+    assert len(by_layer) == 2, f"expected 2 distinct Face.layer groups (one per object), got {by_layer}"
+    assert sorted(by_layer.values()) == [1, 6], by_layer
+
     # exact-coordinate check on the hole-bearing face's outer boundary -
     # confirms the mm<->inch round trip is lossless, not just structurally
     # plausible
@@ -71,7 +84,10 @@ def run():
     expected = {(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0, 100.0, 0.0)}
     assert set(pts_mm) == expected, (pts_mm, expected)
 
-    print("export round-trip: OK (7 faces, loop counts", loop_counts, ", coordinates exact)")
+    print(
+        "export round-trip: OK (7 faces, loop counts", loop_counts,
+        ", coordinates exact, layers", layer_names, ")"
+    )
 
 
 # Note: freecadcmd runs a script file as a module named after the file,

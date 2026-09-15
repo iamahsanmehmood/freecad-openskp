@@ -59,6 +59,13 @@ case is tagging a whole group/component, not individual faces within an
 untagged one, and Face.layer has no public id->name lookup exposed by
 openskp yet to resolve against anyway (same scope cut as materials'
 layer-color fallback, see _resolve_face_color's own docstring).
+
+Layer EXPORT is the clean inverse of this: each exported object's own
+Label becomes its layer (see export()'s own docstring) - since import
+already produces exactly one object per layer with Label set to the
+real layer name, re-exporting an unmodified, just-imported set of layer
+objects reproduces the same tags exactly, verified directly on a real
+production file (see tests/test_export.py and the README).
 """
 from __future__ import annotations
 
@@ -450,7 +457,7 @@ def _wire_points_inches(wire, placement):
     return pts
 
 
-def _add_shape_faces(builder, shape, placement, stats):
+def _add_shape_faces(builder, shape, placement, stats, layer):
     for face in shape.Faces:
         outer = face.OuterWire
         outer_pts = _wire_points_inches(outer, placement)
@@ -465,7 +472,7 @@ def _add_shape_faces(builder, shape, placement, stats):
             if len(hole_pts) >= 3:
                 holes.append(hole_pts)
         try:
-            builder.add_face(outer_pts, holes=holes)
+            builder.add_face(outer_pts, holes=holes, layer=layer)
             stats["faces_written"] += 1
         except Exception:
             # A degenerate/non-planar/self-intersecting face from
@@ -480,30 +487,57 @@ def export(exportList, filename):
     """Called by FreeCAD when exporting to .skp (File > Export).
 
     Every Part::Feature (and anything else exposing a real .Shape) in
-    exportList is flattened into a single, flat set of faces at the
-    root of a new .skp file - global placement resolved so nested/linked
-    objects land in the right position. No component/group structure is
+    exportList is flattened into a flat set of faces at the root of a
+    new .skp file - global placement resolved so nested/linked objects
+    land in the right position. No component/group structure is
     reconstructed (there's no reliable way to infer "this should be one
-    reusable component" purely from arbitrary FreeCAD geometry), and
-    materials/layers aren't carried over - geometry only, matching the
-    import side's own stated scope.
+    reusable component" purely from arbitrary FreeCAD geometry).
+
+    Each object's own Label becomes its SketchUp layer/tag - unlike
+    Blender's exporter (which has to fall back to Collection membership,
+    since one Blender object has no per-object "layer" slot), this is an
+    exact match for what layers-import already produces: one object per
+    layer, Label set to the real layer name (see this module's own
+    "Layers" docstring section above) - so re-exporting an unmodified,
+    just-imported set of layer objects reproduces the same tags exactly,
+    not an approximation. For freshly modelled FreeCAD content that was
+    never imported, this just means each object's own Label doubles as
+    its exported tag - a predictable, if occasionally literal (a "Box"
+    exports to a layer named "Box"), rule rather than trying to guess
+    which Labels look "meaningful."
+
+    Materials aren't carried over on export yet (import only, for now).
     """
     from openskp import create
 
     builder = create()
-    stats = {"faces_written": 0, "faces_skipped": 0, "objects_skipped": 0}
+
+    # openskp's writer requires every layer to be registered before the
+    # first add_face call, so every object's own Label is registered up
+    # front (deduped) rather than as each object is processed.
+    layer_handle_by_label = {}
+    for obj in exportList:
+        if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
+            continue
+        label = getattr(obj, "Label", None)
+        if label and label not in layer_handle_by_label:
+            layer_handle_by_label[label] = builder.add_layer(label)
+
+    stats = {"faces_written": 0, "faces_skipped": 0, "objects_skipped": 0, "layers_written": len(layer_handle_by_label)}
 
     for obj in exportList:
         if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
             stats["objects_skipped"] += 1
             continue
         placement = obj.getGlobalPlacement() if hasattr(obj, "getGlobalPlacement") else obj.Placement
-        _add_shape_faces(builder, obj.Shape, placement, stats)
+        layer = layer_handle_by_label.get(getattr(obj, "Label", None))
+        _add_shape_faces(builder, obj.Shape, placement, stats, layer)
 
     with _real_open(filename, "wb") as f:
         f.write(builder.to_bytes())
 
     print(
         f"openskp export: {stats['faces_written']} faces written, "
-        f"{stats['faces_skipped']} skipped, {stats['objects_skipped']} objects skipped"
+        f"{stats['faces_skipped']} skipped, {stats['objects_skipped']} objects skipped, "
+        f"{stats['layers_written']} layers"
     )

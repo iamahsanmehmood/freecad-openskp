@@ -43,6 +43,17 @@ reconstruct component/group structure - everything lands flat at the
 file's root. Round-trip-verified: exported coordinates match the
 original geometry exactly (see tests/test_export.py).
 
+**Layer export**: each exported object's own `Label` becomes its
+SketchUp layer/tag. This is an exact match for what layers-import
+already produces (one object per layer, `Label` set to the real layer
+name) - re-exporting an unmodified, just-imported set of layer objects
+reproduces the *same tags exactly*, verified directly on the real
+145-definition structural-framing file: all 11 imported layer names
+came back identical after a round trip through export and a fresh,
+independent re-parse. For freshly modelled FreeCAD content that was
+never imported, each object's own `Label` simply doubles as its
+exported tag.
+
 **Materials** (import only, for now) carry over too, as
 `ViewObject.DiffuseColor` (one RGBA entry per `Shape.Faces`, FreeCAD's
 own per-face-color mechanism - the same one `Part::Feature` objects with
@@ -72,10 +83,9 @@ back on, independent of every other layer. Verified against a real
 2 genuinely hidden in the source file (cladding layers) - both objects
 correctly imported hidden, structural framing alone visible by default.
 
-**Not yet carried over, either direction:** layer export (FreeCAD →
-`.skp`), material export. A face's shape, position, and (import-only)
-color/layer all carry over correctly now; nothing carries back out
-beyond geometry yet.
+**Not yet carried over:** material export (FreeCAD → `.skp`). A face's
+shape, position, and layer all carry over correctly in both directions
+now; color import-only so far.
 
 ## Performance on large files — read this before importing a big model
 
@@ -166,6 +176,12 @@ closed-eye Outliner icon and rendered hidden in the 3D view exactly as
 SketchUp's own Tags panel has them, and every other layer rendered
 visible - the structural framing skeleton alone, cladding hidden, without
 manually toggling anything.
+
+Layer export was round-tripped on the same structural-framing production
+file: imported (11 layer objects), immediately re-exported with no
+changes, re-parsed independently, and the resulting `model.layers` names
+matched the original 11 exactly - a real end-to-end check, not just "an
+object's Label got read."
 
 **Verified interactively, not just headlessly:** `Init.py`'s
 `addImportType` registration - **File → Open** on a real `.skp` file in
