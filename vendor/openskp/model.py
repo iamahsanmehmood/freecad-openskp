@@ -79,6 +79,23 @@ class Edge:
         soft: Soft edge (merges the faces it borders into one surface).
         smooth: Smooth edge (normals interpolate across it).
         hidden: Edge hidden by the user.
+        layer: This edge's own layer id, or ``None`` when the file
+            carries no explicit override (SketchUp's own display then
+            falls back to whatever layer the containing instance/
+            placement is on - resolve via :attr:`SkpModel.layers`).
+            Only meaningful for a *loose* edge (one no face uses) - a
+            face-bounded edge's layer is cosmetic, since the face itself
+            carries the layer that actually matters for rendering. Added
+            because a definition made entirely of loose edges (a
+            structural-framing/light-gauge-steel member drawn as a
+            construction line, not a solid) has no other layer signal
+            anywhere on it.
+        curve_id: SketchUp's own ``Edge#curve`` grouping - the id of the
+            Curve object this edge belongs to, or ``None`` when it
+            belongs to none (``edge.curve == nil`` in the source file).
+            Edges sharing the same curve_id were drawn as one continuous
+            multi-segment line/arc by the author; see
+            :func:`loose_edge_runs` to walk them back into ordered runs.
     """
 
     id: int
@@ -87,6 +104,8 @@ class Edge:
     soft: bool = False
     smooth: bool = False
     hidden: bool = False
+    layer: Optional[int] = None
+    curve_id: Optional[int] = None
 
 
 @dataclass
@@ -129,6 +148,14 @@ class Face:
         uv_projected_back: Same for the face's back side.
         hidden: Whether the face is hidden (SketchUp's "Hide" on this
             specific face, not a layer/tag visibility toggle).
+        layer: This face's own layer id, or ``None`` when the file
+            carries no explicit override (falls back to whatever layer
+            the containing instance/placement is on - resolve via
+            :attr:`SkpModel.layers`). Previously only reachable through
+            :func:`SkpFile.build_scene`/``build_instanced_scene``'s
+            internal, private builder state - a consumer working
+            directly with :func:`SkpFile.parse`'s typed model had no way
+            to read a face's own layer at all.
     """
 
     id: int
@@ -141,6 +168,7 @@ class Face:
     uv_projected: bool = False
     uv_projected_back: bool = False
     hidden: bool = False
+    layer: Optional[int] = None
 
 
 # ── Layers & Materials ────────────────────────────────────────────────────
@@ -271,8 +299,20 @@ class Instance:
         ref_idx: Index into :attr:`SkpModel.definitions` for the
             referenced component definition.
         guid: Globally-unique identifier string.
-        matrix: 4×4 transformation matrix stored as a flat 16-element list
-            in **column-major** order.
+        matrix: Transformation matrix stored as a flat **13-element**
+            list, not a 4x4 in disguise: indices 0-8 are the 3x3
+            rotation/scale part in row-major order, 9-11 are the
+            translation, and 12 is a separate scale scalar that
+            :func:`openskp._core.transform_point` never reads (it
+            only uses 0-11). To transform a point ``(x, y, z)``::
+
+                tx = m[0]*x + m[1]*y + m[2]*z + m[9]
+                ty = m[3]*x + m[4]*y + m[5]*z + m[10]
+                tz = m[6]*x + m[7]*y + m[8]*z + m[11]
+
+            Verified directly against :func:`openskp._core.transform_point`
+            and :func:`openskp._core.multiply_matrices`, which are what
+            every internal code path actually uses.
         layer: This instance's own explicit layer override, or ``""``
             when it has none. An instance without an explicit override
             inherits its *placement's* layer, which can only be resolved
@@ -490,6 +530,56 @@ class Definition:
     is_image: bool = False
 
 
+def loose_edge_runs(definition: "Definition") -> List[Tuple[List[int], List[int], bool]]:
+    """Groups a definition's LOOSE edges (edges no face uses - SketchUp's
+    own way of storing drawing/construction geometry: a light-gauge-steel
+    or structural-framing member is routinely drawn this way, not as a
+    solid) into ordered polyline runs.
+
+    Grouping comes from the file's own ``Edge#curve`` (:attr:`Edge.curve_id`),
+    not a vertex-adjacency guess - the same rule :func:`SkpFile.build_scene`'s
+    ``curve_sets`` and :func:`SkpFile.build_instanced_scene`'s
+    ``curve_resources`` both use internally, exposed here directly for a
+    consumer working with :func:`SkpFile.parse`'s typed model instead of
+    either scene-baking API (both of those return triangulated/instanced
+    *mesh* data - this returns the raw edge/vertex ids a B-rep-based
+    consumer, e.g. a CAD kernel that wants real wire edges rather than a
+    render mesh, can build its own geometry from).
+
+    Returns:
+        A list of ``(edge_ids, vertex_ids, closed)`` triples per run -
+        vertex ids, not coordinates, so the caller resolves them via
+        :attr:`Definition.vertices` and applies its own unit/transform
+        conventions. An edge with no ``curve_id`` (``edge.curve == nil``
+        in the source file) is its own two-point run - joining it to
+        neighbouring edges by adjacency alone would invent a curve the
+        author never drew.
+    """
+    from ._curves import _order_curve
+
+    used_edge_ids = set()
+    for face in definition.faces.values():
+        for loop in face.loops:
+            for edge_id, _sign in loop:
+                used_edge_ids.add(edge_id)
+
+    edges_by_id = {e.id: (e.v1_id, e.v2_id) for e in definition.edges.values()}
+    loose_ids = [eid for eid in edges_by_id if eid not in used_edge_ids]
+
+    groups: Dict[Any, List[int]] = {}
+    runs: List[Tuple[List[int], List[int], bool]] = []
+    for eid in loose_ids:
+        curve_id = definition.edges[eid].curve_id
+        if curve_id:
+            groups.setdefault(curve_id, []).append(eid)
+        else:
+            v1, v2 = edges_by_id[eid]
+            runs.append(([eid], [v1, v2], False))
+    for eids in groups.values():
+        runs.extend(_order_curve(edges_by_id, eids))
+    return runs
+
+
 # ── Top-level model ──────────────────────────────────────────────────────
 
 
@@ -633,12 +723,16 @@ class SkpFile:
                 defn.vertices[v_id] = Vertex(id=v_id, x=x, y=y, z=z)
             # Populate edges
             flags_map = getattr(builder, "edge_flags", {})
+            edge_layers_map = getattr(builder, "edge_layers", None) or {}
+            edge_curves_map = getattr(builder, "edge_curves", None) or {}
             for e_id, (v1, v2) in builder.edges.items():
                 flags = flags_map.get(e_id, 0)
                 defn.edges[e_id] = Edge(id=e_id, v1_id=v1 or 0, v2_id=v2 or 0,
                                         soft=bool(flags & 0x08),
                                         smooth=bool(flags & 0x10),
-                                        hidden=bool(flags & 0x01))
+                                        hidden=bool(flags & 0x01),
+                                        layer=edge_layers_map.get(e_id),
+                                        curve_id=edge_curves_map.get(e_id))
             # Populate faces
             for f_id, f_data in builder.faces.items():
                 defn.faces[f_id] = Face(
@@ -647,6 +741,7 @@ class SkpFile:
                     normal=f_data.get("normal"),
                     material_id=f_data.get("material_id"),
                     back_material_id=f_data.get("back_material_id"),
+                    layer=f_data.get("layer"),
                     uv_transform=f_data.get("uv_transform"),
                     uv_transform_back=f_data.get("uv_transform_back"),
                     uv_projected=f_data.get("uv_projected", False),
@@ -792,6 +887,7 @@ class SkpFile:
     def build_scene(
         self,
         name_override_keys: Sequence[str] = ("name", "label", "code"),
+        include_curve_sets: bool = True,
     ) -> "scene.Scene":
         """Bake every instance actually placed in the model into
         world-space, triangulated mesh data - SketchUp's component/group
@@ -817,6 +913,12 @@ class SkpFile:
                 default ``("name", "label", "code")`` covers the common
                 convention - pass your own tuple if your plugin instead
                 uses a key like ``"mark"`` or ``"partNumber"``.
+            include_curve_sets: Bake loose edges (edges no face uses) into
+                :attr:`Scene.curve_sets` as polyline runs. Pass ``False``
+                to skip them - a pure cost lever (+5.7% of the IFC on a
+                model that has both solids and curves), not a correctness
+                one. On a curve-only model it is not a lever at all: the
+                curve sets are the entire content.
 
         Returns:
             A populated :class:`openskp.scene.Scene`.
@@ -825,7 +927,11 @@ class SkpFile:
         from . import scene as _scene
 
         parsed = _core.full_parse(str(self.path))
-        return _scene.build_scene(parsed, name_override_keys=name_override_keys)
+        return _scene.build_scene(
+            parsed,
+            name_override_keys=name_override_keys,
+            include_curve_sets=include_curve_sets,
+        )
 
     def build_instanced_scene(
         self,

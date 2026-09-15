@@ -22,11 +22,23 @@ the point where local-space faces are first built. SketchUp's own
 instance-placement matrix is a flat 13-element [row-major 3x3
 rotation/scale (9) + translation (3) + trailing scale scalar (1)] form
 - verified directly against openskp's own transform_point/
-multiply_matrices in _core.py, not the (currently incorrect) "16-element
-column-major" docstring on the Instance dataclass itself. Only the
-translation component needs the inches->mm scale factor applied when
-converting to a FreeCAD.Matrix; the 3x3 rotation/scale part is a
-dimensionless ratio, unaffected by units.
+multiply_matrices in _core.py (the Instance.matrix docstring itself was
+fixed to match, openskp#320). Only the translation component needs the
+inches->mm scale factor applied when converting to a FreeCAD.Matrix; the
+3x3 rotation/scale part is a dimensionless ratio, unaffected by units.
+
+Loose edges (construction lines/structural framing - a light-gauge-steel
+member is routinely drawn this way, not as a solid) come from openskp's
+public openskp.loose_edge_runs(definition) - added specifically for this
+addon, since the only place that grouping previously existed was inside
+build_scene()/build_instanced_scene()'s internal, triangulated-mesh-only
+output. Each run becomes its own Part.Wire in the same compound as the
+faces (a definition can have both), built once per unique definition and
+cached exactly like face geometry is. Found missing by testing this
+importer against a real structural-framing file, the same gap already
+found and fixed in the Blender addon (github.com/iamahsanmehmood/
+blender-openskp) - studs/king studs/header jack studs drawn as loose
+edges were silently invisible before this.
 """
 from __future__ import annotations
 
@@ -91,6 +103,23 @@ def _make_wire(points_mm):
         return None
 
 
+def _make_loose_edge_wire(points_mm, closed):
+    """Builds one loose-edge run's wire in the definition's own LOCAL
+    space - a plain open or closed polyline, never auto-closed the way
+    _make_wire() forces a face loop closed, since an open structural
+    member (a stud running from A to B) must stay open, not become a
+    closed triangle back to its own start."""
+    vecs = [App.Vector(*p) for p in points_mm]
+    if len(vecs) < 2:
+        return None
+    if closed and len(vecs) > 2 and vecs[0] != vecs[-1]:
+        vecs.append(vecs[0])
+    try:
+        return Part.makePolygon(vecs)
+    except Exception:
+        return None
+
+
 def _make_face_shape(definition, face):
     """Builds one face's shape in the definition's own LOCAL space
     (no world transform applied - that happens once per placement,
@@ -119,10 +148,12 @@ def _make_face_shape(definition, face):
 
 
 def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=None):
-    """Returns `definition`'s own geometry (its faces plus every nested
-    instance's geometry, transformed into this definition's local
-    space), built exactly once per unique definition and cached by
-    identity for the lifetime of this import call."""
+    """Returns `definition`'s own geometry (its faces, its loose-edge
+    runs, plus every nested instance's geometry, transformed into this
+    definition's local space), built exactly once per unique definition
+    and cached by identity for the lifetime of this import call."""
+    import openskp
+
     key = id(definition)
     if key in shape_cache:
         return shape_cache[key]
@@ -138,6 +169,29 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=N
             shapes.append(shape)
         else:
             stats["faces_skipped"] += 1
+
+    # Loose edges (SketchUp's own way of storing drawing/construction
+    # geometry: a light-gauge-steel or structural-framing member is
+    # routinely drawn this way, not as a solid) - deliberately outside
+    # the faces loop above, since a curve-only definition has no faces
+    # at all and would otherwise contribute nothing to the import. Runs
+    # each become their own Part.Wire in the same compound as the faces -
+    # FreeCAD's compounds hold mixed face/wire content natively.
+    for edge_ids, vertex_ids, closed in openskp.loose_edge_runs(definition):
+        stats["edge_runs_built"] += 1
+        pts = []
+        complete = True
+        for vid in vertex_ids:
+            v = definition.vertices.get(vid)
+            if v is None:
+                complete = False
+                break
+            pts.append((v.x * INCH_TO_MM, v.y * INCH_TO_MM, v.z * INCH_TO_MM))
+        wire = _make_loose_edge_wire(pts, closed) if complete else None
+        if wire is not None:
+            shapes.append(wire)
+        else:
+            stats["edge_runs_skipped"] += 1
 
     for inst in definition.instances:
         child_def = model.definitions.get(inst.ref_idx)
@@ -191,7 +245,10 @@ def import_skp(filepath, doc=None):
     print(f"openskp: parsed in {time.time() - t0:.1f}s, building geometry...")
 
     t0 = time.time()
-    stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0}
+    stats = {
+        "faces_built": 0, "faces_skipped": 0, "placements": 0,
+        "edge_runs_built": 0, "edge_runs_skipped": 0,
+    }
     shape_cache: dict = {}
 
     # FreeCAD's own native progress bar (the same Base.ProgressIndicator
@@ -221,7 +278,8 @@ def import_skp(filepath, doc=None):
     doc.recompute()
     print(
         f"openskp: {len(shape_cache)} unique definitions built in {time.time() - t0:.1f}s "
-        f"({stats['faces_built']} faces, {stats['faces_skipped']} skipped), "
+        f"({stats['faces_built']} faces, {stats['faces_skipped']} skipped; "
+        f"{stats['edge_runs_built']} loose-edge runs, {stats['edge_runs_skipped']} skipped), "
         f"{stats['placements']} instances placed"
     )
     return doc

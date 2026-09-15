@@ -25,6 +25,14 @@ once and cached; every placement after the first is a cheap
 `Shape.copy()` + `transformShape()`, not a rebuild from scratch. This
 matters a lot in practice - see the large-file numbers below.
 
+Loose edges (construction lines/structural framing - a light-gauge-steel
+member is routinely drawn this way, not as a solid) import too, as
+`Part.Wire` geometry in the same compound as the faces - a definition
+can have both. Found missing on a real structural-framing file (1,077
+runs across 93 of 145 definitions, silently invisible before this) - the
+same gap already found and fixed in the
+[Blender addon](https://github.com/iamahsanmehmood/blender-openskp).
+
 **Export** (File -> Export, or File -> Save As with a .skp extension)
 flattens the selected FreeCAD objects' faces (global placement
 resolved, so translated/nested objects land in the right world
@@ -100,12 +108,13 @@ build B-rep faces) has been tested end-to-end against real `.skp` fixtures
 via FreeCAD's headless `freecadcmd`, calling `importSKP.import_skp()`
 directly:
 
-| Fixture | Faces | Result |
-|---|---|---|
-| `capilla_quiroz_v17.skp` | 192 | 192 imported, 0 invalid |
-| `gondola_v20.skp` | 39,352 | 39,352 imported, 0 invalid |
-| `SU_File.skp` | 32 | 32 imported, 0 invalid |
-| `Untitled.skp` | 1,588 | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
+| Fixture | Faces | Loose edges | Result |
+|---|---|---|---|
+| `capilla_quiroz_v17.skp` | 192 | 20 | 192 faces + 20 loose edges imported, 0 invalid |
+| `gondola_v20.skp` | 39,352 | — | 39,352 imported, 0 invalid |
+| `SU_File.skp` | 32 | 0 | 32 imported, 0 invalid |
+| `Untitled.skp` | 1,588 | — | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
+| A real structural-framing file (outside the repo) | 9,652 | 1,077 | All faces and loose edges imported, 0 skipped — 93 of the file's 145 definitions were entirely or partly loose-edge (light-gauge-steel members drawn as construction lines), previously silently invisible |
 
 **Not yet verified:** the `Init.py`/`addImportType` registration that makes
 **File → Open** work from FreeCAD's real GUI. It follows the exact,

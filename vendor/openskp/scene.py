@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import _core
+from ._curves import _chain_loose_edges, _solve_run_arc
 from ._face_groups import FaceGroupContext, build_local_face_groups
 from .errors import SkpParseError
 
@@ -152,6 +153,65 @@ class SceneTexture:
 
 
 @dataclass
+class CurveSetMetadata:
+    """Metadata for one run of *loose* edges - edges that no face uses.
+
+    Loose edges are how SketchUp stores drawing/construction geometry: a
+    facade elevation, a section outline, a guide. They carry no faces, so
+    before this existed the whole class of curve-only models baked to an
+    empty scene (no ``glb_primitives`` at all) and exported to an IFC with a
+    spatial skeleton and zero elements.
+
+    Edges belonging to a face's loop are deliberately NOT here: they are
+    already represented by that face's mesh, and emitting them again would
+    double every solid's geometry as line work.
+    """
+
+    name: str = ""
+    definition_name: str = ""
+    layer: str = ""
+    path: str = ""
+    # True when ``name`` was synthesised by this module rather than read from
+    # the file (root-level loose geometry has no name to read - see the
+    # loose-edge block in instantiate()). Consumers that use a name as
+    # *evidence* about the author's intent - ifc_classify - must not treat a
+    # name this module made up as if the author had written it. Same idea as
+    # scene.InstanceNode.name_is_generated.
+    name_is_generated: bool = False
+    # World-space, metres, in **glTF's Y-up frame** (y = height, z = -depth) -
+    # byte-for-byte the same convention as GlbPrimitive.positions, so a
+    # consumer can mix the two without re-deriving an axis swap. A consumer
+    # that wants Z-up (e.g. the IFC exporter) applies the same conversion it
+    # already applies to mesh positions.
+    points_m: List[Tuple[float, float, float]] = field(default_factory=list)
+    # True when the run returns to its own first point (the common case for
+    # a closed outline). IFC's IfcPolyline has no implicit closure, so a
+    # closed run is emitted with its first point repeated at the end.
+    closed: bool = False
+    # Set when this run provably *is* one whole
+    # circular arc, in which case the run is emitted as an analytic arc
+    # rather than as the chords the file happens to tessellate it into.
+    # ``{"points": [(x, y, z), ...], "segments": [(0, 1, 2), ...]}`` - the
+    # points are in the same world-space glTF-Y-up metre frame as
+    # ``points_m`` (so a consumer applies the same axis swap), and the
+    # segments are 0-based index tuples into them, ready to become IFC4
+    # ``IfcArcIndex``/``IfcLineIndex`` entries.
+    #
+    # Only ever set from a *validated* frame: the file says the Curve is a
+    # CArcCurve, the frame's own axes agree it is a circle (not the affine
+    # image of one - see legacy._read_arccurve), and every vertex the file
+    # stores on this run lies on the resulting circle. Anything short of
+    # that leaves this None and the chords are emitted unchanged, which is
+    # exactly what the file contains. See _solve_run_arc.
+    arc: Optional[Dict[str, Any]] = None
+    # Same shape and meaning as MeshMetadata.attribute_dictionaries: the IFC
+    # exporter writes each entry out as its own named property set, which is
+    # how an inference result (e.g. ifc_classify's AI_Classification) travels
+    # downstream with the geometry instead of dying in this process.
+    attribute_dictionaries: Dict[str, Dict[str, str]] = field(default_factory=dict)
+
+
+@dataclass
 class Scene:
     """The result of baking a parsed file's placed instances into a flat,
     world-space 3D scene."""
@@ -159,6 +219,9 @@ class Scene:
     scene_hierarchy: InstanceNode = field(default_factory=InstanceNode)
     mesh_index: Dict[str, MeshMetadata] = field(default_factory=dict)
     glb_primitives: List[GlbPrimitive] = field(default_factory=list)
+    # Loose-edge runs, one entry per chained polyline. Empty for a model
+    # whose geometry is all faces (the overwhelmingly common case).
+    curve_sets: List[CurveSetMetadata] = field(default_factory=list)
     gltf_materials: List[Dict[str, Any]] = field(default_factory=list)
     # Distinct texture images the placed materials use, deduplicated by
     # source bytes. Empty when nothing placed in the scene is textured.
@@ -188,6 +251,7 @@ def _sniff_image_mime(data: bytes) -> Optional[str]:
 def build_scene(
     parsed: Dict[str, Any],
     name_override_keys: Sequence[str] = ("name", "label", "code"),
+    include_curve_sets: bool = True,
 ) -> Scene:
     """Bake every instance actually placed in ``parsed`` (the output of
     :func:`openskp._core.full_parse` / ``full_parse_legacy``) into
@@ -207,6 +271,15 @@ def build_scene(
             plugin's own dictionary name. The default covers the common
             convention; pass your own tuple to also recognize a plugin
             that instead uses e.g. ``"mark"`` or ``"partNumber"``.
+        include_curve_sets: Bake loose edges (edges no face uses) into
+            :attr:`Scene.curve_sets` as polyline runs. On by default, and
+            the only reason to turn it off is cost. Measured on this
+            project's own corpus, exporting the same file both ways:
+            sc_SourceCity_Facade (solids + curves) 50,662,265 -> 53,564,893
+            bytes (+5.7%); magnetar_Facade_Drawing (curves only) 1,570 ->
+            568,177 - that second one being the point: on a curve-only
+            model the curve sets *are* the model, and turning them off
+            leaves a spatial skeleton with nothing in it.
 
     Returns:
         A populated :class:`Scene`.
@@ -225,6 +298,10 @@ def build_scene(
     mesh_counter = [0]
     mesh_index: Dict[str, MeshMetadata] = {}
     glb_primitives: List[GlbPrimitive] = []
+    curve_sets: List[CurveSetMetadata] = []
+    # Per-layer sequence numbers for generated curve-set labels (see the
+    # loose-edge block in instantiate()).
+    curve_seq: Dict[str, int] = {}
 
     # Instance path -> (properties, name) updates, collected in O(1) per
     # instance and applied once after instantiation completes (see the
@@ -337,6 +414,20 @@ def build_scene(
         builder = d["builder"]
 
         if builder.faces:
+            # A definition's faces carry their own
+            # layer (legacy drawbase). The inherited `parent_layer` is never
+            # resolvable for legacy instances, so it silently degraded to
+            # "Layer0" for every face - which starved export/ifc.py's
+            # classifier (it types elements by name, then by layer) of the
+            # one signal that was actually present in the file.
+            _lc: Dict[Any, int] = {}
+            for _f in builder.faces.values():
+                _l = _f.get("layer")
+                if _l:
+                    _lc[_l] = _lc.get(_l, 0) + 1
+            if _lc:
+                _top_layer = max(_lc, key=_lc.get)
+                parent_layer = layer_id_to_name.get(_top_layer, parent_layer)
             # Group faces sharing a resolved (color, double_sided, texture)
             # identity into one mesh each, in local space - shared with the
             # instanced builder (openskp#200) via _face_groups.py: a face
@@ -441,6 +532,69 @@ def build_scene(
                         geom_name=geom_name,
                     )
                 )
+
+        # Loose edges -> world-space polyline runs.
+        #
+        # Deliberately OUTSIDE the `if builder.faces:` branch above: a
+        # curve-only model has no faces at all, which is exactly the case
+        # this exists for. Before it, such a definition contributed nothing
+        # to the scene, so export/ifc.py got an empty primitive list and
+        # emitted a spatial skeleton with zero elements (see
+        # magnetar_Facade_Drawing.skp: 1776 edges -> 0 products).
+        _edge_layers = getattr(builder, "edge_layers", None) or {}
+        _runs = _chain_loose_edges(builder) if include_curve_sets else ()
+        for _eids, _chain, _closed in _runs:
+            pts = []
+            _complete = True
+            for _vk in _chain:
+                _v = builder.vertices.get(_vk)
+                if _v is None:
+                    _complete = False
+                    break
+                _pt = _core.transform_point(_v, current_matrix)
+                pts.append((round(_pt[0] * INCHES_TO_M, 6),
+                            round(_pt[2] * INCHES_TO_M, 6),
+                            round(-_pt[1] * INCHES_TO_M, 6)))
+            # A dangling vertex key would silently shorten the run, turning a
+            # parsing gap into a plausible-looking polyline. Drop the run
+            # instead - a missing curve is honest, a truncated one is not.
+            if not _complete or len(pts) < 2:
+                continue
+            # A run whose edges disagree on layer resolves to the majority,
+            # same rule the face block above uses for the same reason.
+            _lc: Dict[Any, int] = {}
+            for _eid in _eids:
+                _l = _edge_layers.get(_eid)
+                if _l:
+                    _lc[_l] = _lc.get(_l, 0) + 1
+            run_layer = parent_layer
+            if _lc:
+                run_layer = layer_id_to_name.get(max(_lc, key=_lc.get), parent_layer)
+            # Root-level loose geometry has no name in the file whatsoever -
+            # an edge is just an edge, only components get named. Labelling
+            # all 444 of them "ROOT" would be technically honest and useless,
+            # so a root-level run is labelled with the one signal that does
+            # exist (its layer) plus a sequence number to keep them distinct.
+            # Anything inside a named component keeps its real name.
+            if path_name == "ROOT":
+                _seq = curve_seq.get(run_layer, 0) + 1
+                curve_seq[run_layer] = _seq
+                _cname = "%s_%d" % (run_layer, _seq)
+                _cgen = True
+            else:
+                _cname = path_name.split(" / ")[-1] or ""
+                _cgen = False
+            curve_sets.append(CurveSetMetadata(
+                name=_cname,
+                name_is_generated=_cgen,
+                definition_name=d.get("name") or "",
+                layer=run_layer,
+                path=path_name,
+                points_m=pts,
+                closed=_closed,
+                arc=_solve_run_arc(builder, _eids,
+                                   current_matrix, pts, _closed),
+            ))
 
         child_instances_info: List[InstanceNode] = []
         for inst in builder.instances:
@@ -577,12 +731,28 @@ def build_scene(
 
     for geom_name, existing in mesh_index.items():
         if existing.path == "ROOT":
-            existing.name = "ROOT"
-            existing.definition_name = "ROOT_MODEL"
-            existing.layer = "Layer0"
+            # do NOT clobber `layer` here.
+            #
+            # This loop is meant to normalise the synthetic root *node*'s
+            # placeholder fields (see scene_hierarchy below), but it iterates
+            # real MESHES - specifically the ones whose path is exactly
+            # "ROOT", i.e. loose geometry authored directly in the model root
+            # rather than inside any group/component. `instantiate()` has
+            # already resolved their layer from the definition's own faces
+            # (legacy drawbase), and for such a mesh that layer is the ONLY
+            # type signal that exists - there is no component name to fall
+            # back on, because in SketchUp loose geometry has no name.
+            # Hardcoding "Layer0" here threw that signal away and made every
+            # root-level element invisible to export/ifc.py's classifier.
+            # (Verified on gk_itjds_HyparHut.skp: 3 root meshes whose
+            # geom_name had always carried the real layer `Table` while
+            # MeshMetadata.layer read "Layer0".)
+            existing.name = existing.name or "ROOT"
+            existing.definition_name = existing.definition_name or "ROOT_MODEL"
+            existing.layer = existing.layer or "Layer0"
             existing.position_mm = (0.0, 0.0, 0.0)
-            existing.properties = {}
-            existing.attribute_dictionaries = {}
+            existing.properties = existing.properties or {}
+            existing.attribute_dictionaries = existing.attribute_dictionaries or {}
 
     scene_hierarchy = InstanceNode(
         name="ROOT",
@@ -595,15 +765,17 @@ def build_scene(
     )
 
     logger.info(
-        "Scene build complete: %d instances, %d meshes, %d primitives (%.2fs)",
+        "Scene build complete: %d instances, %d meshes, %d primitives, "
+        "%d curve sets (%.2fs)",
         instance_counter[0], len(mesh_index), len(glb_primitives),
-        time.monotonic() - t0,
+        len(curve_sets), time.monotonic() - t0,
     )
 
     return Scene(
         scene_hierarchy=scene_hierarchy,
         mesh_index=mesh_index,
         glb_primitives=glb_primitives,
+        curve_sets=curve_sets,
         gltf_materials=gltf_materials,
         textures=textures,
         layer_hidden=dict(parsed.get("layer_hidden") or {}),
