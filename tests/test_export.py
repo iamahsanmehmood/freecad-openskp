@@ -7,6 +7,18 @@ translated box) through export() and back through openskp's own
 Python reader, checking structure (loop counts) and exact coordinates
 survive the mm<->inch conversion. Also checks layer (SketchUp "tag")
 export: each object's own Label becomes its exported layer.
+
+Material export reads obj.ViewObject.DiffuseColor, which doesn't exist
+at all under headless freecadcmd (same limitation materials-import
+already has - see check_face_colors() in test_import.py) - so
+test_material_export() below exercises the real dedup/registration
+logic (_register_face_materials/_material_key/_material_name) against
+a lightweight stand-in object carrying a fake ViewObject with real
+DiffuseColor data, rather than skipping material export from this
+suite entirely. The full path (does the real GUI's own
+ViewObject.DiffuseColor actually reach export() this same way) was
+verified once directly in a real interactive FreeCAD session - see the
+README.
 """
 import os
 import sys
@@ -90,6 +102,82 @@ def run():
     )
 
 
+class _FakeViewObject:
+    def __init__(self, diffuse_color):
+        self.DiffuseColor = diffuse_color
+
+
+class _FakeObjWithColors:
+    """A minimal stand-in for a real FreeCAD DocumentObject - export()
+    only ever touches .Shape/.ViewObject/.Label/.Placement (and
+    hasattr()-checks for .getGlobalPlacement, deliberately absent here
+    to exercise that fallback too), so a plain object with just those
+    four attributes exercises the exact same code real export() runs
+    against a document object, without needing a real GUI session to
+    get a real ViewObject from."""
+
+    def __init__(self, shape, diffuse_color, label):
+        self.Shape = shape
+        self.ViewObject = _FakeViewObject(diffuse_color)
+        self.Label = label
+        self.Placement = App.Placement()
+
+
+def test_material_export():
+    """Regression test for material export: a Shape's own per-face
+    ViewObject.DiffuseColor becomes a SketchUp material, deduplicated
+    across faces AND across objects (the same color reused registers
+    once). Runs under App.GuiUp forced True with a fake ViewObject
+    (see module docstring for why headless freecadcmd needs this)."""
+    orig_gui_up = App.GuiUp
+    App.GuiUp = True
+    try:
+        red = (1.0, 0.0, 0.0, 1.0)
+        blue_translucent = (0.0, 0.0, 1.0, 0.5)
+
+        box1 = Part.makeBox(10, 10, 10)
+        obj1 = _FakeObjWithColors(box1, [red] * len(box1.Faces), "RedBox")
+
+        box2 = Part.makeBox(10, 10, 10)
+        box2.translate(App.Vector(50, 0, 0))
+        colors2 = [red, red, red, blue_translucent, blue_translucent, blue_translucent]
+        assert len(colors2) == len(box2.Faces)
+        obj2 = _FakeObjWithColors(box2, colors2, "MixedBox")
+
+        out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_material_export_test.skp")
+        importSKP.export([obj1, obj2], out_path)
+
+        import openskp
+
+        model = openskp.SkpFile.open(out_path).parse()
+        os.remove(out_path)
+
+        materials_by_name = {m.name: m for m in model.materials}
+        assert len(materials_by_name) == 2, f"expected 2 distinct materials (red reused), got {materials_by_name}"
+
+        red_mats = [m for m in model.materials if m.color[:3] == (255, 0, 0)]
+        assert len(red_mats) == 1, red_mats
+        assert red_mats[0].transparency == 1.0, red_mats[0].transparency
+
+        blue_mats = [m for m in model.materials if m.color[:3] == (0, 0, 255)]
+        assert len(blue_mats) == 1, blue_mats
+        assert abs(blue_mats[0].transparency - 0.5) < 1e-3, blue_mats[0].transparency
+
+        by_material = {}
+        for f in model.root.faces.values():
+            by_material.setdefault(f.material_id, 0)
+            by_material[f.material_id] += 1
+        assert len(by_material) == 2, f"expected 2 distinct Face.material_id groups, got {by_material}"
+        assert sorted(by_material.values()) == [3, 9], (
+            f"expected 9 red faces (6 from RedBox + 3 from MixedBox) and 3 blue, got {by_material}"
+        )
+
+        print("test_material_export: OK (2 distinct materials, red reused across objects, correctly split)")
+    finally:
+        App.GuiUp = orig_gui_up
+
+
 # Note: freecadcmd runs a script file as a module named after the file,
 # not "__main__" - see tests/test_import.py's own note on this.
 run()
+test_material_export()

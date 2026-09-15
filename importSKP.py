@@ -484,8 +484,63 @@ def _wire_points_inches(wire, placement):
     return pts
 
 
-def _add_shape_faces(builder, shape, placement, stats, layer):
-    for face in shape.Faces:
+def _material_key(rgba):
+    """Rounds a DiffuseColor RGBA (floats 0-1) to a stable, hashable key
+    for deduplication - (r, g, b) as 0-255 ints, alpha as a 0-100 int
+    percentage (matching openskp's own opacity convention: 1.0/100 is
+    fully opaque)."""
+    r, g, b, a = rgba
+    return (round(r * 255), round(g * 255), round(b * 255), round(a * 100))
+
+
+def _material_name(key):
+    r, g, b, a100 = key
+    name = f"Color_{r:02X}{g:02X}{b:02X}"
+    if a100 < 100:
+        name += f"_A{a100:02d}"
+    return name
+
+
+def _register_face_materials(obj, builder, material_handle_by_key):
+    """Returns a list of material handles, one per obj.Shape.Faces entry
+    (all None where no per-face color is available), registering any
+    newly-seen distinct color via openskp's builder.add_material() as
+    it's first encountered - the same Material reused across many faces
+    (or objects) registers exactly once, not once per face.
+
+    Reads obj.ViewObject.DiffuseColor - only meaningful under the real
+    GUI (ViewObject doesn't exist under headless freecadcmd, matching
+    materials-import's own limitation) and only trusted when its length
+    already matches Shape.Faces exactly (the same invariant import
+    itself relies on when applying colors - a mismatch means the color
+    data doesn't actually describe this exact shape, e.g. it's stale
+    from before some edit, so this skips it rather than misapplying
+    colors to the wrong faces)."""
+    shape = obj.Shape
+    if not (App.GuiUp and hasattr(obj, "ViewObject")):
+        return [None] * len(shape.Faces)
+    try:
+        colors = list(obj.ViewObject.DiffuseColor)
+    except Exception:
+        return [None] * len(shape.Faces)
+    if len(colors) != len(shape.Faces):
+        return [None] * len(shape.Faces)
+
+    handles = []
+    for c in colors:
+        key = _material_key(c)
+        if key not in material_handle_by_key:
+            r, g, b, a100 = key
+            opacity = a100 / 100.0
+            material_handle_by_key[key] = builder.add_material(
+                _material_name(key), (r, g, b), opacity=None if opacity >= 1.0 else opacity
+            )
+        handles.append(material_handle_by_key[key])
+    return handles
+
+
+def _add_shape_faces(builder, shape, placement, stats, layer, material_handles):
+    for i, face in enumerate(shape.Faces):
         outer = face.OuterWire
         outer_pts = _wire_points_inches(outer, placement)
         if len(outer_pts) < 3:
@@ -498,8 +553,9 @@ def _add_shape_faces(builder, shape, placement, stats, layer):
             hole_pts = _wire_points_inches(w, placement)
             if len(hole_pts) >= 3:
                 holes.append(hole_pts)
+        material = material_handles[i] if material_handles else None
         try:
-            builder.add_face(outer_pts, holes=holes, layer=layer)
+            builder.add_face(outer_pts, holes=holes, layer=layer, material=material)
             stats["faces_written"] += 1
         except Exception:
             # A degenerate/non-planar/self-intersecting face from
@@ -533,15 +589,34 @@ def export(exportList, filename):
     exports to a layer named "Box"), rule rather than trying to guess
     which Labels look "meaningful."
 
-    Materials aren't carried over on export yet (import only, for now).
+    Each object's own ViewObject.DiffuseColor (one RGBA entry per
+    Shape.Faces, the same property materials-import applies) becomes a
+    SketchUp material per distinct color - solid colors and opacity
+    only, matching import's own scope; no texture export. Only available
+    under the real GUI (ViewObject doesn't exist under headless
+    freecadcmd, so a headless export carries geometry/layers but no
+    colors - matching how headless import can't apply colors either). An
+    object with no per-face color data (or running headless) exports
+    unpainted, same as before this existed.
     """
     from openskp import create
 
     builder = create()
 
-    # openskp's writer requires every layer to be registered before the
-    # first add_face call, so every object's own Label is registered up
-    # front (deduped) rather than as each object is processed.
+    # openskp's writer requires materials, then layers, then faces, in
+    # that order - add_material must precede add_layer (both depend on
+    # the final material count for their own slot numbering), and both
+    # must precede the first add_face call. So materials are resolved
+    # and registered first here, then layers - two dedup passes over
+    # exportList, not two export passes, and the same ordering the
+    # Blender exporter's own export_skp() uses.
+    material_handle_by_key = {}
+    object_material_handles = {}
+    for obj in exportList:
+        if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
+            continue
+        object_material_handles[id(obj)] = _register_face_materials(obj, builder, material_handle_by_key)
+
     layer_handle_by_label = {}
     for obj in exportList:
         if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
@@ -550,7 +625,10 @@ def export(exportList, filename):
         if label and label not in layer_handle_by_label:
             layer_handle_by_label[label] = builder.add_layer(label)
 
-    stats = {"faces_written": 0, "faces_skipped": 0, "objects_skipped": 0, "layers_written": len(layer_handle_by_label)}
+    stats = {
+        "faces_written": 0, "faces_skipped": 0, "objects_skipped": 0,
+        "materials_written": len(material_handle_by_key), "layers_written": len(layer_handle_by_label),
+    }
 
     for obj in exportList:
         if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
@@ -558,7 +636,8 @@ def export(exportList, filename):
             continue
         placement = obj.getGlobalPlacement() if hasattr(obj, "getGlobalPlacement") else obj.Placement
         layer = layer_handle_by_label.get(getattr(obj, "Label", None))
-        _add_shape_faces(builder, obj.Shape, placement, stats, layer)
+        material_handles = object_material_handles.get(id(obj))
+        _add_shape_faces(builder, obj.Shape, placement, stats, layer, material_handles)
 
     with _real_open(filename, "wb") as f:
         f.write(builder.to_bytes())
@@ -566,5 +645,5 @@ def export(exportList, filename):
     print(
         f"openskp export: {stats['faces_written']} faces written, "
         f"{stats['faces_skipped']} skipped, {stats['objects_skipped']} objects skipped, "
-        f"{stats['layers_written']} layers"
+        f"{stats['materials_written']} materials, {stats['layers_written']} layers"
     )
