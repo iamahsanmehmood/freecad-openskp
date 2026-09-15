@@ -54,6 +54,16 @@ independent re-parse. For freshly modelled FreeCAD content that was
 never imported, each object's own `Label` simply doubles as its
 exported tag.
 
+**Material export**: each object's own `ViewObject.DiffuseColor` (one
+RGBA entry per `Shape.Faces` - the same property materials-import
+applies) becomes a SketchUp material per distinct color, deduplicated
+across faces *and* across objects (the same color reused anywhere
+registers exactly once). Solid colors and opacity only, matching
+import's own scope - no texture export. Only available under the real
+GUI, same limitation as materials-import (`ViewObject` doesn't exist
+under headless `freecadcmd`) - a headless export still carries geometry
+and layers, just no color.
+
 **Materials** (import only, for now) carry over too, as
 `ViewObject.DiffuseColor` (one RGBA entry per `Shape.Faces`, FreeCAD's
 own per-face-color mechanism - the same one `Part::Feature` objects with
@@ -83,9 +93,7 @@ back on, independent of every other layer. Verified against a real
 2 genuinely hidden in the source file (cladding layers) - both objects
 correctly imported hidden, structural framing alone visible by default.
 
-**Not yet carried over:** material export (FreeCAD → `.skp`). A face's
-shape, position, and layer all carry over correctly in both directions
-now; color import-only so far.
+Geometry, layers, and materials now all carry over in both directions.
 
 ## Performance on large files — read this before importing a big model
 
@@ -182,6 +190,17 @@ file: imported (11 layer objects), immediately re-exported with no
 changes, re-parsed independently, and the resulting `model.layers` names
 matched the original 11 exactly - a real end-to-end check, not just "an
 object's Label got read."
+
+Material export was checked with a stand-in object carrying real
+`ViewObject.DiffuseColor` data (headless `freecadcmd` has no real
+`ViewObject` at all, the same constraint materials-import has - see
+`tests/test_export.py`'s own module docstring): two boxes, one solid
+red, one mixed red/50%-translucent-blue, exported and re-parsed -
+exactly 2 distinct materials registered (red deduplicated across both
+objects, not registered twice), and faces split 9-red/3-blue, matching
+exactly. The underlying `ViewObject.DiffuseColor` property itself was
+already confirmed correct in a real interactive session for
+materials-*import*; export reads that same property back.
 
 **Non-uniform scale** is verified explicitly, not just assumed to work
 because rotation/translation do: a synthetic file places one component
