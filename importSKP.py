@@ -39,6 +39,26 @@ importer against a real structural-framing file, the same gap already
 found and fixed in the Blender addon (github.com/iamahsanmehmood/
 blender-openskp) - studs/king studs/header jack studs drawn as loose
 edges were silently invisible before this.
+
+Layers (SketchUp calls them "tags"): unlike materials, which fit onto
+the existing single-compound design as one ViewObject.DiffuseColor per
+face, a layer needs its own Part::Feature object to be independently
+toggleable at all - FreeCAD has no per-face visibility mechanism the way
+it has per-face color. So the import is split, one compound per distinct
+layer actually used in the file (via _get_local_shape's layer buckets,
+threaded down the same way as paint-inheritance: Instance.layer
+overrides an inherited default the same way Instance.material_id does -
+see model.py's docstrings for both). A layer switched off in the source
+file's own Tags panel (model.layers' Layer.hidden, read straight off the
+layer manager's own visibility byte for both legacy and modern files
+alike) imports with that object's own ViewObject.Visibility already
+False - one click to toggle back on, independent of every other layer.
+Deliberately ignores a FACE's own individual layer override (Face.layer)
+in favor of just the enclosing placement's layer - the common real-world
+case is tagging a whole group/component, not individual faces within an
+untagged one, and Face.layer has no public id->name lookup exposed by
+openskp yet to resolve against anyway (same scope cut as materials'
+layer-color fallback, see _resolve_face_color's own docstring).
 """
 from __future__ import annotations
 
@@ -186,37 +206,52 @@ def _make_face_shape(definition, face):
             return None
 
 
-def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=None, inherited_material_id=None):
-    """Returns (`definition`'s own geometry, a parallel list of RGBA face
-    colors matching Shape.Faces order) - its faces, its loose-edge runs,
-    plus every nested instance's geometry, transformed into this
-    definition's local space.
+def _get_local_shape(
+    definition, model, stats, shape_cache, visiting, progress=None,
+    inherited_material_id=None, inherited_layer="Layer0",
+):
+    """Returns ``{layer_name: (compound_shape, colors)}`` - this
+    definition's own faces/loose-edge runs (all attributed to
+    ``inherited_layer``, the layer this whole placement context is on -
+    see the module docstring's "Layers" section for why per-FACE layer
+    overrides are deliberately out of scope), plus every nested
+    instance's own per-layer geometry, transformed into this
+    definition's local space and merged in - a definition placed once
+    under an unlayered context and once inside a "Studs"-tagged group
+    can genuinely split across two different output objects.
+    ``colors`` is a list of RGBA tuples matching ``compound_shape.Faces``
+    order, same invariant materials already established.
 
-    Cached by (definition identity, inherited_material_id): the SAME
-    definition can legitimately render with different fallback colors
-    for its unpainted faces depending on what an ancestor group/component
-    painted itself with (SketchUp's own paint-inheritance rule - see
-    _resolve_face_color) - caching on identity alone would silently merge
-    those into whichever context was built first, same class of bug
-    already found and fixed for build_instanced_scene()'s mesh_resource_for.
+    Cached by (definition identity, inherited_material_id,
+    inherited_layer): the SAME definition can legitimately render with
+    different fallback colors AND land in different layer buckets
+    depending on what an ancestor group/component painted itself with or
+    tagged itself as (SketchUp's own paint/tag-inheritance rules) -
+    caching on identity alone would silently merge those into whichever
+    context was built first, same class of bug already found and fixed
+    for build_instanced_scene()'s mesh_resource_for.
     """
     import openskp
 
-    key = (id(definition), inherited_material_id)
+    key = (id(definition), inherited_material_id, inherited_layer)
     if key in shape_cache:
         return shape_cache[key]
     if key in visiting:
-        return None, []  # a real cycle in the instance graph - bail, don't spin
+        return {}  # a real cycle in the instance graph - bail, don't spin
     visiting = visiting | {key}
 
-    shapes = []
-    colors = []
+    buckets: dict = {}  # layer_name -> {"shapes": [...], "colors": [...]}
+
+    def bucket(layer_name):
+        return buckets.setdefault(layer_name, {"shapes": [], "colors": []})
+
     for face in definition.faces.values():
         stats["faces_built"] += 1
         shape = _make_face_shape(definition, face)
         if shape is not None:
-            shapes.append(shape)
-            colors.append(_resolve_face_color(face, model, inherited_material_id))
+            b = bucket(inherited_layer)
+            b["shapes"].append(shape)
+            b["colors"].append(_resolve_face_color(face, model, inherited_material_id))
         else:
             stats["faces_skipped"] += 1
 
@@ -226,7 +261,9 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=N
     # the faces loop above, since a curve-only definition has no faces
     # at all and would otherwise contribute nothing to the import. Runs
     # each become their own Part.Wire in the same compound as the faces -
-    # FreeCAD's compounds hold mixed face/wire content natively.
+    # FreeCAD's compounds hold mixed face/wire content natively. No color
+    # entry - DiffuseColor is indexed by Shape.Faces, which a wire never
+    # contributes to.
     for edge_ids, vertex_ids, closed in openskp.loose_edge_runs(definition):
         stats["edge_runs_built"] += 1
         pts = []
@@ -239,7 +276,7 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=N
             pts.append((v.x * INCH_TO_MM, v.y * INCH_TO_MM, v.z * INCH_TO_MM))
         wire = _make_loose_edge_wire(pts, closed) if complete else None
         if wire is not None:
-            shapes.append(wire)
+            bucket(inherited_layer)["shapes"].append(wire)
         else:
             stats["edge_runs_skipped"] += 1
 
@@ -247,27 +284,34 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=N
         child_def = model.definitions.get(inst.ref_idx)
         if child_def is None:
             continue
-        # An instance's own painted material_id overrides whatever this
-        # definition itself inherited, for both that child's unpainted
-        # faces AND everything nested further inside it - matching
-        # SketchUp's own paint-inheritance rule (see model.py's
-        # Instance.material_id docstring).
-        child_inherited = inst.material_id if inst.material_id is not None else inherited_material_id
-        child_local, child_colors = _get_local_shape(
-            child_def, model, stats, shape_cache, visiting, progress, child_inherited
+        # An instance's own painted material_id/explicit layer overrides
+        # whatever this definition itself inherited, for both that
+        # child's own unpainted/untagged content AND everything nested
+        # further inside it - matching SketchUp's own paint/tag-
+        # inheritance rules (see model.py's Instance.material_id and
+        # Instance.layer docstrings).
+        child_material = inst.material_id if inst.material_id is not None else inherited_material_id
+        child_layer = inst.layer if inst.layer else inherited_layer
+        child_buckets = _get_local_shape(
+            child_def, model, stats, shape_cache, visiting, progress, child_material, child_layer
         )
-        if child_local is None:
+        if not child_buckets:
             continue
         stats["placements"] += 1
-        placed = child_local.copy()
-        placed.transformShape(_to_freecad_matrix(inst.matrix))
-        shapes.append(placed)
-        colors.extend(child_colors)
+        matrix = _to_freecad_matrix(inst.matrix)
+        for layer_name, (child_shape, child_colors) in child_buckets.items():
+            placed = child_shape.copy()
+            placed.transformShape(matrix)
+            b = bucket(layer_name)
+            b["shapes"].append(placed)
+            b["colors"].extend(child_colors)
 
-    result = Part.makeCompound(shapes) if shapes else None
-    if result is None:
-        colors = []
-    shape_cache[key] = (result, colors)
+    result = {}
+    for layer_name, b in buckets.items():
+        if not b["shapes"]:
+            continue
+        result[layer_name] = (Part.makeCompound(b["shapes"]), b["colors"])
+    shape_cache[key] = result
 
     # A real building-scale file can have thousands of unique definitions;
     # a totally silent multi-minute call looks identical to a hang from
@@ -281,22 +325,29 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=N
     elif len(shape_cache) % 200 == 0:
         print(f"  ...{len(shape_cache)} unique definitions built so far")
 
-    return result, colors
+    return result
 
 
 def import_skp(filepath, doc=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
-    Every placed instance's geometry (walked through the full scene
-    graph, definitions resolved and cached, each unique definition's
-    shape built exactly once) becomes part of a single Part::Feature
-    compound. Each face's resolved color/opacity (its own paint, or
-    whatever an ancestor group/component painted itself with, or a
-    neutral default) is applied as ViewObject.DiffuseColor, one entry
-    per Shape.Faces - only when running under the real GUI, since
-    ViewObject doesn't exist under headless freecadcmd. Layers are not
-    yet carried over, and materials are import-only (not written back
-    out on export) - geometry-plus-solid-color, for now.
+    One Part::Feature compound per distinct SketchUp layer/tag actually
+    used by the file (walked through the full scene graph, definitions
+    resolved and cached, each unique (definition, layer, paint) context
+    built exactly once) - not one single object for the whole file, so
+    that a layer switched off in SketchUp's own Tags panel can import
+    already hidden (ViewObject.Visibility) and toggled independently of
+    the rest of the model, the same way FreeCAD's own Std_ToggleVisibility
+    already works object-by-object. Object internal Names are sanitized/
+    de-duplicated by FreeCAD itself; each object's Label is set to the
+    real, human-readable layer name.
+
+    Each face's resolved color/opacity (its own paint, or whatever an
+    ancestor group/component painted itself with, or a neutral default)
+    is applied as ViewObject.DiffuseColor, one entry per Shape.Faces -
+    only when running under the real GUI, since ViewObject doesn't exist
+    under headless freecadcmd. Materials are import-only (not written
+    back out on export); layer export is not yet supported either.
     """
     import openskp
 
@@ -332,27 +383,37 @@ def import_skp(filepath, doc=None):
         progress.start("Building SketchUp geometry...", max(1, len(model.definitions) + 1))
 
     try:
-        root_shape, root_colors = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
+        root_buckets = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
     finally:
         if progress is not None:
             progress.stop()
 
-    if root_shape is not None:
-        obj = doc.addObject("Part::Feature", "SketchUpImport")
-        obj.Shape = root_shape
-        # Kept on stats (not just applied to the ViewObject below) so this
-        # is checkable headlessly under freecadcmd/CI, where ViewObject
-        # doesn't exist at all - not just "assume the GUI path works."
-        stats["face_colors"] = root_colors
-        if App.GuiUp and len(root_colors) == len(root_shape.Faces):
-            obj.ViewObject.DiffuseColor = root_colors
+    layer_hidden = {layer.name: layer.hidden for layer in model.layers}
+    # Kept on stats (not just applied to the ViewObject below) so this is
+    # checkable headlessly under freecadcmd/CI, where ViewObject doesn't
+    # exist at all - not just "assume the GUI path works."
+    stats["layer_face_colors"] = {}
+    stats["hidden_layers"] = 0
+    for layer_name, (shape, colors) in root_buckets.items():
+        base_name = "".join(c if c.isalnum() else "_" for c in layer_name) or "Layer"
+        obj = doc.addObject("Part::Feature", f"SketchUpImport_{base_name}")
+        obj.Label = layer_name
+        obj.Shape = shape
+        stats["layer_face_colors"][layer_name] = colors
+        if App.GuiUp:
+            if len(colors) == len(shape.Faces):
+                obj.ViewObject.DiffuseColor = colors
+            if layer_hidden.get(layer_name, False):
+                obj.ViewObject.Visibility = False
+                stats["hidden_layers"] += 1
 
     doc.recompute()
     print(
         f"openskp: {len(shape_cache)} unique definitions built in {time.time() - t0:.1f}s "
         f"({stats['faces_built']} faces, {stats['faces_skipped']} skipped; "
         f"{stats['edge_runs_built']} loose-edge runs, {stats['edge_runs_skipped']} skipped), "
-        f"{stats['placements']} instances placed"
+        f"{stats['placements']} instances placed; {len(root_buckets)} layers "
+        f"({stats['hidden_layers']} hidden)"
     )
     return doc
 

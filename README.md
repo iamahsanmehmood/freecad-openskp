@@ -58,9 +58,24 @@ matter. Only applied under the real GUI (`ViewObject` doesn't exist
 under headless `freecadcmd`) - the underlying color resolution itself is
 exercised either way (see `tests/test_import.py`).
 
-**Not yet carried over, either direction:** layers and layer visibility,
-material export (FreeCAD → `.skp`). A face's shape and position import
-and export correctly; its layer does not yet, in either direction.
+**Layers** (SketchUp calls them "tags", import only) carry over too -
+unlike materials, which fit onto the existing single-compound design as
+one color per face, a layer needs its own object to be independently
+toggleable at all, since FreeCAD has no per-face visibility the way it
+has per-face color. So import now produces **one `Part::Feature` object
+per distinct layer** actually used in the file (not always a single
+"SketchUpImport" object anymore), each labeled with its real layer name.
+A layer switched off in SketchUp's own Tags panel imports with that
+object's `Visibility` already off - one click (or `Space`) to toggle it
+back on, independent of every other layer. Verified against a real
+145-definition structural-framing production file: 11 distinct layers,
+2 genuinely hidden in the source file (cladding layers) - both objects
+correctly imported hidden, structural framing alone visible by default.
+
+**Not yet carried over, either direction:** layer export (FreeCAD →
+`.skp`), material export. A face's shape, position, and (import-only)
+color/layer all carry over correctly now; nothing carries back out
+beyond geometry yet.
 
 ## Performance on large files — read this before importing a big model
 
@@ -142,14 +157,24 @@ real structural-framing production file above, 9,677 faces resolved to
 face getting exactly one color (verified 1:1 against `Shape.Faces`,
 since `ViewObject.DiffuseColor` is positional).
 
-**Not yet verified:** the `Init.py`/`addImportType` registration that makes
-**File → Open** work from FreeCAD's real GUI. It follows the exact,
-documented convention FreeCAD's own bundled importers (OBJ, DAE, 3DS) use —
-but `addImportType`'s dispatch only activates under the real GUI, which
-`freecadcmd`'s headless mode doesn't exercise. Calling `importSKP.open()`/
-`importSKP.insert()` directly (as the fixtures above do) is fully verified;
-whether the GUI's own File dialog wires up to it correctly needs a real,
-interactive FreeCAD session to confirm.
+Layers were verified the same way, plus visually in a real interactive
+FreeCAD session: on the same structural-framing production file, 11
+`Part::Feature` objects were created (one per layer, matching `Layer0`
+plus the 10 layers actually used by placements), the two cladding layers
+(`wall_external_cladding_1`, `wall_internal_cladding_1`) showed the
+closed-eye Outliner icon and rendered hidden in the 3D view exactly as
+SketchUp's own Tags panel has them, and every other layer rendered
+visible - the structural framing skeleton alone, cladding hidden, without
+manually toggling anything.
+
+**Verified interactively, not just headlessly:** `Init.py`'s
+`addImportType` registration - **File → Open** on a real `.skp` file in
+FreeCAD's actual GUI (not just `freecadcmd`) opens it correctly, producing
+the expected per-layer objects with materials and hidden-layer visibility
+applied. `freecadcmd`'s headless mode still can't exercise
+`ViewObject`-dependent behavior at all (materials/layer visibility), so
+that half is checked both ways - data-only under `freecadcmd`, visually
+under the real GUI - rather than headlessly alone.
 
 ## Contributing
 

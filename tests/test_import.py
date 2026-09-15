@@ -25,14 +25,18 @@ FIXTURES_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "fixtures"
 )
 
-# Expected (faces, invalid, nan_area, loose_edges) per fixture - from the
-# README's own "Verification status" table. A real regression (a
-# suddenly-degenerate import, or loose edges silently dropping again)
-# must fail this test, not just print a different number - that's the
-# whole point of pinning these rather than only checking "didn't crash."
+# Expected (faces, invalid, nan_area, loose_edges, layers, hidden_layers) per
+# fixture - from the README's own "Verification status" table. A real
+# regression (a suddenly-degenerate import, loose edges silently dropping
+# again, or layers no longer splitting into separate objects) must fail this
+# test, not just print a different number - that's the whole point of
+# pinning these rather than only checking "didn't crash." Both fixtures only
+# use SketchUp's default "Layer0" (unhidden) - real multi-layer/hidden-layer
+# splitting was verified separately against a real external structural-
+# framing file (see importSKP.py's module docstring and the README).
 EXPECTED = {
-    "SU_File.skp": (32, 0, 0, 0),
-    "capilla_quiroz_v17.skp": (192, 0, 0, 20),
+    "SU_File.skp": (32, 0, 0, 0, 1, 0),
+    "capilla_quiroz_v17.skp": (192, 0, 0, 20, 1, 0),
 }
 
 
@@ -43,28 +47,53 @@ def check(fixture_name):
         importSKP.import_skp(path, doc)
         objs = [o for o in doc.Objects if hasattr(o, "Shape")]
         assert objs, f"{fixture_name}: no shape object created"
-        shape = objs[0].Shape
-        faces = shape.Faces
+
+        # One object per layer now (not always exactly one object overall)
+        # - aggregate faces/edges across all of them, matching how the
+        # rest of this test already treats "the import" as a whole rather
+        # than any single object.
+        faces = [f for o in objs for f in o.Shape.Faces]
         invalid = [f for f in faces if not f.isValid()]
         nan_area = [f for f in faces if math.isnan(f.Area)]
 
         face_edge_hashes = {e.hashCode() for f in faces for e in f.Edges}
-        loose_edges = [e for e in shape.Edges if e.hashCode() not in face_edge_hashes]
+        loose_edges = [e for o in objs for e in o.Shape.Edges if e.hashCode() not in face_edge_hashes]
 
-        got = (len(faces), len(invalid), len(nan_area), len(loose_edges))
+        layer_count, hidden_count = check_layers(fixture_name, objs)
+        got = (len(faces), len(invalid), len(nan_area), len(loose_edges), layer_count, hidden_count)
         print(
             f"{fixture_name}: {got[0]} faces, {got[1]} invalid, {got[2]} NaN-area, "
-            f"{got[3]} loose edges"
+            f"{got[3]} loose edges, {got[4]} layers ({got[5]} hidden)"
         )
         expected = EXPECTED.get(fixture_name)
         if expected is not None:
             assert got == expected, (
-                f"{fixture_name}: expected {expected} (faces, invalid, nan_area, loose_edges), got {got}"
+                f"{fixture_name}: expected {expected} "
+                f"(faces, invalid, nan_area, loose_edges, layers, hidden_layers), got {got}"
             )
         check_face_colors(fixture_name, len(faces))
         return got
     finally:
         App.closeDocument(doc.Name)
+
+
+def check_layers(fixture_name, objs):
+    """Returns (layer_count, hidden_count) and checks the mechanics: each
+    object's Label is a real layer name (not FreeCAD's own sanitized/
+    de-duplicated internal Name), every Label is distinct (one object per
+    layer, not several accidentally sharing one), and - only under the
+    real GUI, since ViewObject doesn't exist under headless freecadcmd -
+    that a layer's own hidden flag (model.layers' Layer.hidden) landed on
+    the right object's ViewObject.Visibility."""
+    labels = [o.Label for o in objs]
+    assert len(set(labels)) == len(labels), f"{fixture_name}: duplicate layer Labels {labels}"
+
+    hidden_count = 0
+    if App.GuiUp:
+        for o in objs:
+            if not o.ViewObject.Visibility:
+                hidden_count += 1
+    return (len(objs), hidden_count)
 
 
 # Per fixture: expected distinct RGBA colors present after material
@@ -89,27 +118,42 @@ def check_face_colors(fixture_name, expected_face_count):
     App.GuiUp, which freecadcmd never is - so this calls the same
     _get_local_shape() used in production directly, the only way to
     exercise this headlessly) against the pinned facts above, not just
-    "some color got produced." """
+    "some color got produced." Aggregates across every layer bucket
+    _get_local_shape() returns, same reasoning as check()'s own
+    aggregation across doc.Objects."""
     import openskp
 
     path = os.path.join(FIXTURES_DIR, fixture_name)
     model = openskp.SkpFile.open(path).parse()
 
     stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0, "edge_runs_built": 0, "edge_runs_skipped": 0}
-    shape, colors = importSKP._get_local_shape(model.root, model, stats, {}, frozenset())
-    assert len(colors) == expected_face_count, (
-        f"{fixture_name}: {len(colors)} face colors for {expected_face_count} faces - "
-        "must be 1:1 with Shape.Faces, since ViewObject.DiffuseColor is applied positionally"
-    )
-    assert shape is not None and len(shape.Faces) == expected_face_count
+    root_buckets = importSKP._get_local_shape(model.root, model, stats, {}, frozenset())
+    assert root_buckets, f"{fixture_name}: _get_local_shape produced no layer buckets at all"
 
-    got_alphas = {round(c[3], 3) for c in colors}
+    all_colors = []
+    total_faces = 0
+    for layer_name, (shape, colors) in root_buckets.items():
+        assert len(colors) == len(shape.Faces), (
+            f"{fixture_name}/{layer_name}: {len(colors)} face colors for {len(shape.Faces)} faces - "
+            "must be 1:1 with Shape.Faces, since ViewObject.DiffuseColor is applied positionally"
+        )
+        all_colors.extend(colors)
+        total_faces += len(shape.Faces)
+
+    assert total_faces == expected_face_count, (
+        f"{fixture_name}: {total_faces} faces across {len(root_buckets)} layer(s), expected {expected_face_count}"
+    )
+
+    got_alphas = {round(c[3], 3) for c in all_colors}
     expected_alphas = EXPECTED_DISTINCT_ALPHAS.get(fixture_name)
     if expected_alphas is not None:
         assert got_alphas == expected_alphas, (
             f"{fixture_name}: expected alpha values {expected_alphas}, got {got_alphas}"
         )
-    print(f"{fixture_name}: {len(set(colors))} distinct face colors, alphas {sorted(got_alphas)} - OK")
+    print(
+        f"{fixture_name}: {len(set(all_colors))} distinct face colors across {len(root_buckets)} "
+        f"layer(s), alphas {sorted(got_alphas)} - OK"
+    )
 
 
 # Note: freecadcmd runs a script file as a module named after the file
