@@ -61,9 +61,55 @@ def check(fixture_name):
             assert got == expected, (
                 f"{fixture_name}: expected {expected} (faces, invalid, nan_area, loose_edges), got {got}"
             )
+        check_face_colors(fixture_name, len(faces))
         return got
     finally:
         App.closeDocument(doc.Name)
+
+
+# Per fixture: expected distinct RGBA colors present after material
+# resolution (rounded to 3dp) - pinned from real, independently-verified
+# facts about these exact source files: SU_File.skp carries no materials
+# at all (every face falls back to the shared default), while
+# capilla_quiroz_v17.skp's 0.5/0.7-alpha translucent glass materials were
+# already cross-validated once, independently, against openskp's own
+# build_instanced_scene() output while adding the equivalent Blender
+# materials support (see blender-openskp/tests/test_import.py) - the SAME
+# source file, so those two alpha values recurring here is a genuine
+# cross-check, not a coincidence.
+EXPECTED_DISTINCT_ALPHAS = {
+    "SU_File.skp": {1.0},
+    "capilla_quiroz_v17.skp": {0.5, 0.7, 1.0},
+}
+
+
+def check_face_colors(fixture_name, expected_face_count):
+    """Cross-checks material -> per-face-color resolution directly
+    (import_skp() itself only applies ViewObject.DiffuseColor when
+    App.GuiUp, which freecadcmd never is - so this calls the same
+    _get_local_shape() used in production directly, the only way to
+    exercise this headlessly) against the pinned facts above, not just
+    "some color got produced." """
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    model = openskp.SkpFile.open(path).parse()
+
+    stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0, "edge_runs_built": 0, "edge_runs_skipped": 0}
+    shape, colors = importSKP._get_local_shape(model.root, model, stats, {}, frozenset())
+    assert len(colors) == expected_face_count, (
+        f"{fixture_name}: {len(colors)} face colors for {expected_face_count} faces - "
+        "must be 1:1 with Shape.Faces, since ViewObject.DiffuseColor is applied positionally"
+    )
+    assert shape is not None and len(shape.Faces) == expected_face_count
+
+    got_alphas = {round(c[3], 3) for c in colors}
+    expected_alphas = EXPECTED_DISTINCT_ALPHAS.get(fixture_name)
+    if expected_alphas is not None:
+        assert got_alphas == expected_alphas, (
+            f"{fixture_name}: expected alpha values {expected_alphas}, got {got_alphas}"
+        )
+    print(f"{fixture_name}: {len(set(colors))} distinct face colors, alphas {sorted(got_alphas)} - OK")
 
 
 # Note: freecadcmd runs a script file as a module named after the file

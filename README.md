@@ -43,10 +43,24 @@ reconstruct component/group structure - everything lands flat at the
 file's root. Round-trip-verified: exported coordinates match the
 original geometry exactly (see tests/test_export.py).
 
-**Not yet carried over, either direction:** materials, layers, and layer
-visibility. Geometry only, for now - a face's shape and position import
-and export correctly; its color and which layer it lives on do not
-(yet).
+**Materials** (import only, for now) carry over too, as
+`ViewObject.DiffuseColor` (one RGBA entry per `Shape.Faces`, FreeCAD's
+own per-face-color mechanism - the same one `Part::Feature` objects with
+a mixed-material compound already use elsewhere): each face's own paint,
+or whatever an ancestor group/component painted itself with when the
+face has none, or a neutral default when nothing was ever painted -
+matching SketchUp's own paint-inheritance rule. Solid colors and opacity
+only for this pass - no texture images, and (deliberately, for now) not
+a face's individual layer-color fallback, since that needs a layer
+id → color lookup openskp doesn't expose publicly yet; real painted
+files resolve through material_id long before that fallback would
+matter. Only applied under the real GUI (`ViewObject` doesn't exist
+under headless `freecadcmd`) - the underlying color resolution itself is
+exercised either way (see `tests/test_import.py`).
+
+**Not yet carried over, either direction:** layers and layer visibility,
+material export (FreeCAD → `.skp`). A face's shape and position import
+and export correctly; its layer does not yet, in either direction.
 
 ## Performance on large files — read this before importing a big model
 
@@ -115,6 +129,18 @@ directly:
 | `SU_File.skp` | 32 | 0 | 32 imported, 0 invalid |
 | `Untitled.skp` | 1,588 | — | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
 | A real structural-framing file (outside the repo) | 9,652 | 1,077 | All faces and loose edges imported, 0 skipped — 93 of the file's 145 definitions were entirely or partly loose-edge (light-gauge-steel members drawn as construction lines), previously silently invisible |
+
+Materials are cross-checked against `openskp`'s own resolved
+`materials_by_id` for the same fixtures (not just "some color got
+produced"): `capilla_quiroz_v17.skp`'s 16 declared materials resolve
+down to 9 distinct face colors actually used, including its two
+translucent glass materials (alpha 0.5 and 0.7 exactly) landing on the
+right faces; `SU_File.skp` carries no materials at all, and every one of
+its 32 faces correctly falls back to the shared default. On the same
+real structural-framing production file above, 9,677 faces resolved to
+6 distinct colors from the file's 35 declared materials in 4.4s, every
+face getting exactly one color (verified 1:1 against `Shape.Faces`,
+since `ViewObject.DiffuseColor` is positional).
 
 **Not yet verified:** the `Init.py`/`addImportType` registration that makes
 **File → Open** work from FreeCAD's real GUI. It follows the exact,

@@ -120,6 +120,45 @@ def _make_loose_edge_wire(points_mm, closed):
         return None
 
 
+_DEFAULT_FACE_RGBA = (200 / 255, 200 / 255, 200 / 255, 1.0)  # matches openskp.Material's own default color
+
+
+def _material_rgba(material):
+    """openskp.Material -> (r, g, b, a) floats in 0-1, FreeCAD's own
+    DiffuseColor format. Two independent things can make a material
+    translucent - the color record's own alpha byte, and the separate
+    `transparency` factor (SketchUp's useTrans) - multiplying both is
+    safe either way since an untouched one defaults to fully opaque."""
+    r, g, b, a = material.color
+    alpha = (a / 255.0) * material.transparency
+    return (r / 255.0, g / 255.0, b / 255.0, alpha)
+
+
+def _resolve_face_color(face, model, inherited_material_id):
+    """A face's effective display color: its own front material if
+    painted directly, else whatever material an ancestor group/component
+    instance painted itself with (`inherited_material_id`, threaded down
+    through _get_local_shape the same way SketchUp itself resolves an
+    unpainted face's color), else a neutral default.
+
+    Deliberately front-material only (back_material_id is ignored) and
+    deliberately skips the layer-color fallback build_instanced_scene()
+    also has: FreeCAD's Face.layer is a layer ID with no public id->color
+    lookup exposed by openskp yet, and the vast majority of painted real
+    files resolve through material_id long before that fallback would
+    ever matter - a reasonable, documented scope cut for the same
+    "solid colors first" pass as the Blender addon's import, not an
+    oversight.
+    """
+    mat_id = face.material_id if face.material_id is not None else inherited_material_id
+    if mat_id is None:
+        return _DEFAULT_FACE_RGBA
+    mat = model.materials_by_id.get(mat_id)
+    if mat is None:
+        return _DEFAULT_FACE_RGBA
+    return _material_rgba(mat)
+
+
 def _make_face_shape(definition, face):
     """Builds one face's shape in the definition's own LOCAL space
     (no world transform applied - that happens once per placement,
@@ -147,26 +186,37 @@ def _make_face_shape(definition, face):
             return None
 
 
-def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=None):
-    """Returns `definition`'s own geometry (its faces, its loose-edge
-    runs, plus every nested instance's geometry, transformed into this
-    definition's local space), built exactly once per unique definition
-    and cached by identity for the lifetime of this import call."""
+def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=None, inherited_material_id=None):
+    """Returns (`definition`'s own geometry, a parallel list of RGBA face
+    colors matching Shape.Faces order) - its faces, its loose-edge runs,
+    plus every nested instance's geometry, transformed into this
+    definition's local space.
+
+    Cached by (definition identity, inherited_material_id): the SAME
+    definition can legitimately render with different fallback colors
+    for its unpainted faces depending on what an ancestor group/component
+    painted itself with (SketchUp's own paint-inheritance rule - see
+    _resolve_face_color) - caching on identity alone would silently merge
+    those into whichever context was built first, same class of bug
+    already found and fixed for build_instanced_scene()'s mesh_resource_for.
+    """
     import openskp
 
-    key = id(definition)
+    key = (id(definition), inherited_material_id)
     if key in shape_cache:
         return shape_cache[key]
     if key in visiting:
-        return None  # a real cycle in the instance graph - bail, don't spin
+        return None, []  # a real cycle in the instance graph - bail, don't spin
     visiting = visiting | {key}
 
     shapes = []
+    colors = []
     for face in definition.faces.values():
         stats["faces_built"] += 1
         shape = _make_face_shape(definition, face)
         if shape is not None:
             shapes.append(shape)
+            colors.append(_resolve_face_color(face, model, inherited_material_id))
         else:
             stats["faces_skipped"] += 1
 
@@ -197,16 +247,27 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=N
         child_def = model.definitions.get(inst.ref_idx)
         if child_def is None:
             continue
-        child_local = _get_local_shape(child_def, model, stats, shape_cache, visiting, progress)
+        # An instance's own painted material_id overrides whatever this
+        # definition itself inherited, for both that child's unpainted
+        # faces AND everything nested further inside it - matching
+        # SketchUp's own paint-inheritance rule (see model.py's
+        # Instance.material_id docstring).
+        child_inherited = inst.material_id if inst.material_id is not None else inherited_material_id
+        child_local, child_colors = _get_local_shape(
+            child_def, model, stats, shape_cache, visiting, progress, child_inherited
+        )
         if child_local is None:
             continue
         stats["placements"] += 1
         placed = child_local.copy()
         placed.transformShape(_to_freecad_matrix(inst.matrix))
         shapes.append(placed)
+        colors.extend(child_colors)
 
     result = Part.makeCompound(shapes) if shapes else None
-    shape_cache[key] = result
+    if result is None:
+        colors = []
+    shape_cache[key] = (result, colors)
 
     # A real building-scale file can have thousands of unique definitions;
     # a totally silent multi-minute call looks identical to a hang from
@@ -220,7 +281,7 @@ def _get_local_shape(definition, model, stats, shape_cache, visiting, progress=N
     elif len(shape_cache) % 200 == 0:
         print(f"  ...{len(shape_cache)} unique definitions built so far")
 
-    return result
+    return result, colors
 
 
 def import_skp(filepath, doc=None):
@@ -229,8 +290,13 @@ def import_skp(filepath, doc=None):
     Every placed instance's geometry (walked through the full scene
     graph, definitions resolved and cached, each unique definition's
     shape built exactly once) becomes part of a single Part::Feature
-    compound. Materials/layers are not yet carried over - geometry
-    only, for now.
+    compound. Each face's resolved color/opacity (its own paint, or
+    whatever an ancestor group/component painted itself with, or a
+    neutral default) is applied as ViewObject.DiffuseColor, one entry
+    per Shape.Faces - only when running under the real GUI, since
+    ViewObject doesn't exist under headless freecadcmd. Layers are not
+    yet carried over, and materials are import-only (not written back
+    out on export) - geometry-plus-solid-color, for now.
     """
     import openskp
 
@@ -266,7 +332,7 @@ def import_skp(filepath, doc=None):
         progress.start("Building SketchUp geometry...", max(1, len(model.definitions) + 1))
 
     try:
-        root_shape = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
+        root_shape, root_colors = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
     finally:
         if progress is not None:
             progress.stop()
@@ -274,6 +340,12 @@ def import_skp(filepath, doc=None):
     if root_shape is not None:
         obj = doc.addObject("Part::Feature", "SketchUpImport")
         obj.Shape = root_shape
+        # Kept on stats (not just applied to the ViewObject below) so this
+        # is checkable headlessly under freecadcmd/CI, where ViewObject
+        # doesn't exist at all - not just "assume the GUI path works."
+        stats["face_colors"] = root_colors
+        if App.GuiUp and len(root_colors) == len(root_shape.Faces):
+            obj.ViewObject.DiffuseColor = root_colors
 
     doc.recompute()
     print(
