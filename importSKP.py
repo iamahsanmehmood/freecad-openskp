@@ -27,6 +27,22 @@ fixed to match, openskp#320). Only the translation component needs the
 inches->mm scale factor applied when converting to a FreeCAD.Matrix; the
 3x3 rotation/scale part is a dimensionless ratio, unaffected by units.
 
+Non-uniform scale: every placed instance is applied via
+Shape.transformShape(matrix, False, True) - that trailing `True` is
+checkScale, and it matters. Without it, transformShape() silently falls
+back to OCCT's similarity-only gp_Trsf transform, which cannot represent
+non-uniform scale (different factors on different axes) and collapses
+it to the geometric mean of the three instead - confirmed directly, not
+theoretical: a real 2x/3x/0.5x placement came back a flat ~1.44x
+(cube-root of 2*3*0.5) on every axis before this was found. checkScale
+makes transformShape() detect that case and fall back to the general
+(BRepBuilderAPI_GTransform) transform instead, which preserves
+non-uniform scale exactly - same cost as before for the common case
+(uniform scale, or rotation/translation only), only paying for the more
+general math when a placement genuinely needs it. See
+tests/test_import.py's check_nonuniform_scale() for the regression test
+this was found and fixed against.
+
 Loose edges (construction lines/structural framing - a light-gauge-steel
 member is routinely drawn this way, not as a solid) come from openskp's
 public openskp.loose_edge_runs(definition) - added specifically for this
@@ -308,7 +324,18 @@ def _get_local_shape(
         matrix = _to_freecad_matrix(inst.matrix)
         for layer_name, (child_shape, child_colors) in child_buckets.items():
             placed = child_shape.copy()
-            placed.transformShape(matrix)
+            # checkScale=True: without it, Shape.transformShape() silently
+            # falls back to OCCT's similarity-only gp_Trsf transform, which
+            # cannot represent non-uniform scale and collapses it to the
+            # geometric mean of the three axes instead - confirmed directly
+            # (a 2x/3x/0.5x placement came out a flat ~1.44x on every axis).
+            # checkScale=True makes it detect that case and use the general
+            # (BRepBuilderAPI_GTransform) transform instead, which preserves
+            # non-uniform scale exactly - same cost for the common case
+            # (uniform scale/rotation-only placements, the vast majority),
+            # only doing the more general math when a placement actually
+            # needs it.
+            placed.transformShape(matrix, False, True)
             b = bucket(layer_name)
             b["shapes"].append(placed)
             b["colors"].extend(child_colors)

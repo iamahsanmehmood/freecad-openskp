@@ -156,6 +156,94 @@ def check_face_colors(fixture_name, expected_face_count):
     )
 
 
+def check_nonuniform_scale():
+    """Regression test for a real bug: Shape.transformShape() without
+    checkScale=True silently falls back to OCCT's similarity-only
+    gp_Trsf transform, which can't represent non-uniform scale and
+    collapses it to the geometric mean of the three axes instead -
+    confirmed directly (a 2x/3x/0.5x placement came out a flat ~1.44x on
+    every axis before this was fixed). Builds a synthetic file with a
+    component placed three ways (identity, non-uniform scale, that same
+    scale combined with a 90deg rotation - to also catch a transform-
+    ORDER bug scale alone could hide) via openskp's own writer, so the
+    expected bounding boxes are computed directly from the matrices this
+    test itself authored, independent of every code path being tested."""
+    import openskp
+
+    builder = openskp.create()
+    with builder.add_component_definition("CornerBox") as cb:
+        cb.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
+        cb.add_face([(0, 0, 0), (10, 0, 0), (10, 0, 10), (0, 0, 10)])
+        cb.add_face([(0, 0, 0), (0, 10, 0), (0, 10, 10), (0, 0, 10)])
+
+    IDENTITY = (1, 0, 0, 0, 1, 0, 0, 0, 1)
+    SCALE = (2, 0, 0, 0, 3, 0, 0, 0, 0.5)
+    ROT_Z = (0, -1, 0, 1, 0, 0, 0, 0, 1)  # 90deg about Z
+
+    def matmul3(a, b):
+        return tuple(
+            sum(a[r * 3 + k] * b[k * 3 + col] for k in range(3))
+            for r in range(3) for col in range(3)
+        )
+
+    SCALE_THEN_ROTATE = matmul3(ROT_Z, SCALE)
+
+    builder.add_instance(cb, name="Identity", matrix3x3=IDENTITY, translation=(0, 0, 0))
+    builder.add_instance(cb, name="Scaled", matrix3x3=SCALE, translation=(100, 0, 0))
+    builder.add_instance(cb, name="ScaledRotated", matrix3x3=SCALE_THEN_ROTATE, translation=(200, 0, 0))
+
+    path = os.path.join(FIXTURES_DIR, "_scale_test_tmp.skp")
+    with open(path, "wb") as f:
+        f.write(builder.to_bytes())
+
+    def apply(m, t, pt):
+        x, y, z = pt
+        return (
+            m[0] * x + m[1] * y + m[2] * z + t[0],
+            m[3] * x + m[4] * y + m[5] * z + t[1],
+            m[6] * x + m[7] * y + m[8] * z + t[2],
+        )
+
+    corners = [(x, y, z) for x in (0, 10) for y in (0, 10) for z in (0, 10)]
+
+    def expected_bbox_mm(m, t):
+        pts = [apply(m, t, c) for c in corners]
+        xs, ys, zs = zip(*pts)
+        MM = 25.4
+        return (
+            (min(xs) * MM, min(ys) * MM, min(zs) * MM),
+            (max(xs) * MM, max(ys) * MM, max(zs) * MM),
+        )
+
+    expected = {
+        "Identity": expected_bbox_mm(IDENTITY, (0, 0, 0)),
+        "Scaled": expected_bbox_mm(SCALE, (100, 0, 0)),
+        "ScaledRotated": expected_bbox_mm(SCALE_THEN_ROTATE, (200, 0, 0)),
+    }
+
+    doc = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc)
+        objs = [o for o in doc.Objects if hasattr(o, "Shape")]
+        assert len(objs) == 1, f"expected 1 layer object (no layers used), got {len(objs)}"
+        all_pts = [(v.X, v.Y, v.Z) for v in objs[0].Shape.Vertexes]
+
+        for name, (exp_min, exp_max) in expected.items():
+            matches = [
+                p for p in all_pts
+                if all(exp_min[i] - 1e-2 <= p[i] <= exp_max[i] + 1e-2 for i in range(3))
+            ]
+            assert len(matches) >= 4, (
+                f"non-uniform scale check failed for {name!r}: expected corners within "
+                f"{exp_min} - {exp_max} (mm), found only {len(matches)} matching vertices - "
+                f"full vertex list: {all_pts}"
+            )
+        print(f"check_nonuniform_scale: OK ({sorted(expected)}, all within expected bounding boxes)")
+    finally:
+        App.closeDocument(doc.Name)
+        os.remove(path)
+
+
 # Note: freecadcmd runs a script file as a module named after the file
 # (e.g. "test_import"), not "__main__" like a normal Python interpreter -
 # so this runs unconditionally at import time rather than behind an
@@ -168,3 +256,4 @@ for _name in os.listdir(FIXTURES_DIR):
 assert _checked == len(EXPECTED), (
     f"expected to check {len(EXPECTED)} fixtures, found {_checked} .skp files in {FIXTURES_DIR}"
 )
+check_nonuniform_scale()

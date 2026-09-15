@@ -183,6 +183,18 @@ changes, re-parsed independently, and the resulting `model.layers` names
 matched the original 11 exactly - a real end-to-end check, not just "an
 object's Label got read."
 
+**Non-uniform scale** is verified explicitly, not just assumed to work
+because rotation/translation do: a synthetic file places one component
+three ways - identity, a 2x/3x/0.5x non-uniform scale, and that same
+scale combined with a 90° rotation - with the expected world-space
+bounding box for each computed directly from the placement matrices,
+independent of any openskp/FreeCAD code. This caught a real bug (see
+`importSKP.py`'s own "Non-uniform scale" docstring section): without
+`checkScale=True` on `Shape.transformShape()`, FreeCAD/OCCT silently
+collapses non-uniform scale to its geometric mean, so a 2x/3x/0.5x
+placement came back a flat ~1.44x on every axis instead. Fixed, and
+pinned as `tests/test_import.py`'s `check_nonuniform_scale()`.
+
 **Verified interactively, not just headlessly:** `Init.py`'s
 `addImportType` registration - **File → Open** on a real `.skp` file in
 FreeCAD's actual GUI (not just `freecadcmd`) opens it correctly, producing
