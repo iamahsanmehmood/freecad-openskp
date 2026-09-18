@@ -54,14 +54,7 @@ def run():
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_export_test.skp")
     importSKP.export([obj1, obj2], out_path)
 
-    sys.path.insert(
-        0,
-        os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "vendor",
-        ),
-    )
-    import openskp
+    import openskp  # already registered in sys.modules by importSKP's own import above
 
     model = openskp.SkpFile.open(out_path).parse()
     os.remove(out_path)

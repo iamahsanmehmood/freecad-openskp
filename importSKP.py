@@ -85,6 +85,7 @@ production file (see tests/test_export.py and the README).
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 import time
@@ -101,12 +102,33 @@ _real_open = open
 INCH_TO_MM = 25.4
 IDENTITY_13 = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
 
-# Vendored copy of the openskp package (pure Python, no compiled wheel) -
-# lets this addon work standalone without asking users to separately
-# `pip install openskp` into FreeCAD's own embedded interpreter.
-_VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
-if _VENDOR_DIR not in sys.path:
-    sys.path.insert(0, _VENDOR_DIR)
+
+def _load_vendored_openskp():
+    """Registers the vendored openskp package (pure Python, no compiled
+    wheel - lets this addon work standalone without asking users to
+    separately `pip install openskp` into FreeCAD's own embedded
+    interpreter) directly into sys.modules, instead of prepending its
+    directory to sys.path - the latter is flagged practice for legacy
+    (non-namespaced) FreeCAD addons, since it leaks into every other
+    module's import resolution for the rest of the session, not just
+    this one's. Registering by spec keeps openskp's own internal
+    relative imports (e.g. `from .create import ...`) working exactly
+    as they would under a normal sys.path-based import."""
+    if "openskp" in sys.modules:
+        return sys.modules["openskp"]
+    vendor_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+    spec = importlib.util.spec_from_file_location(
+        "openskp",
+        os.path.join(vendor_dir, "openskp", "__init__.py"),
+        submodule_search_locations=[os.path.join(vendor_dir, "openskp")],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["openskp"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+openskp = _load_vendored_openskp()
 
 
 def _to_freecad_matrix(m13):

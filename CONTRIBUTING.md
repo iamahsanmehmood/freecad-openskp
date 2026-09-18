@@ -24,7 +24,8 @@ issue"` shows your `Mod/` path). Restart FreeCAD.
 The `vendor/openskp/` directory is a vendored copy of the pure-Python
 [OpenSKP](https://github.com/iamahsanmehmood/openskp) package — no
 separate `pip install` needed, and no network access required to run the
-addon or its tests.
+addon or its tests. See [vendor/README.md](vendor/README.md) for the
+pinned version and why it's vendored rather than a declared dependency.
 
 ## Running tests
 
