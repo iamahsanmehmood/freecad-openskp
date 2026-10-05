@@ -15,14 +15,23 @@ before vendoring. `openskp` is not on that list, and even a declared
 users would have to `pip install openskp` into FreeCAD's own embedded
 interpreter manually before the addon would even import. Vendoring avoids
 that friction entirely, and openskp meets the guidance's own criteria for
-"vendor with care": pure Python (no compiled extensions to rebuild per
-platform), permissively (MIT) licensed - compatible with this addon's own
+"vendor with care": pure Python in everything this addon actually uses (the one
+compiled dependency, `mapbox_earcut`, is only needed by openskp's scene/mesh
+triangulation, which this importer doesn't call - see below), permissively (MIT) licensed - compatible with this addon's own
 MIT license - small, and stable.
 
 ## What's different from upstream
 
-Nothing beyond the pin itself. No local modifications have been made to
-the vendored copy.
+One local modification, in `openskp/_core.py`: `import mapbox_earcut` is
+optional (wrapped in `try/except ImportError`), with `triangulate_face_3d`
+falling back to fan triangulation and logging a one-time warning. Upstream
+hard-imported it at module top level, which made `import openskp` fail
+outright in FreeCAD's bundled Python (no `mapbox_earcut`) - see
+[freecad-openskp#3](https://github.com/iamahsanmehmood/freecad-openskp/issues/3).
+The same change is upstream in
+[openskp#406](https://github.com/iamahsanmehmood/openskp/pull/406); once a
+release containing it is vendored here, this modification disappears and this
+section goes back to "nothing beyond the pin".
 
 ## Updating this vendored copy
 
