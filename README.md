@@ -160,8 +160,15 @@ directly:
 | `capilla_quiroz_v17.skp` | 192 | 20 | 192 faces + 20 loose edges imported, 0 invalid |
 | `gondola_v20.skp` | 39,352 | — | 39,352 imported, 0 invalid |
 | `SU_File.skp` | 32 | 0 | 32 imported, 0 invalid |
+| `arcs_2017.skp`, `arcs_2021.skp` | 2 | 1 | The same model saved as SketchUp 2017 and 2021: a disc and a half disc (2 faces) and one loose 90 degree arc, which imports as a single real arc edge (radius 254 mm, length 398.98 mm), not a polyline. Pinned in `tests/test_import.py` (`check_arcs`) |
 | `Untitled.skp` | 1,588 | — | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
 | A real structural-framing file (outside the repo) | 9,652 | 1,077 | All faces and loose edges imported, 0 skipped — 93 of the file's 145 definitions were entirely or partly loose-edge (light-gauge-steel members drawn as construction lines), previously silently invisible |
+
+**Arcs and circles.** A loose arc or circle drawn in SketchUp (a run of straight edges that SketchUp
+also stores as one exact arc) imports as a real FreeCAD arc or circle with a centre and a radius, not
+a polygon. Faces are not changed: SketchUp has no curved surfaces, so a disc is still a flat face with
+a polygon boundary, an arc that bounds a face stays part of it, and cylinders and spheres stay faceted.
+A non-uniformly scaled arc (an ellipse) stays a polyline.
 
 Materials are cross-checked against `openskp`'s own resolved
 `materials_by_id` for the same fixtures (not just "some color got
