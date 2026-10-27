@@ -2,11 +2,11 @@
 
 `vendor/openskp/` is a vendored copy of [openskp](https://github.com/iamahsanmehmood/openskp)
 (PyPI: [`openskp`](https://pypi.org/project/openskp/)), pinned to
-upstream `main` at commit
-[`4046d12`](https://github.com/iamahsanmehmood/openskp/commit/4046d12c6405f6ea5af45510f9b0c7a7e299f069),
-which is 1.3.0 plus unreleased fixes. It is pinned to a commit rather than
-the 1.3.0 release because 1.3.0 predates fixes this add-on needs (see
-"Why this commit" below); move the pin to the next release once it is cut.
+the **1.4.0 release** (tag `python-v1.4.0`, commit
+[`d673706`](https://github.com/iamahsanmehmood/openskp/commit/d673706fdb3239311ddb9079d36d24d9fc5bc16d),
+also on [PyPI](https://pypi.org/project/openskp/1.4.0/)). It is a release now:
+the previous pins were commits on `main` because 1.3.0 predated fixes this
+add-on needs (see "Why this release" below).
 
 ## Why vendored instead of a declared dependency
 
@@ -36,9 +36,11 @@ That change is now upstream
 ([openskp#406](https://github.com/iamahsanmehmood/openskp/pull/406)), so the
 local patch is gone.
 
-## Why this commit
+## Why this release
 
-Moved on 2026-10-27 from `13ae161`. What the new copy adds for an import:
+Moved on 2026-10-27 from `13ae161` (via `4046d12`, an unreleased commit of the same
+day; the only difference to 1.4.0 is the writers' group flag, which this add-on
+does not use). What the new copy adds for an import:
 
 - **Instances scaled through the matrix's scale term
   ([openskp#444](https://github.com/iamahsanmehmood/openskp/issues/444)).**
