@@ -18,6 +18,9 @@ Typical usage::
 
 from __future__ import annotations
 
+import contextlib
+import gc
+import math
 import pathlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
@@ -306,17 +309,22 @@ class Instance:
         matrix: Transformation matrix stored as a flat **13-element**
             list, not a 4x4 in disguise: indices 0-8 are the 3x3
             rotation/scale part in row-major order, 9-11 are the
-            translation, and 12 is a separate scale scalar that
-            :func:`openskp._core.transform_point` never reads (it
-            only uses 0-11). To transform a point ``(x, y, z)``::
+            translation, and 12 is a scale scalar - ``1/w`` of
+            SketchUp's homogeneous term, 1.0 for nearly every instance
+            (an instance can be scaled through it instead of through the
+            3x3; the translation is then in the scaled units). To
+            transform a point ``(x, y, z)``::
 
-                tx = m[0]*x + m[1]*y + m[2]*z + m[9]
-                ty = m[3]*x + m[4]*y + m[5]*z + m[10]
-                tz = m[6]*x + m[7]*y + m[8]*z + m[11]
+                s  = m[12]
+                tx = s * (m[0]*x + m[1]*y + m[2]*z + m[9])
+                ty = s * (m[3]*x + m[4]*y + m[5]*z + m[10])
+                tz = s * (m[6]*x + m[7]*y + m[8]*z + m[11])
 
             Verified directly against :func:`openskp._core.transform_point`
             and :func:`openskp._core.multiply_matrices`, which are what
-            every internal code path actually uses.
+            every internal code path actually uses (they fold ``s`` into
+            the other twelve values, so a composed matrix always has
+            ``m[12] == 1``).
         layer: This instance's own explicit layer override, or ``""``
             when it has none. An instance without an explicit override
             inherits its *placement's* layer, which can only be resolved
@@ -480,6 +488,50 @@ class ConstructionLine:
 
 
 @dataclass
+class ArcCurve:
+    """The analytic arc behind a curve: SketchUp's own ``ArcCurve``.
+
+    A curve that SketchUp drew as an arc or a circle is a run of straight
+    edges (:attr:`Edge.curve_id`) *and* this exact description. The arc is
+    the set of points ``center + cos(t) * x_axis + sin(t) * y_axis`` for ``t``
+    from :attr:`start_angle` to :attr:`end_angle`. For a circle
+    ``x_axis`` and ``y_axis`` are perpendicular and both of length
+    :attr:`radius`; an arc that has been scaled non-uniformly keeps its arc
+    identity and stores an affine image of a circle, where they are not (then
+    :attr:`radius` is the length of ``x_axis`` only). Arcs and circles that
+    bound a face are arcs too. Lengths are in the model's units (inches), in
+    the definition's local space, like :attr:`Vertex.x`.
+
+    Attributes:
+        center: ``(x, y, z)`` of the arc's centre.
+        normal: Unit normal of the arc's plane.
+        x_axis: Vector from the centre to the arc's start (length = radius).
+        y_axis: ``normal x x_axis``.
+        start_angle: Start parameter in radians.
+        end_angle: End parameter in radians. A full circle has
+            ``end_angle == start_angle`` in a classic (pre-2021) file and
+            ``start_angle + 2 pi`` in a 2021+ file; :attr:`is_full_circle`
+            covers both.
+    """
+
+    center: Tuple[float, float, float]
+    normal: Tuple[float, float, float]
+    x_axis: Tuple[float, float, float]
+    y_axis: Tuple[float, float, float]
+    start_angle: float
+    end_angle: float
+
+    @property
+    def radius(self) -> float:
+        return math.sqrt(sum(c * c for c in self.x_axis))
+
+    @property
+    def is_full_circle(self) -> bool:
+        sweep = (self.end_angle - self.start_angle) % (2.0 * math.pi)
+        return min(sweep, 2.0 * math.pi - sweep) < 1e-9
+
+
+@dataclass
 class ConstructionPoint:
     """A construction/guide point (SketchUp's Construction Point tool).
 
@@ -506,6 +558,9 @@ class Definition:
             :class:`ConstructionLine`.
         construction_points: Construction/guide points - see
             :class:`ConstructionPoint`.
+        arcs: The analytic arc of every curve that is one, keyed by curve id
+            - the :attr:`Edge.curve_id` of the edges that form it. A curve
+            that is not an arc (a freehand or polygon curve) has no entry.
         always_faces_camera: SketchUp's "always face camera" component
             behavior (2D people / tree cut-outs that rotate to face the
             viewer). Consumers typically render such instances as
@@ -515,6 +570,14 @@ class Definition:
             quad, placed through an image-specific wrapper node. Useful for
             consumers that give images special treatment (e.g. billboard
             cut-outs).
+        is_group: ``True`` when SketchUp made this definition for a *group*
+            rather than a component (what its own API reports as
+            ``SUComponentType_Group``). Groups and component instances are
+            both :class:`Instance` placements of a :class:`Definition`;
+            this is the only thing that tells them apart. It comes from the
+            file itself - the definition kind in a 2021+ file, the group
+            record that places it in an older one - not from how often the
+            definition is placed.
     """
 
     id: int = 0
@@ -529,9 +592,11 @@ class Definition:
     dimensions: List[Dimension] = field(default_factory=list)
     construction_lines: List[ConstructionLine] = field(default_factory=list)
     construction_points: List[ConstructionPoint] = field(default_factory=list)
+    arcs: Dict[int, ArcCurve] = field(default_factory=dict)
     always_faces_camera: bool = False
     shadows_face_sun: bool = False
     is_image: bool = False
+    is_group: bool = False
 
 
 def loose_edge_runs(definition: "Definition") -> List[Tuple[List[int], List[int], bool]]:
@@ -603,7 +668,7 @@ class SkpModel:
             TypeScript/.NET/Dart/C++'s ``root``/``Root``.
         layers: List of :class:`Layer` objects found in the file.
         pages: List of :class:`Page` objects — the file's saved scenes
-            (VFF files; classic pre-2021 files import with none).
+            (from VFF files and from classic pre-2021 files).
         dimensions: Model-level linear dimensions with world-space
             endpoints (VFF files). Legacy files surface text-only
             dimensions per definition instead (``Definition.dimensions``).
@@ -638,6 +703,28 @@ class SkpModel:
 
 
 # ── SkpFile entry-point ──────────────────────────────────────────────────
+
+
+@contextlib.contextmanager
+def _paused_cyclic_gc():
+    """Pause automatic cyclic garbage collection for a large allocation burst.
+
+    Parsing builds millions of small vertex, edge, loop and face objects that
+    the model keeps alive, so every automatic generation scan walks a growing
+    object graph and frees nothing. Reference counting is unaffected; only the
+    automatic scans are deferred, and the caller's collector state is restored
+    on every exit, including exceptions and KeyboardInterrupt.
+
+    Space_AsBuilt_Track.skp (442 MB, 3.6 M faces) parse: 95.9 s -> 61.8 s on
+    CPython 3.13, max RSS 8.24 -> 8.51 GB.
+    """
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if enabled:
+            gc.enable()
 
 
 class SkpFile:
@@ -686,6 +773,15 @@ class SkpFile:
     def parse(self) -> SkpModel:
         """Run the full parsing pipeline and return a populated model.
 
+        The automatic cyclic garbage collector is paused for the duration of
+        the parse (see :func:`_paused_cyclic_gc`) and restored afterwards.
+        """
+        with _paused_cyclic_gc():
+            return self._parse_pipeline()
+
+    def _parse_pipeline(self) -> SkpModel:
+        """The parsing pipeline proper, run by :meth:`parse`.
+
         The pipeline:
 
         1. Read the file bytes and validate / extract the VFF container.
@@ -721,15 +817,22 @@ class SkpFile:
                 always_faces_camera=d.get("always_faces_camera", False),
                 shadows_face_sun=d.get("shadows_face_sun", False),
                 is_image=d.get("is_image", False),
+                is_group=d.get("is_group", False),
             )
+            # Completed VFF builders can retain dense private tables. Iterate
+            # those directly; their public accessors still return cached dicts.
+            if isinstance(builder, _core._GeometryBuilder):
+                vertices, edges, faces = builder._geometry_tables()
+            else:
+                vertices, edges, faces = builder.vertices, builder.edges, builder.faces
             # Populate vertices
-            for v_id, (x, y, z) in builder.vertices.items():
+            for v_id, (x, y, z) in vertices.items():
                 defn.vertices[v_id] = Vertex(id=v_id, x=x, y=y, z=z)
             # Populate edges
             flags_map = getattr(builder, "edge_flags", {})
             edge_layers_map = getattr(builder, "edge_layers", None) or {}
             edge_curves_map = getattr(builder, "edge_curves", None) or {}
-            for e_id, (v1, v2) in builder.edges.items():
+            for e_id, (v1, v2) in edges.items():
                 flags = flags_map.get(e_id, 0)
                 defn.edges[e_id] = Edge(id=e_id, v1_id=v1 or 0, v2_id=v2 or 0,
                                         soft=bool(flags & 0x08),
@@ -738,7 +841,7 @@ class SkpFile:
                                         layer=edge_layers_map.get(e_id),
                                         curve_id=edge_curves_map.get(e_id))
             # Populate faces
-            for f_id, f_data in builder.faces.items():
+            for f_id, f_data in faces.items():
                 defn.faces[f_id] = Face(
                     id=f_id,
                     loops=f_data.get("loops", []),
@@ -796,6 +899,11 @@ class SkpFile:
                     start=cl.get("start"),
                     end=cl.get("end"),
                 ))
+            for curve_id, frame in (getattr(builder, "arc_curves", None) or {}).items():
+                defn.arcs[curve_id] = ArcCurve(
+                    center=tuple(frame["center"]), normal=tuple(frame["normal"]),
+                    x_axis=tuple(frame["x_axis"]), y_axis=tuple(frame["y_axis"]),
+                    start_angle=frame["start_angle"], end_angle=frame["end_angle"])
             for cp in getattr(builder, "construction_points", []):
                 defn.construction_points.append(ConstructionPoint(
                     position=cp.get("position", (0.0, 0.0, 0.0)),

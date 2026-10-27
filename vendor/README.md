@@ -3,9 +3,9 @@
 `vendor/openskp/` is a vendored copy of [openskp](https://github.com/iamahsanmehmood/openskp)
 (PyPI: [`openskp`](https://pypi.org/project/openskp/)), pinned to
 upstream `main` at commit
-[`13ae161`](https://github.com/iamahsanmehmood/openskp/commit/13ae161fa0108647a04ad5730776120bb6fe8c83),
+[`4046d12`](https://github.com/iamahsanmehmood/openskp/commit/4046d12c6405f6ea5af45510f9b0c7a7e299f069),
 which is 1.3.0 plus unreleased fixes. It is pinned to a commit rather than
-the 1.3.0 release because 1.3.0 predates two fixes this add-on needs (see
+the 1.3.0 release because 1.3.0 predates fixes this add-on needs (see
 "Why this commit" below); move the pin to the next release once it is cut.
 
 ## Why vendored instead of a declared dependency
@@ -37,6 +37,35 @@ That change is now upstream
 local patch is gone.
 
 ## Why this commit
+
+Moved on 2026-10-27 from `13ae161`. What the new copy adds for an import:
+
+- **Instances scaled through the matrix's scale term
+  ([openskp#444](https://github.com/iamahsanmehmood/openskp/issues/444)).**
+  SketchUp can keep a uniform scale in an instance's transformation instead of
+  in its 3x3. Every earlier reader ignored it, so such an instance came out 100x
+  its size and 100x its distance from its parent in this add-on too.
+- **More legacy (pre-2021) files read correctly:** SketchUp 4, 5 and 2019 files
+  ([openskp#440](https://github.com/iamahsanmehmood/openskp/pull/440)) and files
+  saved through SketchUp's C API as 2019 or 2020
+  ([#459](https://github.com/iamahsanmehmood/openskp/pull/459)); a 2021+ scene
+  that saves no camera is no longer dropped
+  ([#458](https://github.com/iamahsanmehmood/openskp/pull/458)).
+- **Faster 2021+ parsing:** the same model data, 2 to 4 times faster on a large
+  file ([#439](https://github.com/iamahsanmehmood/openskp/pull/439),
+  [#453](https://github.com/iamahsanmehmood/openskp/pull/453)).
+- **OBJ and PLY export fixes** that keep material names unique and colours
+  ([#421](https://github.com/iamahsanmehmood/openskp/pull/421),
+  [#423](https://github.com/iamahsanmehmood/openskp/pull/423)); this add-on does
+  not call those exporters.
+- **New data this add-on can use later:** `Definition.is_group`
+  ([#446](https://github.com/iamahsanmehmood/openskp/issues/446)), and the
+  exact centre, radius and angles of every arc and circle in
+  `Definition.arcs` ([#462](https://github.com/iamahsanmehmood/openskp/issues/462);
+  see freecad-openskp#7). Nothing in the importer reads them yet, so this
+  update changes no import beyond the fixes above.
+
+What the previous pin (`13ae161`) already brought:
 
 - **Dimensions anchored inside components
   ([openskp#384](https://github.com/iamahsanmehmood/openskp/pull/384)).** The

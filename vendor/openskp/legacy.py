@@ -442,6 +442,15 @@ def _preamble(ar, r):
 # none of them: a real V4 file already parses with the later layout.
 _FIRST_V4 = 4
 
+# The texture image became a first-class CDib object (store-map slot, entity
+# preamble) in SketchUp 6. SketchUp 3, 4 and 5 write it as a bare inline
+# subtype/length/bytes record straight after the material's flag word.
+_FIRST_DIB_OBJECT = 6
+
+# First version whose instances and groups carry a name string (SketchUp 3 and
+# 4 files have none; where the name is optional the reader checks for one).
+_FIRST_NAMED_INSTANCE = 5
+
 
 def _early_preamble(ar, r):
     """``_preamble`` for the entity types that carry NO attribute-container
@@ -459,7 +468,7 @@ def _drawbase(ar, r):
     # comes from the face's own pointer instead (see _read_face); report the
     # rest as unset rather than the meaningless 0x0100 / "hidden" the 8-byte
     # layout would read out of them.
-    b = r.raw(5) if ar.ver < _FIRST_V4 else r.raw(8)
+    b = r.raw(5 if ar.ver < _FIRST_V4 else (7 if ar.ver < 5 else 8))
     # The layer field is normally a u16 id, but an entity can carry the
     # layer BY OBJECT instead (seen on real 2018 instances): a full
     # inline CLayer record on first use, an escaped back-ref to it on
@@ -775,7 +784,7 @@ def _texture_block(ar, r):
     subtype/length/bytes record - no preamble, no object tag, and so no
     store-map slot (``tex_dib`` is ``None``; the bytes ride along as
     ``tex_data`` instead)."""
-    if ar.ver < _FIRST_V4:
+    if ar.ver < _FIRST_DIB_OBJECT:
         s = None
         dib = _read_dib(ar, r)
     else:
@@ -856,7 +865,7 @@ def _read_camera(ar, r):
     r.raw(137)
     r.u16()
     r.utf16()
-    r.raw(33)
+    r.raw(33 if ar.ver >= 6 else 10)
     return {'k': 'camera'}
 
 
@@ -867,6 +876,10 @@ def _read_thumbnail(ar, r):
         r.raw(129)
         return {'k': 'thumbnail', 'dib': None}
     ar.read_object(r, expect='CCamera')
+    if ar.ver < 6:
+        # SketchUp 4 and 5 end the thumbnail with its camera: no trailing
+        # image pointer (not even a null one).
+        return {'k': 'thumbnail', 'dib': None}
     _, _, dib = ar.read_object(r, expect='CDib')
     return {'k': 'thumbnail', 'dib': dib}
 
@@ -1019,15 +1032,12 @@ def _read_skfont(ar, r):
 
 # ── pages (scenes) ──────────────────────────────────────────────────────
 #
-# CViewPage's full record embeds a camera, an optional thumbnail image, a
-# font, and — whenever any of its several independent "use_*" capture
-# flags beyond hidden-layers is set — an entire Style sub-object with no
-# documented fixed size. Reverse engineering that is out of scope, matching
-# this project's existing CCamera precedent, so only the narrow case is
-# supported: a page whose captured flags are exactly the baseline (nothing
-# captured) or baseline + hidden-layers. Ground truth for both was captured
-# from real v17-native SketchUp saves; ``_PAGE_ALLOWED_FLAGS`` and the
-# 0x20 hidden-layers bit are empirical, not documented by SketchUp.
+# The fallback scan: _read_page_list (below) reads whole scene records and
+# runs first; this narrow scan only runs when that reader gives up on a
+# record. It supports a page whose captured flags are exactly the baseline
+# (nothing captured) or baseline + hidden-layers. Ground truth for both was
+# captured from real v17-native SketchUp saves; ``_PAGE_ALLOWED_FLAGS`` and
+# the 0x20 hidden-layers bit are empirical, not documented by SketchUp.
 _PAGE_ALLOWED_FLAGS = (0xc00, 0xc20)
 _PAGE_HIDDEN_LAYERS_BIT = 0x20
 
@@ -1140,6 +1150,257 @@ def _scan_pages(data: bytes, ar) -> list:
     return pages
 
 
+# ── full scene records ───────────────────────────────────────────────────
+#
+# Ground truth, all read byte-exactly by _read_page_list:
+# - the gondola_v20.skp fixture (SketchUp 2020, one scene, flags 0x1FF);
+# - SketchUp's own 3D Warehouse model "Skill Builder: Creating Section
+#   Animations with Scenes" in its SketchUp 2017 format (eight scenes,
+#   0x7F) and SketchUp 2015 saves (nine scenes, 0x7F) - not
+#   redistributable, so not committed;
+# - files written by openskp.create, which SketchUp Free opens with
+#   working scenes.
+#
+# The scene list sits in the document tail as a u32 count right before the
+# first record (which declares the CViewPage class), then one record per
+# scene, then a ref to the selected scene. A record is: the class tag | a
+# null attribute ref | (schema 13, SketchUp 2016+, only) a pid | name |
+# description | u32 capture flags | the camera (CCamera, or null) | the
+# thumbnail (CDib, or null) | (schema 13) a byte | then one section per
+# capture flag that is set:
+#
+#   0x02 style       the rendering options (length by file version, see
+#                    _RENDERING_OPTIONS_LEN) + a CSkpStyle ref or object
+#   0x04 shadows     2 bytes (schema 13: 3) + the shadow info
+#   0x08 axes        (schema 13: a flag byte +) 110 bytes
+#   0x10 hidden      a byte, u32 n, n entity refs
+#   0x20 layers      u32 n, n refs to the layers (tags) the scene hides
+#   0x40 sections    u32 n, n section-plane refs
+#
+# | 22 bytes (transition and delay time, flags) | u32 n + an n-byte PNG.
+# 0x80 and 0x100 (SketchUp 2020's split of "hidden" into geometry and
+# objects) add no section.
+#
+# Files saved through SketchUp's C API (SUModelSaveToFileWithVersion as 2017
+# to 2020) declare the class at schema 15. Measured on those files: flag
+# 0x01 is the camera, which is only there when it is set, with no CDib tag, no
+# byte after it and no thumbnail; the rendering options are 3 bytes longer;
+# the style options have two more value types (3: 2 bytes, 5: 4 bytes); and
+# the trailer is 21 bytes with no PNG after it. Built with every flag set
+# (0x1FF), so the 0x04/0x08/0x10/0x40 sections of this layout are measured,
+# not assumed. The samples only have 0x7F and 0x1FF; that a
+# section is absent when its flag is clear is this reader's assumption for
+# the others. A record it can't fully read, or flags outside 0x1FF, make
+# _read_page_list give up, and the narrow _scan_pages above takes over.
+_PAGE_DECL_RE = re.compile(rb'\xff\xff(\x0c|\x0d|\x0f)\x00\x09\x00CViewPage')
+_PAGE_KNOWN_FLAGS = 0x1FF
+# The rendering options' length by SketchUp major version, measured on the
+# model-level copy of the same block in every fixture from 2014 to 2020
+# (and in the 2020 scene); other versions aren't known, so give up there.
+_RENDERING_OPTIONS_LEN = {14: 206, 15: 206, 16: 206, 17: 206, 18: 211, 19: 212, 20: 213}
+_PAGE_AXES_LEN = 110
+_PAGE_TRAILER_LEN = 22
+_SHADOW_INFO_FIXED_LEN = 60  # after the city and country strings
+# CSkpStyle option values: type tag -> byte size
+_STYLE_VALUE_SIZES = {1: 1, 3: 2, 4: 4, 5: 4, 6: 4, 7: 8}
+
+
+def _read_tag(r):
+    """One archive tag, with the 0x7FFF escape to 32 bits resolved:
+    ``('null', 0)``, ``('decl', 0)``, ``('class', slot)`` (a new object
+    of an already-declared class) or ``('obj', slot)`` (a back-ref)."""
+    v = r.u16()
+    if v == 0:
+        return 'null', 0
+    if v == 0xFFFF:
+        return 'decl', 0
+    if v == 0x7FFF:
+        v = r.u32()
+        return ('class', v & 0x7FFFFFFF) if v & 0x80000000 else ('obj', v)
+    return ('class', v & 0x7FFF) if v & 0x8000 else ('obj', v)
+
+
+def _skip_pid(r):
+    mask = r.u8()
+    r.raw(bin(mask).count('1'))
+
+
+class _PageClasses:
+    """The classes the scene records declare or refer to: the schema each
+    was declared with and, once seen, the slot its class-refs use - every
+    class-ref to one class must carry the same slot, which catches a
+    record read from the wrong offset early."""
+
+    def __init__(self):
+        # CCamera and CDib are declared in the document prefix; the scene
+        # records only refer to them, at the schemas every v6+ file uses.
+        self.schema = {'CCamera': 5, 'CDib': 3}
+        self.slot = {}
+
+    def object(self, r, kind, slot, name):
+        """After a 'decl' or 'class' tag: the declaration's header (if
+        any); returns the schema the object was written with."""
+        if kind == 'decl':
+            schema = r.u16()
+            n = r.u16()
+            if n != len(name) or r.raw(n) != name.encode('ascii'):
+                raise LegacyParseError(f"expected a {name} declaration {r.ctx()}")
+            self.schema[name] = schema
+        elif self.slot.setdefault(name, slot) != slot:
+            raise LegacyParseError(f"{name} class-ref to another slot {r.ctx()}")
+        if name not in self.schema:
+            raise LegacyParseError(f"{name} object of an unknown schema {r.ctx()}")
+        return self.schema[name]
+
+
+def _read_page_camera(r):
+    eye = r.f64s(3)
+    target = r.f64s(3)
+    up = r.f64s(3)
+    r.f64s(2)                     # constants 1.0, 1000.0
+    perspective = r.u8()
+    fov = r.f64()
+    ortho_height = r.f64()
+    r.raw(137 - 105)
+    r.u16()
+    r.utf16()
+    r.raw(33)
+    return {'eye': eye, 'target': target, 'up': up, 'fov': fov,
+            'parallel': perspective == 0, 'ortho_height': ortho_height}
+
+
+def _skip_style(r, schema):
+    """A CSkpStyle object's body: no attributes, a pid (schema 2+), GUID,
+    a string, u32, name, description, then its options - each a u32 key
+    and a u32 count of (u32 type, value) pairs."""
+    if r.u16() != 0:
+        raise LegacyParseError(f"style with attributes {r.ctx()}")
+    if schema >= 2:
+        _skip_pid(r)
+    r.raw(16)
+    r.utf16()
+    r.u32()
+    r.utf16()
+    r.utf16()
+    for _ in range(r.u32()):
+        r.u32()
+        for _ in range(r.u32()):
+            size = _STYLE_VALUE_SIZES.get(r.u32())
+            if size is None:
+                raise LegacyParseError(f"unknown style value type {r.ctx()}")
+            r.raw(size)
+
+
+def _read_refs(r, n):
+    if n > (len(r.data) - r.pos) // 2:
+        raise LegacyParseError(f"implausible ref count {n} {r.ctx()}")
+    refs = []
+    for _ in range(n):
+        kind, v = _read_tag(r)
+        if kind != 'obj':
+            raise LegacyParseError(f"expected a back-ref {r.ctx()}")
+        refs.append(v)
+    return refs
+
+
+def _read_page_record(r, classes, ver):
+    kind, slot = _read_tag(r)
+    if kind not in ('decl', 'class'):
+        raise LegacyParseError(f"expected a CViewPage record {r.ctx()}")
+    schema = classes.object(r, kind, slot, 'CViewPage')
+    if r.u16() != 0:
+        raise LegacyParseError(f"scene with attributes {r.ctx()}")
+    if schema >= 13:
+        _skip_pid(r)
+    page = {'name': r.utf16(), 'hidden_layer_ids': []}
+    r.utf16()                                     # description
+    flags = r.u32()
+    if flags & ~_PAGE_KNOWN_FLAGS:
+        raise LegacyParseError(f"scene capture flags {flags:#x} {r.ctx()}")
+    if schema >= 15:
+        # saved through SketchUp's C API: the camera is there when its flag
+        # is, and there is no thumbnail
+        if flags & 0x01:
+            kind, slot = _read_tag(r)
+            if kind not in ('decl', 'class'):
+                raise LegacyParseError(f"expected a camera {r.ctx()}")
+            classes.object(r, kind, slot, 'CCamera')
+            page.update(_read_page_camera(r))
+    else:
+        kind, slot = _read_tag(r)
+        if kind in ('decl', 'class'):
+            classes.object(r, kind, slot, 'CCamera')
+            page.update(_read_page_camera(r))
+        kind, slot = _read_tag(r)
+        if kind in ('decl', 'class'):
+            classes.object(r, kind, slot, 'CDib')
+            _read_dib(None, r)
+        if schema >= 13:
+            r.u8()
+    if flags & 0x02:
+        if ver not in _RENDERING_OPTIONS_LEN:
+            raise LegacyParseError(f"rendering options of a v{ver} scene")
+        r.raw(_RENDERING_OPTIONS_LEN[ver] + (3 if schema >= 15 else 0))
+        kind, slot = _read_tag(r)
+        if kind in ('decl', 'class'):
+            _skip_style(r, classes.object(r, kind, slot, 'CSkpStyle'))
+    if flags & 0x04:
+        r.raw(3 if schema >= 13 else 2)
+        r.u32()                                   # time
+        r.u8()
+        r.utf16()                                 # city
+        r.utf16()                                 # country
+        r.raw(_SHADOW_INFO_FIXED_LEN)
+    if flags & 0x08:
+        r.raw(_PAGE_AXES_LEN + (1 if schema >= 13 else 0))
+    if flags & 0x10:
+        r.u8()
+        _read_refs(r, r.u32())
+    if flags & 0x20:
+        page['hidden_layer_ids'] = _read_refs(r, r.u32())
+    if flags & 0x40:
+        _read_refs(r, r.u32())
+    if schema >= 15:
+        r.raw(_PAGE_TRAILER_LEN - 1)
+        return page
+    r.raw(_PAGE_TRAILER_LEN)
+    png = r.u32()
+    if png > len(r.data) - r.pos:
+        raise LegacyParseError(f"implausible thumbnail length {png} {r.ctx()}")
+    r.raw(png)
+    return page
+
+
+def _read_page_list(data: bytes, ar):
+    """Every scene, with its camera and hidden layers, read as a sequence
+    from the scene list in the file tail. ``None`` when there is a scene
+    list this reader can't fully read (the caller then falls back to
+    _scan_pages); ``[]`` when there is none."""
+    m = _PAGE_DECL_RE.search(data, ar.r.pos)
+    if m is None:
+        # a scene list in a schema this reader doesn't know: let the
+        # narrow scan try
+        return None if data.find(b'CViewPage', ar.r.pos) >= 0 else []
+    try:
+        count = struct.unpack_from('<I', data, m.start() - 4)[0]
+        if not 1 <= count <= 10000:
+            raise LegacyParseError(f"implausible scene count {count}")
+        r = _R(data, m.start())
+        classes = _PageClasses()
+        pages = [_read_page_record(r, classes, ar.ver) for _ in range(count)]
+        # the list ends with a ref to the selected scene (or a null ref)
+        if _read_tag(r)[0] not in ('obj', 'null'):
+            raise LegacyParseError(f"no selected-scene ref after the scenes {r.ctx()}")
+        for page in pages:
+            page['hidden_layer_ids'] = [
+                i for i in page['hidden_layer_ids']
+                if (ar.slots.get(i) or ('',))[0] == 'obj' and ar.slots[i][1] == 'CLayer']
+    except (LegacyParseError, struct.error, IndexError, ValueError) as e:
+        logger.debug("scene list not fully readable, falling back to the scan: %s", e)
+        return None
+    return pages
+
+
 def _entity_ref(ar, r):
     """A reference-to-entity tag: dimension connection points and text
     leader attachments. Unlike ``read_object``'s back-ref path, this
@@ -1164,7 +1425,8 @@ def _read_dimlinear(ar, r):
     _preamble(ar, r)
     db = _drawbase(ar, r)
     text = r.utf16()
-    ar.read_object(r, expect='CSkFont')
+    if ar.ver >= 6:
+        ar.read_object(r, expect='CSkFont')
     # The tail is NOT a fixed 165-byte blob: it embeds two object
     # references (the dimension's connection points into the geometry).
     # Each is a normal MFC tag — 2 bytes in small files, but 6 bytes once
@@ -1185,13 +1447,16 @@ def _read_dimlinear(ar, r):
     # (a SketchUp 2018 house: 70 of its 72 root entities lost, 948
     # definitions left unplaced). Measured on 42 dimensions in 23 legacy
     # files: every record is 161 fixed bytes plus its refs.
-    b37 = r.raw(37)
+    # SketchUp 4 and 5 write neither the font object above nor the 5 bytes in
+    # front of the first connection block; keep the block's later offsets
+    # the same by supplying them as zeros.
+    b37 = (b'\x00' * 5 if ar.ver < 6 else b'') + r.raw(32 if ar.ver < 6 else 37)
     c1 = _entity_ref(ar, r)          # connection point 1 (may be null)
     path1 = _connection_paths(ar, r)
     b32 = r.raw(32)
     c2 = _entity_ref(ar, r)          # connection point 2 (may be null)
     path2 = _connection_paths(ar, r)
-    b72 = r.raw(72)
+    b72 = r.raw(72 if ar.ver >= 6 else 68)   # SketchUp 4 and 5: no trailing u32
     # the dimension-line offset (inches, signed) sits at a fixed position
     # of the trailing block on every sample (v17 and v18 alike)
     offset = struct.unpack_from('<d', b72, 52)[0]
@@ -1372,7 +1637,7 @@ def _reanchor_on_string_marker(data: bytes, pos: int) -> int:
 def _read_definition(ar, r):
     _preamble(ar, r)
     # undecoded base block (13 bytes in SketchUp 3)
-    r.raw(22 if ar.ver >= 17 else (20 if ar.ver >= _FIRST_V4 else 13))
+    r.raw(22 if ar.ver >= 17 else (20 if ar.ver >= 5 else (19 if ar.ver >= _FIRST_V4 else 13)))
     nlayers = r.u32()
     if nlayers > 10000:
         raise LegacyParseError(f"implausible def layer count {r.ctx()}")
@@ -1385,6 +1650,10 @@ def _read_definition(ar, r):
             continue
         ar.read_object(r, expect='CLayer')
         got += 1
+    if ar.ver == 19 and nlayers and r.peek_u16() == 0:
+        # SketchUp 2019 follows the LAST layer with a separator null too
+        # (2020 does as well, but its count recovery already absorbs it).
+        r.pos += 2
     decl = r.u16()
     if decl == 0x7FFF:
         decl = r.u32()
@@ -1443,10 +1712,18 @@ def _read_definition(ar, r):
     # component-behavior flags sit 9 bytes before the thumbnail:
     # bit 0 = always-faces-camera, bit 1 = shadows-face-sun
     behavior = gap[-9] if len(gap) >= 9 else 0
+    # the last u32 before the thumbnail is 1 for the definition of a group and
+    # 0 for a component's (what SketchUp's SUComponentDefinitionGetType
+    # reports). Checked against SketchUp 2025's own counts on gondola_v20
+    # (14 groups, 6 components) and Untitled (46 groups), and on a model with
+    # 144 groups and 1 component saved by SketchUp 3 to 2020; the CGroup
+    # record that places a definition is no substitute: openskp's own writer
+    # puts one over a component definition, which SketchUp calls a component.
+    is_group = len(gap) >= 4 and int.from_bytes(gap[-4:], 'little') == 1
     ar.read_object(r, expect='CThumbnail')
     return {'k': 'definition', 'name': name, 'guid': guid.hex().upper(),
             'ents': ents, 'faces_camera': bool(behavior & 1),
-            'shadows_face_sun': bool(behavior & 2)}
+            'shadows_face_sun': bool(behavior & 2), 'is_group': is_group}
 
 
 def _read_instance(ar, r):
@@ -1456,8 +1733,9 @@ def _read_instance(ar, r):
     if dn != 'CComponentDefinition':
         raise LegacyParseError(f"instance definition ref is {dn} {r.ctx()}")
     xf = r.f64s(13)
-    # SketchUp 3 instances carry no name string.
-    name = r.utf16() if (ar.ver >= _FIRST_V4 or r.peek(3) == _STR_MARKER) else ''
+    # SketchUp 3 and 4 instances carry no name string (5 is the first to
+    # write one); where it is optional, take it only if a string is there.
+    name = r.utf16() if (ar.ver >= _FIRST_NAMED_INSTANCE or r.peek(3) == _STR_MARKER) else ''
     # The trailing instance GUID is a pre-2014 (ver < 14) thing, full stop -
     # for BOTH CComponentInstance and CGroup, gated by real file version,
     # not by the class's own schema number.
@@ -1551,15 +1829,24 @@ def _walk(data: bytes):
         # definition-list anchor, a back-ref to the ACTIVE layer object
         bases = _probe_layer_anchor_bases(data, ver, start, mat_count)
 
-    last_exc = None
+    # Every candidate but the right one dies almost immediately (the slot
+    # numbers it hands out disagree with the file's own class-refs), while the
+    # right one only fails where the file really differs from what we know.
+    # So report the failure that got FURTHEST into the file - not the last
+    # candidate's, which is the earliest-failing one and says nothing useful.
+    best_exc = None
+    best_at = -1
     for base in bases:
         try:
             return _walk_model(data, ver, start, mat_count, base)
         except (LegacyParseError, struct.error, IndexError,
                 UnicodeDecodeError) as exc:
-            last_exc = exc
-    if last_exc is not None:
-        raise last_exc
+            m = re.search(r'@0x([0-9a-f]+)', str(exc))
+            at = int(m.group(1), 16) if m else -1
+            if best_exc is None or at > best_at:
+                best_exc, best_at = exc, at
+    if best_exc is not None:
+        raise best_exc
     raise LegacyParseError("no viable slot base candidate")
 
 
@@ -1621,8 +1908,20 @@ def _probe_layer_anchor_bases(data: bytes, ver: int, start: int,
         # under the throwaway base every absolute back-ref classifies as
         # premodel; anything else means the prefix did not parse
         raise LegacyParseError(f"base probe: anchor resolved to {n}")
+    # a null entry in the layer list has no slot, so it is no candidate (files
+    # saved through SketchUp's C API as 2019 or 2020 have one)
     return [s - (rel - b0) for rel in layer_slots
-            if 0 < s - (rel - b0) < b0]
+            if rel is not None and 0 < s - (rel - b0) < b0]
+
+
+def _definition_starts_at(ar, at: int) -> bool:
+    """True when the bytes at *at* begin a CComponentDefinition record: its
+    first-use class declaration, or a class-ref to its known slot."""
+    data = ar.data
+    if data[at:at + 2] == bytes([0xFF, 0xFF]) and data[at + 6:at + 26] == b'CComponentDefinition':
+        return True
+    def_cls = ar.class_slot.get('CComponentDefinition')
+    return def_cls is not None and _is_class_ref(data, at, def_cls)
 
 
 def _walk_model(data: bytes, ver: int, start: int, mat_count: int,
@@ -1683,6 +1982,18 @@ def _walk_model(data: bytes, ver: int, start: int, mat_count: int,
         retry = _retry_count_after_v20_filler(r, r.pos - 4, 1_000_000, ar)
         if retry is not None:
             def_count = retry
+            if not _definition_starts_at(ar, r.pos):
+                # A model with NO component definitions has no definition
+                # count to find: SketchUp 2020 writes its filler where the
+                # count would be, and the first count behind it is the ROOT
+                # entity count. The retry cannot tell the two apart, so it
+                # handed the root count over as a definition count - and the
+                # root entities were then read (and silently dropped) as
+                # "definitions". A real definition count is always followed
+                # by a definition record; anything else means this is the
+                # root count, so put it back.
+                def_count = 0
+                r.pos -= 4
     if def_count > 1_000_000:
         raise LegacyParseError("implausible definition count")
     for _ in range(def_count):
@@ -2062,6 +2373,7 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
                 _fill_builder(b, d['ents'], slots)
                 defs_dict[s] = {'guid': d['guid'], 'name': d['name'],
                                 'is_image': s in image_def_ids,
+                                'is_group': d.get('is_group', False),
                                 'always_faces_camera': d.get('faces_camera', False),
                                 'shadows_face_sun': d.get('shadows_face_sun', False),
                                 'builder': b}
@@ -2080,8 +2392,10 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
                          'builder': root_builder}
 
     try:
-        pages = _scan_pages(data, ar)
-    except (LegacyParseError, struct.error, IndexError):
+        pages = _read_page_list(data, ar)
+        if pages is None:
+            pages = _scan_pages(data, ar)
+    except (LegacyParseError, struct.error, IndexError, ValueError):
         pages = []
 
     logger.info(
