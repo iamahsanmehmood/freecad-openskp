@@ -136,7 +136,7 @@ def check_face_colors(fixture_name, expected_face_count):
     path = os.path.join(FIXTURES_DIR, fixture_name)
     model = openskp.SkpFile.open(path).parse()
 
-    stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0, "edge_runs_built": 0, "edge_runs_skipped": 0}
+    stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0, "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0}
     root_buckets = importSKP._get_local_shape(model.root, model, stats, {}, frozenset())
     assert root_buckets, f"{fixture_name}: _get_local_shape produced no layer buckets at all"
 
