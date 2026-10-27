@@ -24,10 +24,16 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import importSKP  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _harness  # noqa: E402  - freecadcmd exits 0 on a failing script; see tests/_harness.py
 
-import FreeCAD as App  # noqa: E402
-import Part  # noqa: E402
+try:
+    import importSKP  # noqa: E402
+
+    import FreeCAD as App  # noqa: E402
+    import Part  # noqa: E402
+except BaseException:
+    _harness.die()
 
 
 def _make_wire(pts):
@@ -170,7 +176,12 @@ def test_material_export():
         App.GuiUp = orig_gui_up
 
 
+def _main():
+    run()
+    test_material_export()
+
+
 # Note: freecadcmd runs a script file as a module named after the file,
-# not "__main__" - see tests/test_import.py's own note on this.
-run()
-test_material_export()
+# not "__main__" - see tests/test_import.py's own note on this. It also exits 0
+# when the script raises, so a failure has to end the process itself.
+_harness.run(_main)

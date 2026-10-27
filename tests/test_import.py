@@ -17,9 +17,15 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import importSKP  # noqa: E402
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import _harness  # noqa: E402  - freecadcmd exits 0 on a failing script; see tests/_harness.py
 
-import FreeCAD as App  # noqa: E402
+try:
+    import importSKP  # noqa: E402
+
+    import FreeCAD as App  # noqa: E402
+except BaseException:
+    _harness.die()
 
 FIXTURES_DIR = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "fixtures"
@@ -280,19 +286,24 @@ def check_arcs(fixture_name):
         App.closeDocument(doc.Name)
 
 
+def _main():
+    _checked = 0
+    for _name in os.listdir(FIXTURES_DIR):
+        if _name.endswith(".skp"):
+            check(_name)
+            _checked += 1
+    assert _checked == len(EXPECTED), (
+        f"expected to check {len(EXPECTED)} fixtures, found {_checked} .skp files in {FIXTURES_DIR}"
+    )
+    check_nonuniform_scale()
+    check_arcs("arcs_2017.skp")
+    check_arcs("arcs_2021.skp")
+
+
 # Note: freecadcmd runs a script file as a module named after the file
 # (e.g. "test_import"), not "__main__" like a normal Python interpreter -
 # so this runs unconditionally at import time rather than behind an
 # `if __name__ == "__main__"` guard, which would silently never fire here.
-_checked = 0
-for _name in os.listdir(FIXTURES_DIR):
-    if _name.endswith(".skp"):
-        check(_name)
-        _checked += 1
-assert _checked == len(EXPECTED), (
-    f"expected to check {len(EXPECTED)} fixtures, found {_checked} .skp files in {FIXTURES_DIR}"
-)
-check_nonuniform_scale()
-
-check_arcs("arcs_2017.skp")
-check_arcs("arcs_2021.skp")
+# It also exits 0 when the script raises, so a failure has to end the process
+# itself: _harness.run does.
+_harness.run(_main)
