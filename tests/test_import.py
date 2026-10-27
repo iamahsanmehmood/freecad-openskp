@@ -43,6 +43,10 @@ FIXTURES_DIR = os.path.join(
 EXPECTED = {
     "SU_File.skp": (32, 0, 0, 0, 1, 0),
     "capilla_quiroz_v17.skp": (192, 0, 0, 20, 1, 0),
+    # a loose arc (one real arc edge, not a polyline), a disc and a half disc (two faces); see
+    # check_arcs. The same model saved as SketchUp 2017 (classic container) and 2021 (VFF).
+    "arcs_2017.skp": (2, 0, 0, 1, 1, 0),
+    "arcs_2021.skp": (2, 0, 0, 1, 1, 0),
 }
 
 
@@ -132,7 +136,7 @@ def check_face_colors(fixture_name, expected_face_count):
     path = os.path.join(FIXTURES_DIR, fixture_name)
     model = openskp.SkpFile.open(path).parse()
 
-    stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0, "edge_runs_built": 0, "edge_runs_skipped": 0}
+    stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0, "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0}
     root_buckets = importSKP._get_local_shape(model.root, model, stats, {}, frozenset())
     assert root_buckets, f"{fixture_name}: _get_local_shape produced no layer buckets at all"
 
@@ -250,6 +254,38 @@ def check_nonuniform_scale():
         os.remove(path)
 
 
+def check_arcs(fixture_name):
+    """The loose arc in arcs_*.skp (centre 0,0,0; radius 10 in; 0 to 90 degrees) imports as ONE
+    real arc edge with the right centre, radius and length, not as a polyline of straight edges;
+    the disc and the half disc, which bound faces, stay faces."""
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    doc = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc)
+        objs = [o for o in doc.Objects if hasattr(o, "Shape")]
+        faces = [f for o in objs for f in o.Shape.Faces]
+        face_edge_hashes = {e.hashCode() for f in faces for e in f.Edges}
+        loose = [e for o in objs for e in o.Shape.Edges if e.hashCode() not in face_edge_hashes]
+        assert len(faces) == 2, f"{fixture_name}: expected the disc and the half disc as faces, got {len(faces)}"
+        assert len(loose) == 1, f"{fixture_name}: expected one loose edge (the arc), got {len(loose)}"
+        arc = loose[0]
+        circle = arc.Curve
+        assert hasattr(circle, "Radius"), f"{fixture_name}: the loose arc imported as {type(circle).__name__}, not a circle"
+        radius_mm = 10 * importSKP.INCH_TO_MM
+        assert abs(circle.Radius - radius_mm) < 1e-6, f"{fixture_name}: radius {circle.Radius} != {radius_mm}"
+        assert abs(circle.Center.x) < 1e-6 and abs(circle.Center.y) < 1e-6 and abs(circle.Center.z) < 1e-6, (
+            f"{fixture_name}: centre {circle.Center}"
+        )
+        expected_length = radius_mm * math.pi / 2
+        assert abs(arc.Length - expected_length) < 1e-3, f"{fixture_name}: arc length {arc.Length} != {expected_length}"
+        # its two ends are SketchUp's own arc ends: (10, 0, 0) and (0, 10, 0) inches
+        ends = sorted((round(v.X, 3), round(v.Y, 3), round(v.Z, 3)) for v in arc.Vertexes)
+        assert ends == sorted([(round(radius_mm, 3), 0.0, 0.0), (0.0, round(radius_mm, 3), 0.0)]), f"{fixture_name}: ends {ends}"
+        print(f"check_arcs({fixture_name}): OK (one real arc, radius {circle.Radius:.3f} mm, length {arc.Length:.3f} mm)")
+    finally:
+        App.closeDocument(doc.Name)
+
+
 def _main():
     _checked = 0
     for _name in os.listdir(FIXTURES_DIR):
@@ -260,6 +296,8 @@ def _main():
         f"expected to check {len(EXPECTED)} fixtures, found {_checked} .skp files in {FIXTURES_DIR}"
     )
     check_nonuniform_scale()
+    check_arcs("arcs_2017.skp")
+    check_arcs("arcs_2021.skp")
 
 
 # Note: freecadcmd runs a script file as a module named after the file

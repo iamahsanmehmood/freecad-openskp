@@ -56,6 +56,13 @@ found and fixed in the Blender addon (github.com/iamahsanmehmood/
 blender-openskp) - studs/king studs/header jack studs drawn as loose
 edges were silently invisible before this.
 
+Arcs and circles: a loose-edge run that is exactly one whole arc or circle
+(SketchUp keeps the exact arc beside its run of straight edges: openskp's
+Definition.arcs) is imported as a real FreeCAD arc or circle, with a centre
+and a radius, instead of the polyline (see _make_arc_edge). Faces are not
+changed: SketchUp has no curved surfaces, so a disc is still a flat face with
+a polygon boundary, and an arc that bounds a face stays part of it.
+
 Layers (SketchUp calls them "tags"): unlike materials, which fit onto
 the existing single-compound design as one ViewObject.DiffuseColor per
 face, a layer needs its own Part::Feature object to be independently
@@ -86,6 +93,7 @@ production file (see tests/test_export.py and the README).
 from __future__ import annotations
 
 import importlib.util
+import math
 import os
 import sys
 import time
@@ -181,6 +189,70 @@ def _make_loose_edge_wire(points_mm, closed):
         vecs.append(vecs[0])
     try:
         return Part.makePolygon(vecs)
+    except Exception:
+        return None
+
+
+def _make_arc_edge(definition, edge_ids):
+    """Builds a real FreeCAD arc (or circle) for one loose-edge run that is
+    exactly one whole arc curve of SketchUp's, in the definition's local
+    space, or returns ``None`` so the caller keeps the polyline.
+
+    SketchUp stores an arc or circle as a run of straight edges *and* as the
+    exact arc (centre, axes, start and end angle: openskp's
+    ``Definition.arcs``, keyed by the edges' ``curve_id``), so a circle drawn
+    in SketchUp can arrive in FreeCAD as a circle with a centre and a radius
+    rather than as a 24-sided polygon. Only a run that is the *whole* curve
+    qualifies (a curve some of whose edges bound a face has no single arc
+    to state), and only a true circle: an arc scaled non-uniformly is an
+    ellipse, which stays a polyline here.
+
+    The arc is built from three points on the curve rather than from angles,
+    because FreeCAD measures a Part.Circle's angles from an x direction it
+    picks itself, which would not be SketchUp's.
+    """
+    arcs = getattr(definition, "arcs", None)
+    if not arcs:
+        return None
+    curve_ids = {definition.edges[e].curve_id for e in edge_ids if e in definition.edges}
+    if len(curve_ids) != 1:
+        return None
+    curve_id = next(iter(curve_ids))
+    arc = arcs.get(curve_id)
+    if arc is None:
+        return None
+    if sum(1 for e in definition.edges.values() if e.curve_id == curve_id) != len(edge_ids):
+        return None
+
+    cx, cy, cz = (c * INCH_TO_MM for c in arc.center)
+    ax = [c * INCH_TO_MM for c in arc.x_axis]
+    ay = [c * INCH_TO_MM for c in arc.y_axis]
+    radius = math.sqrt(sum(c * c for c in ax))
+    if radius <= 0.0:
+        return None
+    dot = sum(a * b for a, b in zip(ax, ay))
+    if abs(math.sqrt(sum(c * c for c in ay)) - radius) > 1e-6 * radius or abs(dot) > 1e-6 * radius * radius:
+        return None  # an ellipse (a non-uniformly scaled arc), not a circle
+
+    def point(t):
+        return App.Vector(
+            cx + math.cos(t) * ax[0] + math.sin(t) * ay[0],
+            cy + math.cos(t) * ax[1] + math.sin(t) * ay[1],
+            cz + math.cos(t) * ax[2] + math.sin(t) * ay[2],
+        )
+
+    try:
+        if arc.is_full_circle:
+            normal = App.Vector(
+                ax[1] * ay[2] - ax[2] * ay[1],
+                ax[2] * ay[0] - ax[0] * ay[2],
+                ax[0] * ay[1] - ax[1] * ay[0],
+            )
+            if normal.Length == 0.0:
+                return None
+            return Part.Circle(App.Vector(cx, cy, cz), normal, radius).toShape()
+        t0, t1 = arc.start_angle, arc.end_angle
+        return Part.Arc(point(t0), point((t0 + t1) / 2.0), point(t1)).toShape()
     except Exception:
         return None
 
@@ -319,6 +391,11 @@ def _get_local_shape(
                 complete = False
                 break
             pts.append((v.x * INCH_TO_MM, v.y * INCH_TO_MM, v.z * INCH_TO_MM))
+        arc_edge = _make_arc_edge(definition, edge_ids) if complete else None
+        if arc_edge is not None:
+            stats["arcs_built"] += 1
+            bucket(inherited_layer)["shapes"].append(arc_edge)
+            continue
         wire = _make_loose_edge_wire(pts, closed) if complete else None
         if wire is not None:
             bucket(inherited_layer)["shapes"].append(wire)
@@ -420,7 +497,7 @@ def import_skp(filepath, doc=None):
     t0 = time.time()
     stats = {
         "faces_built": 0, "faces_skipped": 0, "placements": 0,
-        "edge_runs_built": 0, "edge_runs_skipped": 0,
+        "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
     }
     shape_cache: dict = {}
 
