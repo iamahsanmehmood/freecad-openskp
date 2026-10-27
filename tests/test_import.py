@@ -251,6 +251,7 @@ def check_nonuniform_scale():
 
 
 def _main():
+    assert False, 'CI CANARY: this must fail the job'
     _checked = 0
     for _name in os.listdir(FIXTURES_DIR):
         if _name.endswith(".skp"):
