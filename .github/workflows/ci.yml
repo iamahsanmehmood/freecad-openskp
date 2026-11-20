@@ -70,3 +70,6 @@ jobs:
 
       - name: Run export tests
         run: ${{ steps.locate.outputs.freecadcmd }} tests/test_export.py
+
+      - name: Run non-planar face regression tests
+        run: ${{ steps.locate.outputs.freecadcmd }} tests/test_nonplanar.py
