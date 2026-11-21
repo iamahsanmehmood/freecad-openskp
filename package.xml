@@ -20,8 +20,10 @@
     <content>
         <!-- "other" (FreeCAD 1.1+), not "workbench" - this addon has no
         GUI/toolbar, it only registers the .skp import/export file types
-        via Init.py. "workbench" requires a <classname> matching a real
-        InitGui class, which doesn't apply here. -->
+        via freecad/openskp_importer/init.py. "workbench" requires a
+        <classname> matching a real InitGui class, which doesn't apply here.
+        FreeCAD runs a top-level Init.py only for "workbench" entries, which
+        is why registration lives in that namespaced package (#14). -->
         <other>
             <name>OpenSKPImporter</name>
             <subdirectory>./</subdirectory>

@@ -37,6 +37,18 @@ freecadcmd tests/test_export.py
 freecadcmd tests/test_nonplanar.py
 ```
 
+`tests/test_registration.py` checks something the others cannot: that FreeCAD
+registers the `.skp` import/export types by itself when it starts. It needs a
+fresh FreeCAD process with the add-on installed in a scratch user data
+directory, so it is run like this (CI does the same):
+
+```bash
+export FREECAD_USER_DATA="$(mktemp -d)"
+mkdir -p "$FREECAD_USER_DATA/Mod/OpenSKP"
+git archive HEAD | tar -x -C "$FREECAD_USER_DATA/Mod/OpenSKP"
+freecadcmd tests/test_registration.py
+```
+
 Note: `freecadcmd` sets `__name__` to the *filename*, not `"__main__"` —
 these test files run unconditionally at module level for this reason
 rather than relying on an `if __name__ == "__main__":` guard, which would
