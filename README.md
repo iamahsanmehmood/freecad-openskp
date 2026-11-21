@@ -234,8 +234,9 @@ collapses non-uniform scale to its geometric mean, so a 2x/3x/0.5x
 placement came back a flat ~1.44x on every axis instead. Fixed, and
 pinned as `tests/test_import.py`'s `check_nonuniform_scale()`.
 
-**Verified interactively, not just headlessly:** `Init.py`'s
-`addImportType` registration - **File → Open** on a real `.skp` file in
+**Verified interactively, not just headlessly:** the
+`addImportType` registration (now in `freecad/openskp_importer/init.py`;
+`tests/test_registration.py` checks that FreeCAD performs it at startup) - **File → Open** on a real `.skp` file in
 FreeCAD's actual GUI (not just `freecadcmd`) opens it correctly, producing
 the expected per-layer objects with materials and hidden-layer visibility
 applied. `freecadcmd`'s headless mode still can't exercise

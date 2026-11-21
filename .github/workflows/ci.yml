@@ -73,3 +73,67 @@ jobs:
 
       - name: Run non-planar face regression tests
         run: ${{ steps.locate.outputs.freecadcmd }} tests/test_nonplanar.py
+
+      # The tests above call the importer directly, so none of them can tell whether
+      # FreeCAD registers the .skp types by itself at startup (#14). This one starts a
+      # fresh freecadcmd whose user data directory holds an installed copy of the add-on
+      # (the repository's files, as the Addon Manager would install them) and asks what
+      # FreeCAD registered.
+      - name: Run startup registration test
+        run: |
+          export FREECAD_USER_DATA="$RUNNER_TEMP/freecad-user"
+          mkdir -p "$FREECAD_USER_DATA/Mod/OpenSKP"
+          git archive HEAD | tar -x -C "$FREECAD_USER_DATA/Mod/OpenSKP"
+          ${{ steps.locate.outputs.freecadcmd }} tests/test_registration.py
+
+  # The same startup check on FreeCAD 1.1.4, the version #14 was reported on. Startup
+  # handling of package.xml differs between FreeCAD releases, so the add-on is checked on
+  # more than the one version the tests above run on. A separate job, not a matrix, so the
+  # required check name "test" stays what it is.
+  registration-1-1-4:
+    name: registration (FreeCAD 1.1.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache extracted FreeCAD
+        id: cache-freecad
+        uses: actions/cache@v4
+        with:
+          path: squashfs-root
+          key: freecad-1.1.4-linux-x86_64-extracted-v1
+
+      - name: Download and extract FreeCAD AppImage
+        if: steps.cache-freecad.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o freecad.AppImage             https://github.com/FreeCAD/FreeCAD/releases/download/1.1.4/FreeCAD_1.1.4-Linux-x86_64-py311.AppImage
+          chmod +x freecad.AppImage
+          ./freecad.AppImage --appimage-extract >/dev/null
+          rm freecad.AppImage
+
+      - name: Locate freecadcmd
+        id: locate
+        run: |
+          FREECADCMD=$(find squashfs-root -type f -name 'freecadcmd' | head -1)
+          if [ -z "$FREECADCMD" ]; then
+            echo "::error::freecadcmd not found in extracted AppImage"
+            exit 1
+          fi
+          echo "freecadcmd=$FREECADCMD" >> "$GITHUB_OUTPUT"
+
+      - name: Install openskp's runtime dependencies
+        if: steps.cache-freecad.outputs.cache-hit != 'true'
+        run: |
+          cat > _pip_install.py <<'PYEOF'
+          from pip._internal.cli.main import main as _pip_main
+          raise SystemExit(_pip_main(["install", "--quiet", "mapbox_earcut", "shapely", "numpy"]))
+          PYEOF
+          ${{ steps.locate.outputs.freecadcmd }} _pip_install.py
+          rm _pip_install.py
+
+      - name: Run startup registration test
+        run: |
+          export FREECAD_USER_DATA="$RUNNER_TEMP/freecad-user"
+          mkdir -p "$FREECAD_USER_DATA/Mod/OpenSKP"
+          git archive HEAD | tar -x -C "$FREECAD_USER_DATA/Mod/OpenSKP"
+          ${{ steps.locate.outputs.freecadcmd }} tests/test_registration.py
