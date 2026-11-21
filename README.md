@@ -20,6 +20,18 @@ not a triangulated mesh) and rebuilds it as native FreeCAD `Part.Face` /
 transforms, so a component placed 50 times ends up in the right 50
 places, not just modeled once.
 
+If a source polygon is slightly non-planar and cannot be constructed as a
+planar face, a simple outline is triangulated without moving any of
+its 3-D boundary vertices. Concave outlines are supported; already valid
+planar faces stay single faces. Non-planar face triangulation needs no optional
+mesh dependencies. Each triangle inherits its source face's material,
+and component/layer nesting is unchanged. Repaired and rejected source faces
+are reported with their face ID and component name.
+
+This new fallback only handles simple, single-loop polygons; the importer's
+existing handling of faces with holes is unchanged. Self-intersecting or
+degenerate projected outlines are not triangulated.
+
 Each *unique* component/group definition's geometry is built exactly
 once and cached; every placement after the first is a cheap
 `Shape.copy()` + `transformShape()`, not a rebuild from scratch. This
@@ -160,6 +172,7 @@ directly:
 | `capilla_quiroz_v17.skp` | 192 | 20 | 192 faces + 20 loose edges imported, 0 invalid |
 | `gondola_v20.skp` | 39,352 | — | 39,352 imported, 0 invalid |
 | `SU_File.skp` | 32 | 0 | 32 imported, 0 invalid |
+| `Test_Component.skp` | 124 | 0 | 106 source polygons; 14 non-planar polygons become 32 planar triangles, 0 skipped. All original boundary vertices retained; sews into one valid closed solid and passes the detailed BOP check. See `tests/test_nonplanar.py` |
 | `arcs_2017.skp`, `arcs_2021.skp` | 2 | 1 | The same model saved as SketchUp 2017 and 2021: a disc and a half disc (2 faces) and one loose 90 degree arc, which imports as a single real arc edge (radius 254 mm, length 398.98 mm), not a polyline. Pinned in `tests/test_import.py` (`check_arcs`) |
 | `Untitled.skp` | 1,588 | — | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
 | A real structural-framing file (outside the repo) | 9,652 | 1,077 | All faces and loose edges imported, 0 skipped — 93 of the file's 145 definitions were entirely or partly loose-edge (light-gauge-steel members drawn as construction lines), previously silently invisible |

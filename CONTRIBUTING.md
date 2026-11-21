@@ -29,15 +29,16 @@ pinned version and why it's vendored rather than a declared dependency.
 
 ## Running tests
 
-Both test files run under FreeCAD's own headless interpreter:
+The FreeCAD test files run under FreeCAD's own headless interpreter:
 
 ```bash
 freecadcmd tests/test_import.py
 freecadcmd tests/test_export.py
+freecadcmd tests/test_nonplanar.py
 ```
 
 Note: `freecadcmd` sets `__name__` to the *filename*, not `"__main__"` —
-both test files run unconditionally at module level for this reason
+these test files run unconditionally at module level for this reason
 rather than relying on an `if __name__ == "__main__":` guard, which would
 silently never fire.
 

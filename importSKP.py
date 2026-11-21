@@ -296,11 +296,123 @@ def _resolve_face_color(face, model, inherited_material_id):
     return _material_rgba(mat)
 
 
+def _nonplanar_triangles(points):
+    """Triangulate a simple nonplanar loop, retaining its exact 3-D vertices.
+
+    Project only to choose diagonals. Dependency-free ear clipping handles
+    concave outlines too; a triangle fan would incorrectly fill their notches.
+    Return None for planar, degenerate or self-intersecting input. Faces with
+    holes are handled by the caller, never by dropping their inner loops.
+    """
+    if len(points) < 4:
+        return None
+    vectors = [App.Vector(*p) for p in points]
+    origin = sum(vectors, App.Vector()) / len(vectors)
+    relative = [p - origin for p in vectors]
+    normal = App.Vector()
+    for a, b in zip(relative, relative[1:] + relative[:1]):
+        normal += a.cross(b)
+    if normal.Length == 0:
+        return None
+    normal.normalize()
+    deviation = max(abs(p.dot(normal)) for p in relative)
+    if deviation <= 1e-7:  # mm; do not reinterpret other face-construction errors
+        return None
+
+    # Drop the dominant normal axis and normalize the projection for stable
+    # predicates, including components far from their local origin.
+    axis = max(range(3), key=lambda i: abs(normal[i]))
+    coords = [tuple(p[i] for i in range(3) if i != axis) for p in relative]
+    scale = max(max(p[i] for p in coords) - min(p[i] for p in coords) for i in (0, 1))
+    if scale == 0:
+        return None
+    coords = [(x / scale, y / scale) for x, y in coords]
+    eps = 1e-12
+
+    def cross(a, b, c):
+        return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+    def on_segment(a, b, p):
+        return (
+            min(a[0], b[0]) - eps <= p[0] <= max(a[0], b[0]) + eps
+            and min(a[1], b[1]) - eps <= p[1] <= max(a[1], b[1]) + eps
+        )
+
+    def intersect(a, b, c, d):
+        ab_c, ab_d = cross(a, b, c), cross(a, b, d)
+        cd_a, cd_b = cross(c, d, a), cross(c, d, b)
+        opposite_ab = ab_c > eps and ab_d < -eps or ab_c < -eps and ab_d > eps
+        opposite_cd = cd_a > eps and cd_b < -eps or cd_a < -eps and cd_b > eps
+        if opposite_ab and opposite_cd:
+            return True
+        return any(
+            abs(value) <= eps and on_segment(start, end, point)
+            for value, start, end, point in (
+                (ab_c, a, b, c), (ab_d, a, b, d),
+                (cd_a, c, d, a), (cd_b, c, d, b),
+            )
+        )
+
+    count = len(coords)
+    for i in range(count):
+        a, b = coords[i], coords[(i + 1) % count]
+        if (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 <= eps ** 2:
+            return None
+        for j in range(i + 1, count):
+            if j == i + 1 or (i == 0 and j == count - 1):
+                continue
+            if intersect(a, b, coords[j], coords[(j + 1) % count]):
+                return None
+    area2 = sum(
+        a[0] * b[1] - b[0] * a[1]
+        for a, b in zip(coords, coords[1:] + coords[:1])
+    )
+    if abs(area2) <= eps:
+        return None
+    winding = 1 if area2 > 0 else -1
+
+    def point_in_triangle(point, a, b, c):
+        return all(
+            winding * cross(start, end, point) >= -eps
+            for start, end in ((a, b), (b, c), (c, a))
+        )
+
+    remaining = list(range(count))
+    triangles = []
+    while len(remaining) > 3:
+        for offset, current in enumerate(remaining):
+            previous = remaining[offset - 1]
+            following = remaining[(offset + 1) % len(remaining)]
+            a, b, c = coords[previous], coords[current], coords[following]
+            if winding * cross(a, b, c) <= eps:
+                continue
+            # Include triangle boundaries here: a diagonal must not skip over
+            # another boundary vertex, including collinear vertices.
+            if any(
+                point_in_triangle(coords[index], a, b, c)
+                for index in remaining
+                if index not in (previous, current, following)
+            ):
+                continue
+            triangles.append((previous, current, following))
+            remaining.pop(offset)
+            break
+        else:
+            return None
+    if winding * cross(*(coords[i] for i in remaining)) <= eps:
+        return None
+    triangles.append(tuple(remaining))
+    return triangles
+
+
 def _make_face_shape(definition, face):
     """Builds one face's shape in the definition's own LOCAL space
     (no world transform applied - that happens once per placement,
-    cheaply, via _to_freecad_matrix + transformShape)."""
+    cheaply, via _to_freecad_matrix + transformShape). Returns one Face,
+    a compound of planar triangles for a warped simple polygon, or None.
+    """
     wires = []
+    loops = []
     for loop in face.loops:
         pts = _loop_points(definition, loop)
         if pts is None:
@@ -309,18 +421,48 @@ def _make_face_shape(definition, face):
         if wire is None:
             return None
         wires.append(wire)
+        loops.append(pts)
     if not wires:
         return None
     try:
         return Part.Face(wires)
     except Exception:
-        # Some real files carry holes with inconsistent winding relative
-        # to their outer loop - fall back to the outer boundary alone
-        # rather than dropping the face's material area entirely.
+        pass
+    # Preserve the existing handling of faces with holes. Triangulating such
+    # boundaries needs a separate implementation; it is outside this fallback.
+    if len(loops) != 1:
         try:
             return Part.Face([wires[0]])
         except Exception:
             return None
+    # A single SketchUp polygon can be slightly warped. Split it into planar
+    # triangles instead of dropping it or moving shared boundary vertices.
+    # _make_wire closes a polygon from its start vertices. Before repairing a
+    # rejected face, ensure that this does not bridge missing source segments.
+    loop = face.loops[0]
+    for (edge_id, sign), (next_id, next_sign) in zip(loop, loop[1:] + loop[:1]):
+        edge, following = definition.edges[edge_id], definition.edges[next_id]
+        end = edge.v2_id if sign >= 0 else edge.v1_id
+        start = following.v1_id if next_sign >= 0 else following.v2_id
+        if end != start:
+            return None
+    indices = _nonplanar_triangles(loops[0])
+    if indices is None:
+        return None
+    triangles = []
+    try:
+        for triangle in indices:
+            shape = Part.Face(_make_wire([loops[0][i] for i in triangle]))
+            if not shape.isValid() or shape.Area <= 0:
+                return None
+            triangles.append(shape)
+    except Exception:
+        return None
+    App.Console.PrintWarning(
+        f"openskp: triangulated non-planar face {face.id} in "
+        f"{definition.name or '(model root)'!r} into {len(triangles)} faces\n"
+    )
+    return Part.makeCompound(triangles)
 
 
 def _get_local_shape(
@@ -367,10 +509,21 @@ def _get_local_shape(
         shape = _make_face_shape(definition, face)
         if shape is not None:
             b = bucket(inherited_layer)
-            b["shapes"].append(shape)
-            b["colors"].append(_resolve_face_color(face, model, inherited_material_id))
+            faces = shape.Faces
+            # Flatten only this source face's triangles, preserving component
+            # nesting and a face-only leaf compound for downstream CAD tools.
+            b["shapes"].extend(faces)
+            color = _resolve_face_color(face, model, inherited_material_id)
+            b["colors"].extend([color] * len(faces))
+            if len(faces) > 1:
+                stats["faces_triangulated"] = stats.get("faces_triangulated", 0) + 1
+                stats["triangles_built"] = stats.get("triangles_built", 0) + len(faces)
         else:
             stats["faces_skipped"] += 1
+            App.Console.PrintWarning(
+                f"openskp: skipped face {face.id} in {definition.name or '(model root)'!r}: "
+                "could not construct a valid face without changing its boundaries\n"
+            )
 
     # Loose edges (SketchUp's own way of storing drawing/construction
     # geometry: a light-gauge-steel or structural-framing member is
@@ -543,7 +696,9 @@ def import_skp(filepath, doc=None):
     doc.recompute()
     print(
         f"openskp: {len(shape_cache)} unique definitions built in {time.time() - t0:.1f}s "
-        f"({stats['faces_built']} faces, {stats['faces_skipped']} skipped; "
+        f"({stats['faces_built']} source faces, {stats['faces_skipped']} skipped; "
+        f"{stats.get('faces_triangulated', 0)} non-planar faces triangulated into "
+        f"{stats.get('triangles_built', 0)} triangles; "
         f"{stats['edge_runs_built']} loose-edge runs, {stats['edge_runs_skipped']} skipped), "
         f"{stats['placements']} instances placed; {len(root_buckets)} layers "
         f"({stats['hidden_layers']} hidden)"

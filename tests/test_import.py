@@ -47,6 +47,7 @@ EXPECTED = {
     # check_arcs. The same model saved as SketchUp 2017 (classic container) and 2021 (VFF).
     "arcs_2017.skp": (2, 0, 0, 1, 1, 0),
     "arcs_2021.skp": (2, 0, 0, 1, 1, 0),
+    "Test_Component.skp": (124, 0, 0, 0, 1, 0),
 }
 
 
