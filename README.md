@@ -11,6 +11,20 @@ from-scratch `.skp` reader/writer. No Trimble SDK, no SketchUp
 installation, no compiled extension required — pure Python, vendored directly
 into this addon.
 
+## Featured
+
+This add-on, together with the Blender one, was covered by [Blender 3D Architect](https://www.youtube.com/@blender3darchitect):
+
+<table>
+<tr>
+<td align="center" width="60%">
+<a href="https://www.youtube.com/watch?v=q-Gjsa4tuPU"><img src="https://img.youtube.com/vi/q-Gjsa4tuPU/mqdefault.jpg" alt="Blender and FreeCAD Can Now Read and Write SketchUp Files (video)" width="100%"></a><br>
+<b>Blender and FreeCAD Can Now Read and Write SketchUp Files</b><br>
+<sub>Blender 3D Architect · October 2026</sub>
+</td>
+</tr>
+</table>
+
 ## What it does
 
 **Import** parses a `.skp` file's real geometry (planar faces and loops,
