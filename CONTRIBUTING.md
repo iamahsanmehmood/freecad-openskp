@@ -35,6 +35,15 @@ The FreeCAD test files run under FreeCAD's own headless interpreter:
 freecadcmd tests/test_import.py
 freecadcmd tests/test_export.py
 freecadcmd tests/test_nonplanar.py
+freecadcmd tests/test_hierarchy.py
+```
+
+`tests/gui_hierarchy.py` checks the component hierarchy in FreeCAD's real
+GUI (what the 3D view draws). It needs a display; CI runs it under a
+virtual one and uploads pictures of the window:
+
+```bash
+GUI_OUT=gui-out GUI_TESTS_DIR="$PWD/tests" FreeCAD tests/gui_hierarchy.py
 ```
 
 `tests/test_registration.py` checks something the others cannot: that FreeCAD

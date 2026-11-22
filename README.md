@@ -34,6 +34,44 @@ not a triangulated mesh) and rebuilds it as native FreeCAD `Part.Face` /
 transforms, so a component placed 50 times ends up in the right 50
 places, not just modeled once.
 
+**Component hierarchy** (the default): the model tree follows SketchUp's
+own structure, so each part can be inspected, measured or rebuilt on its
+own.
+
+- Every component definition becomes an `App::Part`, kept in a hidden
+  **SketchUp components** group, holding its own faces and loose edges as
+  one shape, and a link for every component or group placed inside it.
+  Components that are defined in the file but not placed anywhere are
+  imported too.
+- Every placement is an `App::Link` to its definition, labelled with the
+  instance's name, carrying its position, rotation, non-uniform scale and
+  mirroring. Edit a definition and every placement follows.
+- The model itself is an `App::Part` named after the file, with one group
+  per SketchUp tag used at its top level. A tag hidden in SketchUp imports
+  hidden; a tag on a nested instance is kept in the link's `SketchUpLayer`
+  property, and hides that link when the tag is hidden.
+- An unpainted face shows the paint of the instance that places it, as in
+  SketchUp. Where one component is placed with different paints, each
+  paint gets its own definition, labelled with the material name (for
+  example "Leg (Red)").
+- A placement that is sheared (a 3x3 that is not a rotation and a scale per
+  axis, which SketchUp allows and a link cannot hold) is imported as a
+  placed copy of the component's geometry instead, labelled "(sheared
+  copy)", and reported in the console.
+
+**Merged** (the previous layout): one compound per SketchUp tag, with no
+component objects. It is lighter for a very large model, where thousands of
+definitions would each become an object (see
+[Performance](#performance-on-large-files--read-this-before-importing-a-big-model)).
+To use it, open Tools > Edit parameters, go to
+`BaseApp/Preferences/Mod/OpenSKP` and add a Boolean `MergeOnImport` set to
+`true`; from Python, `importSKP.import_skp(path, doc, merge=True)`.
+
+The two layouts show exactly the same geometry: the tests import every
+fixture both ways and compare faces, areas, vertices and edges
+(`tests/test_hierarchy.py`), and check in FreeCAD's real GUI that the 3D
+view draws the same extent for both (`tests/gui_hierarchy.py`).
+
 If a source polygon is slightly non-planar and cannot be constructed as a
 planar face, a simple outline is triangulated without moving any of
 its 3-D boundary vertices. Concave outlines are supported; already valid
@@ -63,10 +101,12 @@ same gap already found and fixed in the
 flattens the selected FreeCAD objects' faces (global placement
 resolved, so translated/nested objects land in the right world
 position) into a new .skp file - each face's outer boundary and any
-holes preserved. There's no way to infer "this should be one reusable
-component" purely from arbitrary FreeCAD geometry, so export doesn't
-reconstruct component/group structure - everything lands flat at the
-file's root. Round-trip-verified: exported coordinates match the
+holes preserved. An imported hierarchy can be exported as it is: parts,
+tag groups and links are followed down to the geometry they show, with
+each link's placement and scale, and the hidden definitions are not
+written a second time. Export does not write components yet, so
+everything lands flat at the file's root, on the tags the import
+recorded. Round-trip-verified: exported coordinates match the
 original geometry exactly (see tests/test_export.py).
 
 **Layer export**: each exported object's own `Label` becomes its
@@ -105,7 +145,7 @@ matter. Only applied under the real GUI (`ViewObject` doesn't exist
 under headless `freecadcmd`) - the underlying color resolution itself is
 exercised either way (see `tests/test_import.py`).
 
-**Layers** (SketchUp calls them "tags", import only) carry over too -
+**Layers in the merged layout** (SketchUp calls them "tags") carry over too -
 unlike materials, which fit onto the existing single-compound design as
 one color per face, a layer needs its own object to be independently
 toggleable at all, since FreeCAD has no per-face visibility the way it
@@ -142,6 +182,12 @@ unique component/group definitions, 358,188 faces in the final compound:
 | Build + place geometry (unique definitions cached, placements copied) | ~135s |
 | Assign shape / other | ~70s |
 | **Total** | **~297s (~5 min)** |
+
+Those numbers are for the merged layout. In the component hierarchy the
+same file becomes one `App::Part` per definition and one `App::Link` per
+placement (thousands of objects, each `App::Part` with its own origin), so
+for a model of that size set `MergeOnImport` (see
+[What it does](#what-it-does)).
 
 Progress is visible throughout — FreeCAD's native progress bar
 (`Base.ProgressIndicator`) in the GUI, periodic console output under

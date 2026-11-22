@@ -95,6 +95,19 @@ def run():
     expected = {(0.0, 0.0, 0.0), (100.0, 0.0, 0.0), (100.0, 100.0, 0.0), (0.0, 100.0, 0.0)}
     assert set(pts_mm) == expected, (pts_mm, expected)
 
+    # The translated box: obj2's shape carries its own placement (x = 200 mm), and
+    # its points already include it. Export used to apply the object's placement a
+    # second time, which put the box at x = 400 mm.
+    box_x = set()
+    for f in model.root.faces.values():
+        if len(f.loops) != 1:
+            continue
+        for edge_id, sign in f.loops[0]:
+            edge = model.root.edges[edge_id]
+            v = model.root.vertices[edge.v1_id if sign >= 0 else edge.v2_id]
+            box_x.add(round(v.x * 25.4, 3))
+    assert box_x == {200.0, 250.0}, f"the box exported at x = {sorted(box_x)} mm, expected 200 and 250"
+
     print(
         "export round-trip: OK (7 faces, loop counts", loop_counts,
         ", coordinates exact, layers", layer_names, ")"
