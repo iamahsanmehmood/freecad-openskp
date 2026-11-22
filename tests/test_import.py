@@ -48,6 +48,10 @@ EXPECTED = {
     "arcs_2017.skp": (2, 0, 0, 1, 1, 0),
     "arcs_2021.skp": (2, 0, 0, 1, 1, 0),
     "Test_Component.skp": (124, 0, 0, 0, 1, 0),
+    # one 100 in cube placed twice, once scaled through the 3x3 and once through the matrix's
+    # scale term (openskp#444); see check_scale_term. Saved by SketchUp's own library as 2021 and 6.
+    "instance_scale_term_2021.skp": (12, 0, 0, 0, 1, 0),
+    "instance_scale_term_v6.skp": (12, 0, 0, 0, 1, 0),
 }
 
 
@@ -287,6 +291,37 @@ def check_arcs(fixture_name):
         App.closeDocument(doc.Name)
 
 
+def check_scale_term(fixture_name):
+    """A 100 in cube placed twice: once through the 3x3 (scale 0.01) and once through the
+    matrix's scale term (index 12 = 0.01, translation 2000 in; openskp#444). SketchUp's own
+    library reports both as 1 x 1 x 1 in cubes, at x = 0 and x = 20 in. The add-on used to
+    ignore the scale term, which made the second cube 100 in wide at x = 2000 in."""
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    doc = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc)
+        faces = [f for o in doc.Objects if hasattr(o, "Shape") for f in o.Shape.Faces]
+        mm = importSKP.INCH_TO_MM
+        cubes = {
+            "via the 3x3": [f for f in faces if f.BoundBox.XMax < 2 * mm],
+            "via the scale term": [f for f in faces if f.BoundBox.XMin > 19 * mm],
+        }
+        for how, cube_faces in cubes.items():
+            assert len(cube_faces) == 6, f"{fixture_name}: cube placed {how}: {len(cube_faces)} faces, expected 6"
+            box = cube_faces[0].BoundBox
+            for f in cube_faces[1:]:
+                box.add(f.BoundBox)
+            x0 = 0.0 if how == "via the 3x3" else 20 * mm
+            got = (box.XMin, box.XMax, box.YMin, box.YMax, box.ZMin, box.ZMax)
+            want = (x0, x0 + mm, 0.0, mm, 0.0, mm)
+            assert all(abs(g - w) < 1e-4 for g, w in zip(got, want)), (
+                f"{fixture_name}: cube placed {how} spans {got} mm, expected {want}"
+            )
+        print(f"check_scale_term({fixture_name}): OK (both cubes 1 in, at x = 0 and 20 in)")
+    finally:
+        App.closeDocument(doc.Name)
+
+
 def _main():
     _checked = 0
     for _name in os.listdir(FIXTURES_DIR):
@@ -299,6 +334,8 @@ def _main():
     check_nonuniform_scale()
     check_arcs("arcs_2017.skp")
     check_arcs("arcs_2021.skp")
+    check_scale_term("instance_scale_term_2021.skp")
+    check_scale_term("instance_scale_term_v6.skp")
 
 
 # Note: freecadcmd runs a script file as a module named after the file

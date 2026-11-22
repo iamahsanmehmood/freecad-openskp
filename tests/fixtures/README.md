@@ -13,3 +13,12 @@ by `tests/test_nonplanar.py`, including with optional triangulation dependencies
 unavailable. The fixture demonstrates the importer's handling of the parsed
 geometry; it does not establish whether non-planarity originated in SketchUp
 or in the underlying parser.
+
+`instance_scale_term_2021.skp` and `instance_scale_term_v6.skp` come from the
+openskp repository (`packages/python/tests/fixtures/`), where they were built
+and saved through SketchUp's own library as SketchUp 2021 and SketchUp 6 files:
+one 100 in cube definition placed twice, once scaled through the 3x3 (0.01) and
+once through the matrix's scale term (index 12 = 0.01, translation 2000 in;
+openskp#444). SketchUp reports both cubes as 1 x 1 x 1 in, at x = 0 and
+x = 20 in, which `check_scale_term` in `tests/test_import.py` checks. No
+private content.
