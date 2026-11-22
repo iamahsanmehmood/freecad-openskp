@@ -153,6 +153,7 @@ def check_structure(path):
             assert not part.Visibility, f"{part.Label} is visible at the origin"
 
         model_part = doc.getObject(stats["model_part"])
+        print("model part Group:", [(o.Label, o.TypeId) for o in model_part.Group], flush=True)
         assert model_part.TypeId == "App::Part" and model_part.Label == os.path.splitext(os.path.basename(path))[0]
         tags = {o.Label: o for o in model_part.Group if o.TypeId == "App::DocumentObjectGroup"}
         assert sorted(tags) == ["Closed", "Layer0", "Open"], sorted(tags)

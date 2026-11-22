@@ -1221,6 +1221,16 @@ def _can_export(obj):
     return _is_container(obj) or (shape is not None and not shape.isNull())
 
 
+def _direct_children(container):
+    """A container's own children. An App::Part's Group also lists what sits
+    in the plain groups inside it (the tag groups of an import), which are
+    reached through those groups instead."""
+    for child in container.Group:
+        parent = _parent_of(child)
+        if parent is None or parent.Name == container.Name:
+            yield child
+
+
 def _is_definitions_group(obj):
     return bool(getattr(obj, "SketchUpDefinitions", False))
 
@@ -1265,11 +1275,11 @@ def _export_leaves(exportList):
         # but its Shape (the tip) is the solid it stands for.
         if _is_type(obj, "App::Part"):
             inner = matrix if through_link else matrix * obj.Placement.toMatrix()
-            for child in obj.Group:
+            for child in _direct_children(obj):
                 yield from walk(child, inner, layer, False)
             return
         if _is_type(obj, "App::DocumentObjectGroup"):
-            for child in obj.Group:
+            for child in _direct_children(obj):
                 yield from walk(child, matrix, layer, False)
             return
         shape = getattr(obj, "Shape", None)
