@@ -82,7 +82,9 @@ does not use). What that copy added for an import:
   ([openskp#444](https://github.com/iamahsanmehmood/openskp/issues/444)).**
   SketchUp can keep a uniform scale in an instance's transformation instead of
   in its 3x3. Every earlier reader ignored it, so such an instance came out 100x
-  its size and 100x its distance from its parent in this add-on too.
+  its size and 100x its distance from its parent. The add-on converts instance
+  matrices itself (`importSKP._to_freecad_matrix`), and it ignored the term
+  too up to and including v0.3.0; it now folds it in the same way openskp does.
 - **More legacy (pre-2021) files read correctly:** SketchUp 4, 5 and 2019 files
   ([openskp#440](https://github.com/iamahsanmehmood/openskp/pull/440)) and files
   saved through SketchUp's C API as 2019 or 2020

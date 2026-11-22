@@ -141,7 +141,16 @@ openskp = _load_vendored_openskp()
 
 def _to_freecad_matrix(m13):
     """13-element openskp instance matrix -> FreeCAD.Matrix (row-major
-    4x4), scaling only the translation component to millimetres."""
+    4x4), scaling only the translation component to millimetres.
+
+    Index 12 is a uniform scale SketchUp can keep in the transformation's
+    homogeneous term instead of in the 3x3 (openskp#444): a point maps to
+    ``s * (R p + t)``. It is folded into the other twelve values first, as
+    openskp does itself; ignoring it placed such an instance 1/s times too
+    big and 1/s times too far from its parent's origin."""
+    s = m13[12] if len(m13) > 12 else 1.0
+    if s != 1.0:
+        m13 = [v * s for v in m13[:12]] + [1.0]
     return App.Matrix(
         m13[0], m13[1], m13[2], m13[9] * INCH_TO_MM,
         m13[3], m13[4], m13[5], m13[10] * INCH_TO_MM,
