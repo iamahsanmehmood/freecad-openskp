@@ -89,6 +89,62 @@ jobs:
           git archive HEAD | tar -x -C "$FREECAD_USER_DATA/Mod/OpenSKP"
           ${{ steps.locate.outputs.freecadcmd }} tests/test_registration.py
 
+  # The component hierarchy in FreeCAD's real GUI, under a virtual display: what the 3D
+  # view actually draws (links to hidden definitions, a hidden tag, definitions kept out
+  # of view), which the headless tests above cannot see. Screenshots are uploaded.
+  gui:
+    name: GUI check (hierarchy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache extracted FreeCAD
+        id: cache-freecad
+        uses: actions/cache@v4
+        with:
+          path: squashfs-root
+          key: freecad-1.1.3-linux-x86_64-extracted-v2
+
+      - name: Download and extract FreeCAD AppImage
+        if: steps.cache-freecad.outputs.cache-hit != 'true'
+        run: |
+          curl -fL -o freecad.AppImage             https://github.com/FreeCAD/FreeCAD/releases/download/1.1.3/FreeCAD_1.1.3-Linux-x86_64-py311.AppImage
+          chmod +x freecad.AppImage
+          ./freecad.AppImage --appimage-extract >/dev/null
+          rm freecad.AppImage
+
+      - name: Install openskp's runtime dependencies
+        if: steps.cache-freecad.outputs.cache-hit != 'true'
+        run: |
+          FREECADCMD=$(find squashfs-root -type f -name 'freecadcmd' | head -1)
+          cat > _pip_install.py <<'PYEOF'
+          from pip._internal.cli.main import main as _pip_main
+          raise SystemExit(_pip_main(["install", "--quiet", "mapbox_earcut", "shapely", "numpy"]))
+          PYEOF
+          "$FREECADCMD" _pip_install.py
+          rm _pip_install.py
+
+      - name: Install a virtual display
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb xauth libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0             libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libxcb-render-util0 libxcb-image0 libxcb-xinerama0 >/dev/null
+
+      - name: Run the GUI check
+        run: |
+          export GUI_OUT="$RUNNER_TEMP/gui-out" GUI_TESTS_DIR="$GITHUB_WORKSPACE/tests"
+          xvfb-run -a -s "-screen 0 1600x1000x24" timeout 300 squashfs-root/AppRun             "$GITHUB_WORKSPACE/tests/gui_hierarchy.py" || true
+          if [ ! -f "$GUI_OUT/result.txt" ]; then echo "::error::the GUI check wrote no result"; exit 1; fi
+          cat "$GUI_OUT/result.txt"
+          head -1 "$GUI_OUT/result.txt" | grep -qx PASS
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-hierarchy
+          path: ${{ runner.temp }}/gui-out/*.png
+          if-no-files-found: warn
+
   # The same startup check on FreeCAD 1.1.4, the version #14 was reported on. Startup
   # handling of package.xml differs between FreeCAD releases, so the add-on is checked on
   # more than the one version the tests above run on. A separate job, not a matrix, so the

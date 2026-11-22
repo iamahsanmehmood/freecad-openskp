@@ -38,89 +38,45 @@ except BaseException:
 FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 MM = importSKP.INCH_TO_MM
 
-# The synthetic model's instances that sit at the top level (not inside Table):
-# name -> (3x3 row-major, translation in inches). Leg is a 2 x 2 x 28 in box.
-TOP_LEVEL_LEGS = {
-    "Scaled leg": ((0, -3, 0, 2, 0, 0, 0, 0, 0.5), (0, 100, 0)),   # rotated 90 deg, scaled 2 / 3 / 0.5
-    "Mirrored leg": ((-1, 0, 0, 0, 1, 0, 0, 0, 1), (50, 100, 0)),  # mirrored in x
-}
-SHEARED = ((1, 0.5, 0, 0, 1, 0, 0, 0, 1), (100, 100, 0))
-LEG_SIZE = (2, 2, 28)
+from _synthetic import LEG_SIZE, SHEARED, TOP_LEVEL_LEGS, write_synthetic  # noqa: E402
 
-
-def _box(cb, x, y, z):
-    cb.add_face([(0, 0, 0), (0, y, 0), (x, y, 0), (x, 0, 0)])
-    cb.add_face([(0, 0, z), (x, 0, z), (x, y, z), (0, y, z)])
-    cb.add_face([(0, 0, 0), (x, 0, 0), (x, 0, z), (0, 0, z)])
-    cb.add_face([(0, y, 0), (0, y, z), (x, y, z), (x, y, 0)])
-    cb.add_face([(0, 0, 0), (0, 0, z), (0, y, z), (0, y, 0)])
-    cb.add_face([(x, 0, 0), (x, y, 0), (x, y, z), (x, 0, z)])
-
-
-def write_synthetic(path):
-    """A table (a blue top and four unpainted legs) placed twice: on tag
-    "Closed", and on tag "Open" (hidden) painted red. Three legs at the top
-    level: one rotated and scaled non-uniformly, one mirrored, one sheared.
-    A component "Spare" that is never placed, and one loose face at the top."""
-    import openskp
-
-    b = openskp.create()
-    red = b.add_material("Red", (200, 30, 30, 255))
-    blue = b.add_material("Blue", (30, 30, 200, 255))
-    open_tag = b.add_layer("Open", hidden=True)
-    closed_tag = b.add_layer("Closed")
-    with b.add_component_definition("Leg") as leg:
-        _box(leg, *LEG_SIZE)
-    with b.add_component_definition("Table") as table:
-        table.add_face([(0, 0, 30), (40, 0, 30), (40, 20, 30), (0, 20, 30)], material=blue)
-        for i, (x, y) in enumerate([(0, 0), (38, 0), (0, 18), (38, 18)]):
-            table.add_instance(leg, name=f"Leg {i + 1}", translation=(x, y, 0))
-    with b.add_component_definition("Spare") as spare:
-        spare.add_face([(0, 0, 0), (5, 0, 0), (5, 5, 0), (0, 5, 0)])
-    b.add_instance(table, name="Table closed", layer=closed_tag)
-    b.add_instance(table, name="Table open", translation=(100, 0, 0), material=red, layer=open_tag)
-    for name, (m, t) in TOP_LEVEL_LEGS.items():
-        b.add_instance(leg, name=name, matrix3x3=m, translation=t)
-    b.add_instance(leg, name="Sheared leg", matrix3x3=SHEARED[0], translation=SHEARED[1])
-    b.add_face([(0, -20, 0), (10, -20, 0), (10, -10, 0), (0, -10, 0)])
-    with open(path, "wb") as f:
-        f.write(b.to_bytes())
-
-
-def _world_faces(doc, stats):
-    """Every face the hierarchy shows, in world space: the model part followed
+def _world_shapes(doc, stats):
+    """Everything the hierarchy shows, in world space: the model part followed
     down through its tag groups and links (the export walker), each leaf's
     shape mapped through its transform."""
     model_part = doc.getObject(stats["model_part"])
-    faces = []
-    for _obj, shape, transform, _layer in importSKP._export_leaves([model_part]):
-        faces.extend(shape.transformGeometry(transform).Faces)
-    return faces
+    return [shape.transformGeometry(transform)
+            for _obj, shape, transform, _layer in importSKP._export_leaves([model_part])]
 
 
-def _merged_faces(path):
+def _merged_shapes(path):
     doc = App.newDocument()
     try:
         importSKP.import_skp(path, doc, merge=True)
-        return [f.copy() for o in doc.Objects if hasattr(o, "Shape") for f in o.Shape.Faces]
+        return [o.Shape.copy() for o in doc.Objects if hasattr(o, "Shape")]
     finally:
         App.closeDocument(doc.Name)
 
 
-def _signature(faces):
-    points = sorted({(round(v.X, 3), round(v.Y, 3), round(v.Z, 3)) for f in faces for v in f.Vertexes})
-    return len(faces), round(sum(f.Area for f in faces), 3), points
+def _signature(shapes):
+    """Faces, their total area, every vertex, edges and their total length:
+    the last two cover loose edges and arcs, which have no face."""
+    faces = [f for s in shapes for f in s.Faces]
+    edges = [e for s in shapes for e in s.Edges]
+    points = sorted({(round(v.X, 3), round(v.Y, 3), round(v.Z, 3)) for s in shapes for v in s.Vertexes})
+    return (len(faces), round(sum(f.Area for f in faces), 3), points,
+            len(edges), round(sum(e.Length for e in edges), 3))
 
 
 def check_same_geometry(path):
     """The hierarchy shows exactly the merged import's geometry."""
-    merged = _signature(_merged_faces(path))
+    merged = _signature(_merged_shapes(path))
     doc = App.newDocument()
     try:
         importSKP.import_skp(path, doc, merge=False)
         stats = importSKP.last_import_stats
         assert not stats["merged"], stats
-        got = _signature(_world_faces(doc, stats))
+        got = _signature(_world_shapes(doc, stats))
     finally:
         App.closeDocument(doc.Name)
     name = os.path.basename(path)
@@ -130,7 +86,10 @@ def check_same_geometry(path):
         f"{name}: vertex sets differ; only in hierarchy: {sorted(set(got[2]) - set(merged[2]))[:5]}, "
         f"only in merged: {sorted(set(merged[2]) - set(got[2]))[:5]}"
     )
-    print(f"check_same_geometry({name}): OK ({got[0]} faces, area {got[1]} mm2, {len(got[2])} vertices)")
+    assert got[3] == merged[3], f"{name}: hierarchy shows {got[3]} edges, merged import has {merged[3]}"
+    assert abs(got[4] - merged[4]) <= 1e-6 * max(1.0, merged[4]), f"{name}: edge length {got[4]} vs merged {merged[4]}"
+    print(f"check_same_geometry({name}): OK ({got[0]} faces, area {got[1]} mm2, {len(got[2])} vertices, "
+          f"{got[3]} edges, {got[4]} mm of edges)")
 
 
 def check_structure(path):
@@ -153,7 +112,6 @@ def check_structure(path):
             assert not part.Visibility, f"{part.Label} is visible at the origin"
 
         model_part = doc.getObject(stats["model_part"])
-        print("model part Group:", [(o.Label, o.TypeId) for o in model_part.Group], flush=True)
         assert model_part.TypeId == "App::Part" and model_part.Label == os.path.splitext(os.path.basename(path))[0]
         tags = {o.Label: o for o in model_part.Group if o.TypeId == "App::DocumentObjectGroup"}
         assert sorted(tags) == ["Closed", "Layer0", "Open"], sorted(tags)
