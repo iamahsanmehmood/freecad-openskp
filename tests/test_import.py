@@ -2,7 +2,9 @@
 
     freecadcmd tests/test_import.py
 
-Verifies importSKP.import_skp() against real fixture files, checking
+Verifies importSKP.import_skp() in its merged layout (merge=True: one object per
+SketchUp tag; the component hierarchy is tests/test_hierarchy.py) against real
+fixture files, checking
 face count, validity, absence of degenerate (zero-area/NaN) faces, AND
 loose-edge (structural-framing/light-gauge-steel) run count - not just
 "it didn't crash." The loose-edge count is the regression guard for a
@@ -59,7 +61,7 @@ def check(fixture_name):
     path = os.path.join(FIXTURES_DIR, fixture_name)
     doc = App.newDocument()
     try:
-        importSKP.import_skp(path, doc)
+        importSKP.import_skp(path, doc, merge=True)
         objs = [o for o in doc.Objects if hasattr(o, "Shape")]
         assert objs, f"{fixture_name}: no shape object created"
 
@@ -238,7 +240,7 @@ def check_nonuniform_scale():
 
     doc = App.newDocument()
     try:
-        importSKP.import_skp(path, doc)
+        importSKP.import_skp(path, doc, merge=True)
         objs = [o for o in doc.Objects if hasattr(o, "Shape")]
         assert len(objs) == 1, f"expected 1 layer object (no layers used), got {len(objs)}"
         all_pts = [(v.X, v.Y, v.Z) for v in objs[0].Shape.Vertexes]
@@ -266,7 +268,7 @@ def check_arcs(fixture_name):
     path = os.path.join(FIXTURES_DIR, fixture_name)
     doc = App.newDocument()
     try:
-        importSKP.import_skp(path, doc)
+        importSKP.import_skp(path, doc, merge=True)
         objs = [o for o in doc.Objects if hasattr(o, "Shape")]
         faces = [f for o in objs for f in o.Shape.Faces]
         face_edge_hashes = {e.hashCode() for f in faces for e in f.Edges}
@@ -299,7 +301,7 @@ def check_scale_term(fixture_name):
     path = os.path.join(FIXTURES_DIR, fixture_name)
     doc = App.newDocument()
     try:
-        importSKP.import_skp(path, doc)
+        importSKP.import_skp(path, doc, merge=True)
         faces = [f for o in doc.Objects if hasattr(o, "Shape") for f in o.Shape.Faces]
         mm = importSKP.INCH_TO_MM
         cubes = {

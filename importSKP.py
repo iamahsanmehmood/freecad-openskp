@@ -474,56 +474,27 @@ def _make_face_shape(definition, face):
     return Part.makeCompound(triangles)
 
 
-def _get_local_shape(
-    definition, model, stats, shape_cache, visiting, progress=None,
-    inherited_material_id=None, inherited_layer="Layer0",
-):
-    """Returns ``{layer_name: (compound_shape, colors)}`` - this
-    definition's own faces/loose-edge runs (all attributed to
-    ``inherited_layer``, the layer this whole placement context is on -
-    see the module docstring's "Layers" section for why per-FACE layer
-    overrides are deliberately out of scope), plus every nested
-    instance's own per-layer geometry, transformed into this
-    definition's local space and merged in - a definition placed once
-    under an unlayered context and once inside a "Studs"-tagged group
-    can genuinely split across two different output objects.
-    ``colors`` is a list of RGBA tuples matching ``compound_shape.Faces``
-    order, same invariant materials already established.
-
-    Cached by (definition identity, inherited_material_id,
-    inherited_layer): the SAME definition can legitimately render with
-    different fallback colors AND land in different layer buckets
-    depending on what an ancestor group/component painted itself with or
-    tagged itself as (SketchUp's own paint/tag-inheritance rules) -
-    caching on identity alone would silently merge those into whichever
-    context was built first, same class of bug already found and fixed
-    for build_instanced_scene()'s mesh_resource_for.
-    """
+def _build_own_geometry(definition, model, stats, inherited_material_id):
+    """One definition's OWN faces and loose-edge runs (not its nested
+    instances), in its local space: ``(shapes, colors)``, where ``colors``
+    holds one RGBA per face in the order the faces appear in ``shapes``
+    (wires and arcs add no colour, since DiffuseColor is indexed by
+    Shape.Faces). Shared by the merged import (_get_local_shape) and the
+    component hierarchy (_HierarchyImport)."""
     import openskp
 
-    key = (id(definition), inherited_material_id, inherited_layer)
-    if key in shape_cache:
-        return shape_cache[key]
-    if key in visiting:
-        return {}  # a real cycle in the instance graph - bail, don't spin
-    visiting = visiting | {key}
-
-    buckets: dict = {}  # layer_name -> {"shapes": [...], "colors": [...]}
-
-    def bucket(layer_name):
-        return buckets.setdefault(layer_name, {"shapes": [], "colors": []})
-
+    shapes = []
+    colors = []
     for face in definition.faces.values():
         stats["faces_built"] += 1
         shape = _make_face_shape(definition, face)
         if shape is not None:
-            b = bucket(inherited_layer)
             faces = shape.Faces
             # Flatten only this source face's triangles, preserving component
             # nesting and a face-only leaf compound for downstream CAD tools.
-            b["shapes"].extend(faces)
+            shapes.extend(faces)
             color = _resolve_face_color(face, model, inherited_material_id)
-            b["colors"].extend([color] * len(faces))
+            colors.extend([color] * len(faces))
             if len(faces) > 1:
                 stats["faces_triangulated"] = stats.get("faces_triangulated", 0) + 1
                 stats["triangles_built"] = stats.get("triangles_built", 0) + len(faces)
@@ -556,13 +527,58 @@ def _get_local_shape(
         arc_edge = _make_arc_edge(definition, edge_ids) if complete else None
         if arc_edge is not None:
             stats["arcs_built"] += 1
-            bucket(inherited_layer)["shapes"].append(arc_edge)
+            shapes.append(arc_edge)
             continue
         wire = _make_loose_edge_wire(pts, closed) if complete else None
         if wire is not None:
-            bucket(inherited_layer)["shapes"].append(wire)
+            shapes.append(wire)
         else:
             stats["edge_runs_skipped"] += 1
+    return shapes, colors
+
+
+def _get_local_shape(
+    definition, model, stats, shape_cache, visiting, progress=None,
+    inherited_material_id=None, inherited_layer="Layer0",
+):
+    """Returns ``{layer_name: (compound_shape, colors)}`` - this
+    definition's own faces/loose-edge runs (all attributed to
+    ``inherited_layer``, the layer this whole placement context is on -
+    see the module docstring's "Layers" section for why per-FACE layer
+    overrides are deliberately out of scope), plus every nested
+    instance's own per-layer geometry, transformed into this
+    definition's local space and merged in - a definition placed once
+    under an unlayered context and once inside a "Studs"-tagged group
+    can genuinely split across two different output objects.
+    ``colors`` is a list of RGBA tuples matching ``compound_shape.Faces``
+    order, same invariant materials already established.
+
+    Cached by (definition identity, inherited_material_id,
+    inherited_layer): the SAME definition can legitimately render with
+    different fallback colors AND land in different layer buckets
+    depending on what an ancestor group/component painted itself with or
+    tagged itself as (SketchUp's own paint/tag-inheritance rules) -
+    caching on identity alone would silently merge those into whichever
+    context was built first, same class of bug already found and fixed
+    for build_instanced_scene()'s mesh_resource_for.
+    """
+    key = (id(definition), inherited_material_id, inherited_layer)
+    if key in shape_cache:
+        return shape_cache[key]
+    if key in visiting:
+        return {}  # a real cycle in the instance graph - bail, don't spin
+    visiting = visiting | {key}
+
+    buckets: dict = {}  # layer_name -> {"shapes": [...], "colors": [...]}
+
+    def bucket(layer_name):
+        return buckets.setdefault(layer_name, {"shapes": [], "colors": []})
+
+    own_shapes, own_colors = _build_own_geometry(definition, model, stats, inherited_material_id)
+    if own_shapes:
+        b = bucket(inherited_layer)
+        b["shapes"].extend(own_shapes)
+        b["colors"].extend(own_colors)
 
     for inst in definition.instances:
         child_def = model.definitions.get(inst.ref_idx)
@@ -623,31 +639,333 @@ def _get_local_shape(
     return result
 
 
-def import_skp(filepath, doc=None):
+_PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/OpenSKP"
+
+# The statistics of the most recent import_skp() call, for tests and scripts:
+# under headless freecadcmd there is no ViewObject to read colours back from.
+last_import_stats: dict = {}
+
+
+def _merge_on_import_preference():
+    """The ``MergeOnImport`` preference (Tools > Edit parameters >
+    BaseApp/Preferences/Mod/OpenSKP), False when unset: by default an import
+    keeps SketchUp's component hierarchy."""
+    try:
+        return App.ParamGet(_PARAM_PATH).GetBool("MergeOnImport", False)
+    except Exception:
+        return False
+
+
+def _link_transform(m13):
+    """Splits a 13-value instance matrix into what an App::Link can hold:
+    ``(placement, scale_vector)``, the placement in millimetres, or ``None``
+    when the 3x3 is not a rotation times a per-axis scale (a sheared
+    placement, or a degenerate one with a zero axis).
+
+    An App::Link applies its ScaleVector in the linked object's own axes,
+    then its Placement, which is ``R @ diag(s)``: each column of the 3x3 is
+    one rotated, scaled axis. So the scale factors are the column lengths
+    and the rotation is the normalised columns, which must be orthogonal. A
+    mirrored placement (negative determinant) puts the reflection into the
+    x scale, keeping the rotation a rotation. The scale term at index 12 is
+    folded in first, as in _to_freecad_matrix."""
+    s = m13[12] if len(m13) > 12 else 1.0
+    m = [v * s for v in m13[:12]]
+    cols = [[m[j], m[3 + j], m[6 + j]] for j in range(3)]
+    lengths = [math.sqrt(sum(c * c for c in col)) for col in cols]
+    if min(lengths) <= 1e-12:
+        return None
+    unit = [[c / length for c in col] for col, length in zip(cols, lengths)]
+    for i in range(3):
+        for j in range(i + 1, 3):
+            if abs(sum(a * b for a, b in zip(unit[i], unit[j]))) > 1e-6:
+                return None  # sheared: no rotation and per-axis scale gives this
+    a, b, c = unit
+    det = (a[0] * (b[1] * c[2] - b[2] * c[1])
+           - a[1] * (b[0] * c[2] - b[2] * c[0])
+           + a[2] * (b[0] * c[1] - b[1] * c[0]))
+    if det < 0:
+        lengths[0] = -lengths[0]
+        unit[0] = [-v for v in unit[0]]
+    rotation = App.Matrix(
+        unit[0][0], unit[1][0], unit[2][0], m[9] * INCH_TO_MM,
+        unit[0][1], unit[1][1], unit[2][1], m[10] * INCH_TO_MM,
+        unit[0][2], unit[1][2], unit[2][2], m[11] * INCH_TO_MM,
+        0.0, 0.0, 0.0, 1.0,
+    )
+    return App.Placement(rotation), App.Vector(*lengths)
+
+
+def _set_layer_property(obj, layer_name):
+    """Records the SketchUp tag an object stands for in its own
+    ``SketchUpLayer`` property, which export reads back."""
+    if not layer_name:
+        return
+    if "SketchUpLayer" not in obj.PropertiesList:
+        obj.addProperty("App::PropertyString", "SketchUpLayer", "SketchUp",
+                        "The SketchUp tag (layer) of this object; export writes it back")
+    obj.SketchUpLayer = layer_name
+
+
+class _HierarchyImport:
+    """Builds the document the way SketchUp organises the model (#5).
+
+    - Every component definition becomes one ``App::Part`` in a hidden
+      "SketchUp components" group: its own faces and loose edges as one
+      Part::Feature, and an ``App::Link`` for every component or group placed
+      inside it. Definitions that are not placed anywhere are included too.
+    - The model itself is an ``App::Part`` named after the file, with one
+      group per SketchUp tag used at its top level; each holds the links of
+      the top-level instances on that tag (and the model's own loose
+      geometry, which is on Layer0). A tag hidden in SketchUp's Tags panel
+      imports hidden.
+    - A link carries the instance's placement, including non-uniform scale
+      and mirroring (see _link_transform). A sheared placement cannot be a
+      link: that instance is imported as a placed copy of the component's
+      geometry instead, and counted in the statistics.
+    - Paint inheritance: an unpainted face in a component takes the paint of
+      the instance that places it. Where instances of one definition pass
+      different paints to unpainted faces, each paint gets its own
+      definition object, labelled with the material name, because a link
+      shows its target's colours as they are.
+
+    A tag on a nested instance is kept in that link's ``SketchUpLayer``
+    property, and the link is hidden when the tag is; FreeCAD has no layers
+    that cut across the hierarchy the way SketchUp's tags do.
+    """
+
+    def __init__(self, doc, model, stats, progress, title):
+        self.doc = doc
+        self.model = model
+        self.stats = stats
+        self.progress = progress
+        self.title = title
+        self.layer_hidden = {layer.name: layer.hidden for layer in model.layers}
+        self.parts = {}  # (id(definition), effective inherited material) -> App::Part
+        self.built_definitions = set()  # id(definition)
+        self.paint_memo = {}
+        self.merged_cache = {}  # for sheared placements, see _place
+        self.components = None
+
+    # -- helpers ---------------------------------------------------------
+
+    def _add(self, type_id, name, label):
+        obj = self.doc.addObject(type_id, name)
+        obj.Label = label
+        return obj
+
+    def _material_name(self, material_id):
+        material = self.model.materials_by_id.get(material_id)
+        return material.name if material is not None and material.name else f"material {material_id}"
+
+    def _passes_paint_down(self, definition, visiting=frozenset()):
+        """Whether anything in this definition's subtree shows its placing
+        instance's paint: an unpainted face, or an unpainted instance of a
+        definition that does."""
+        key = id(definition)
+        if key in self.paint_memo:
+            return self.paint_memo[key]
+        if key in visiting:
+            return False
+        visiting = visiting | {key}
+        result = any(face.material_id is None for face in definition.faces.values())
+        if not result:
+            for inst in definition.instances:
+                child = self.model.definitions.get(inst.ref_idx)
+                if child is not None and inst.material_id is None and self._passes_paint_down(child, visiting):
+                    result = True
+                    break
+        self.paint_memo[key] = result
+        return result
+
+    def _geometry(self, definition, inherited_material_id, label):
+        shapes, colors = _build_own_geometry(definition, self.model, self.stats, inherited_material_id)
+        if not shapes:
+            return None
+        obj = self._add("Part::Feature", "Geometry", label)
+        obj.Shape = Part.makeCompound(shapes)
+        self._apply_colors(obj, colors)
+        return obj
+
+    def _apply_colors(self, obj, colors):
+        self.stats["object_face_colors"][obj.Name] = colors
+        if App.GuiUp and len(colors) == len(obj.Shape.Faces):
+            obj.ViewObject.DiffuseColor = colors
+
+    @staticmethod
+    def _hide(obj):
+        obj.Visibility = False
+        if App.GuiUp:
+            obj.ViewObject.Visibility = False
+
+    # -- the hierarchy ---------------------------------------------------
+
+    def component(self, definition, inherited_material_id, visiting=frozenset()):
+        """The App::Part for ``definition`` as it looks when placed with
+        ``inherited_material_id`` passed down, built on first use."""
+        material_key = inherited_material_id if self._passes_paint_down(definition) else None
+        key = (id(definition), material_key)
+        if key in self.parts:
+            return self.parts[key]
+        if key in visiting:
+            return None  # a cycle in the instance graph
+        name = definition.name or ("Group" if definition.is_group else "Component")
+        label = name if material_key is None else f"{name} ({self._material_name(material_key)})"
+        part = self._add("App::Part", "Component", label)
+        self.components.addObject(part)
+        self._hide(part)  # shown through its links, not at the origin
+        self.parts[key] = part
+        self.built_definitions.add(id(definition))
+        self.stats["components"] += 1
+
+        geometry = self._geometry(definition, material_key, f"{label} geometry")
+        if geometry is not None:
+            part.addObject(geometry)
+        for inst in definition.instances:
+            placed = self._place(inst, material_key, visiting | {key})
+            if placed is not None:
+                part.addObject(placed)
+                if inst.layer and self.layer_hidden.get(inst.layer, False):
+                    self._hide(placed)
+
+        if self.progress is not None:
+            self.progress.next()
+        return part
+
+    def _place(self, inst, inherited_material_id, visiting):
+        """An App::Link placing ``inst``, or a placed copy when its matrix is
+        sheared; ``None`` when it references no definition."""
+        child = self.model.definitions.get(inst.ref_idx)
+        if child is None:
+            return None
+        child_material = inst.material_id if inst.material_id is not None else inherited_material_id
+        label = inst.name or child.name or ("Group" if child.is_group else "Component")
+        self.stats["placements"] += 1
+        split = _link_transform(inst.matrix)
+        if split is None:
+            obj = self._placed_copy(inst, child, child_material, label)
+        else:
+            target = self.component(child, child_material, visiting)
+            if target is None:
+                return None
+            obj = self._add("App::Link", "Link", label)
+            obj.LinkedObject = target
+            placement, scale = split
+            obj.Placement = placement
+            if any(abs(v - 1.0) > 1e-12 for v in scale):
+                obj.ScaleVector = scale
+            self.stats["links"] += 1
+        _set_layer_property(obj, inst.layer)
+        return obj
+
+    def _placed_copy(self, inst, child, child_material, label):
+        """A sheared placement: the component's whole geometry (nested
+        instances included), transformed and stored as one Part::Feature,
+        built the same way as the merged import."""
+        scratch = {"faces_built": 0, "faces_skipped": 0, "placements": 0,
+                   "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0}
+        buckets = _get_local_shape(child, self.model, scratch, self.merged_cache, frozenset(), None,
+                                   child_material, "Layer0")
+        shapes, colors = [], []
+        for shape, layer_colors in buckets.values():
+            shapes.append(shape)
+            colors.extend(layer_colors)
+        compound = Part.makeCompound(shapes)
+        compound.transformShape(_to_freecad_matrix(inst.matrix), False, True)
+        obj = self._add("Part::Feature", "PlacedCopy", f"{label} (sheared copy)")
+        obj.Shape = compound
+        self._apply_colors(obj, colors)
+        self.stats["sheared_copies"] += 1
+        App.Console.PrintWarning(
+            f"openskp: {label!r} is placed with a sheared transformation, which a link cannot hold; "
+            "imported as a placed copy of its geometry\n"
+        )
+        return obj
+
+    def run(self):
+        self.components = self._add("App::DocumentObjectGroup", "SketchUpComponents", "SketchUp components")
+        self.components.addProperty(
+            "App::PropertyBool", "SketchUpDefinitions", "SketchUp",
+            "Holds the component definitions; export reaches them only through their links")
+        self.components.SketchUpDefinitions = True
+        self._hide(self.components)
+
+        model_part = self._add("App::Part", "SketchUpModel", self.title)
+        groups = {}
+
+        def layer_group(layer_name):
+            if layer_name not in groups:
+                group = self._add("App::DocumentObjectGroup", "Tag", layer_name)
+                _set_layer_property(group, layer_name)
+                model_part.addObject(group)
+                if self.layer_hidden.get(layer_name, False):
+                    self._hide(group)
+                    self.stats["hidden_layers"] += 1
+                groups[layer_name] = group
+            return groups[layer_name]
+
+        root = self.model.root
+        geometry = self._geometry(root, None, f"{self.title} geometry")
+        if geometry is not None:
+            layer_group("Layer0").addObject(geometry)
+        for inst in root.instances:
+            placed = self._place(inst, None, frozenset())
+            if placed is None:
+                continue
+            layer = inst.layer or "Layer0"
+            layer_group(layer).addObject(placed)
+            if self.layer_hidden.get(layer, False):
+                self._hide(placed)
+
+        # Components that are defined in the file but not placed anywhere
+        # (#5: "this would also allow recovering any Components that are not
+        # placed anywhere"). Groups and images only exist where placed.
+        for definition in self.model.definitions.values():
+            if id(definition) in self.built_definitions or definition is root:
+                continue
+            if definition.is_group or getattr(definition, "is_image", False):
+                continue
+            if not definition.faces and not definition.instances and not getattr(definition, "edges", None):
+                continue
+            self.component(definition, None)
+            self.stats["unplaced_components"] += 1
+
+        self.stats["layers"] = len(groups)
+        self.stats["model_part"] = model_part.Name
+        self.stats["components_group"] = self.components.Name
+        return model_part
+
+
+def import_skp(filepath, doc=None, merge=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
-    One Part::Feature compound per distinct SketchUp layer/tag actually
-    used by the file (walked through the full scene graph, definitions
-    resolved and cached, each unique (definition, layer, paint) context
-    built exactly once) - not one single object for the whole file, so
-    that a layer switched off in SketchUp's own Tags panel can import
-    already hidden (ViewObject.Visibility) and toggled independently of
-    the rest of the model, the same way FreeCAD's own Std_ToggleVisibility
-    already works object-by-object. Object internal Names are sanitized/
-    de-duplicated by FreeCAD itself; each object's Label is set to the
-    real, human-readable layer name.
+    Two layouts:
+
+    - **Component hierarchy** (the default, ``merge=False``): one object per
+      component definition and a link per placement, the way SketchUp
+      organises the model; see _HierarchyImport.
+    - **Merged** (``merge=True``): one Part::Feature compound per SketchUp
+      tag; see _import_merged. Lighter for a very large model, where
+      thousands of definitions would each become an object.
+
+    ``merge=None`` reads the ``MergeOnImport`` preference (Tools > Edit
+    parameters, BaseApp/Preferences/Mod/OpenSKP), which is False unless set.
 
     Each face's resolved color/opacity (its own paint, or whatever an
     ancestor group/component painted itself with, or a neutral default)
     is applied as ViewObject.DiffuseColor, one entry per Shape.Faces -
     only when running under the real GUI, since ViewObject doesn't exist
-    under headless freecadcmd. Materials are import-only (not written
-    back out on export); layer export is not yet supported either.
+    under headless freecadcmd (the colours are in ``last_import_stats``
+    either way).
     """
     import openskp
 
+    global last_import_stats
+
     if doc is None:
         doc = App.ActiveDocument or App.newDocument("SketchUpImport")
+    if merge is None:
+        merge = _merge_on_import_preference()
 
     print(f"openskp: parsing {os.path.basename(filepath)} "
           "(can take a while for a large file - this is real work, not a hang)...")
@@ -660,8 +978,9 @@ def import_skp(filepath, doc=None):
     stats = {
         "faces_built": 0, "faces_skipped": 0, "placements": 0,
         "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
+        "hidden_layers": 0, "merged": bool(merge),
     }
-    shape_cache: dict = {}
+    last_import_stats = stats
 
     # FreeCAD's own native progress bar (the same Base.ProgressIndicator
     # its Draft/DXF importer uses) - visible in the GUI's status bar
@@ -678,17 +997,61 @@ def import_skp(filepath, doc=None):
         progress.start("Building SketchUp geometry...", max(1, len(model.definitions) + 1))
 
     try:
-        root_buckets = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
+        if merge:
+            built = _import_merged(doc, model, stats, progress)
+        else:
+            stats.update({"components": 0, "links": 0, "sheared_copies": 0,
+                          "unplaced_components": 0, "object_face_colors": {}})
+            title = os.path.splitext(os.path.basename(filepath))[0] or "SketchUp model"
+            _HierarchyImport(doc, model, stats, progress, title).run()
+            built = stats["components"]
     finally:
         if progress is not None:
             progress.stop()
+
+    doc.recompute()
+    common = (
+        f"({stats['faces_built']} source faces, {stats['faces_skipped']} skipped; "
+        f"{stats.get('faces_triangulated', 0)} non-planar faces triangulated into "
+        f"{stats.get('triangles_built', 0)} triangles; "
+        f"{stats['edge_runs_built']} loose-edge runs, {stats['edge_runs_skipped']} skipped)"
+    )
+    if merge:
+        print(
+            f"openskp: {built} unique definitions built in {time.time() - t0:.1f}s {common}, "
+            f"{stats['placements']} instances placed; {stats['layers']} layers "
+            f"({stats['hidden_layers']} hidden)"
+        )
+    else:
+        print(
+            f"openskp: {stats['components']} components built in {time.time() - t0:.1f}s {common}, "
+            f"{stats['links']} links, {stats['sheared_copies']} sheared copies, "
+            f"{stats['unplaced_components']} unplaced components; {stats['layers']} tags at the top level "
+            f"({stats['hidden_layers']} hidden)"
+        )
+    return doc
+
+
+def _import_merged(doc, model, stats, progress):
+    """One Part::Feature compound per distinct SketchUp layer/tag actually
+    used by the file (walked through the full scene graph, definitions
+    resolved and cached, each unique (definition, layer, paint) context
+    built exactly once) - not one single object for the whole file, so
+    that a layer switched off in SketchUp's own Tags panel can import
+    already hidden (ViewObject.Visibility) and toggled independently of
+    the rest of the model, the same way FreeCAD's own Std_ToggleVisibility
+    already works object-by-object. Object internal Names are sanitized/
+    de-duplicated by FreeCAD itself; each object's Label is set to the
+    real, human-readable layer name. Returns the number of unique
+    definitions built."""
+    shape_cache: dict = {}
+    root_buckets = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
 
     layer_hidden = {layer.name: layer.hidden for layer in model.layers}
     # Kept on stats (not just applied to the ViewObject below) so this is
     # checkable headlessly under freecadcmd/CI, where ViewObject doesn't
     # exist at all - not just "assume the GUI path works."
     stats["layer_face_colors"] = {}
-    stats["hidden_layers"] = 0
     for layer_name, (shape, colors) in root_buckets.items():
         base_name = "".join(c if c.isalnum() else "_" for c in layer_name) or "Layer"
         obj = doc.addObject("Part::Feature", f"SketchUpImport_{base_name}")
@@ -701,18 +1064,8 @@ def import_skp(filepath, doc=None):
             if layer_hidden.get(layer_name, False):
                 obj.ViewObject.Visibility = False
                 stats["hidden_layers"] += 1
-
-    doc.recompute()
-    print(
-        f"openskp: {len(shape_cache)} unique definitions built in {time.time() - t0:.1f}s "
-        f"({stats['faces_built']} source faces, {stats['faces_skipped']} skipped; "
-        f"{stats.get('faces_triangulated', 0)} non-planar faces triangulated into "
-        f"{stats.get('triangles_built', 0)} triangles; "
-        f"{stats['edge_runs_built']} loose-edge runs, {stats['edge_runs_skipped']} skipped), "
-        f"{stats['placements']} instances placed; {len(root_buckets)} layers "
-        f"({stats['hidden_layers']} hidden)"
-    )
-    return doc
+    stats["layers"] = len(root_buckets)
+    return len(shape_cache)
 
 
 def open(filename):  # noqa: A001 - FreeCAD's own import-module contract
@@ -735,8 +1088,8 @@ def insert(filename, docname):
 
 
 def _wire_points_inches(wire, placement):
-    """A wire's ordered vertex points, in world space (via the object's
-    global placement) and converted from FreeCAD's native millimetres
+    """A wire's ordered vertex points, in world space (``placement`` is an
+    App.Matrix or App.Placement, anything with multVec) and converted from FreeCAD's native millimetres
     back to SketchUp's native inches. No closing/repeated final point -
     openskp's add_face expects the polygon open, matching how
     OrderedVertexes already returns it."""
@@ -802,10 +1155,14 @@ def _register_face_materials(obj, builder, material_handle_by_key):
     return handles
 
 
-def _add_shape_faces(builder, shape, placement, stats, layer, material_handles):
+def _add_shape_faces(builder, shape, transform, stats, layer, material_handles):
+    """Writes every face of ``shape`` with its points mapped through
+    ``transform`` (an App.Matrix into world millimetres). A mirroring
+    transform reverses each loop so the face keeps facing outwards."""
+    mirrored = transform.determinant() < 0
     for i, face in enumerate(shape.Faces):
         outer = face.OuterWire
-        outer_pts = _wire_points_inches(outer, placement)
+        outer_pts = _wire_points_inches(outer, transform)
         if len(outer_pts) < 3:
             stats["faces_skipped"] += 1
             continue
@@ -813,9 +1170,11 @@ def _add_shape_faces(builder, shape, placement, stats, layer, material_handles):
         for w in face.Wires:
             if w.isSame(outer):
                 continue
-            hole_pts = _wire_points_inches(w, placement)
+            hole_pts = _wire_points_inches(w, transform)
             if len(hole_pts) >= 3:
-                holes.append(hole_pts)
+                holes.append(hole_pts[::-1] if mirrored else hole_pts)
+        if mirrored:
+            outer_pts = outer_pts[::-1]
         material = material_handles[i] if material_handles else None
         try:
             builder.add_face(outer_pts, holes=holes, layer=layer, material=material)
@@ -829,28 +1188,128 @@ def _add_shape_faces(builder, shape, placement, stats, layer, material_handles):
             stats["faces_skipped"] += 1
 
 
+def _is_type(obj, type_id):
+    is_derived = getattr(obj, "isDerivedFrom", None)
+    return bool(is_derived and is_derived(type_id))
+
+
+def _parent_of(obj):
+    for getter in ("getParentGroup", "getParentGeoFeatureGroup"):
+        method = getattr(obj, getter, None)
+        if method is not None:
+            parent = method()
+            if parent is not None:
+                return parent
+    return None
+
+
+def _ancestors(obj):
+    seen = set()
+    parent = _parent_of(obj)
+    while parent is not None and parent.Name not in seen:
+        seen.add(parent.Name)
+        yield parent
+        parent = _parent_of(parent)
+
+
+def _is_container(obj):
+    return _is_type(obj, "App::Link") or _is_type(obj, "App::Part") or _is_type(obj, "App::DocumentObjectGroup")
+
+
+def _can_export(obj):
+    shape = getattr(obj, "Shape", None)
+    return _is_container(obj) or (shape is not None and not shape.isNull())
+
+
+def _is_definitions_group(obj):
+    return bool(getattr(obj, "SketchUpDefinitions", False))
+
+
+def _export_leaves(exportList):
+    """Yields ``(obj, shape, transform, layer)`` for every piece of geometry
+    the selection shows, flattened into world space.
+
+    The selection can be plain shapes (as before) or the hierarchy an import
+    builds (#5): App::Part containers, tag groups and App::Link placements,
+    each followed down to the Part::Features they show, with the links'
+    placements and scale applied. An object whose ancestor is also selected
+    is reached through that ancestor, not twice, and the hidden "SketchUp
+    components" group is skipped, since its definitions sit at the origin
+    and are already exported wherever a link places them.
+
+    ``transform`` maps the shape's own points (which already include the
+    object's own Placement) into world millimetres. ``layer`` is the nearest
+    ``SketchUpLayer`` on the way down, else the selected object's Label (the
+    rule for plain shapes: each object's Label is its tag)."""
+    selected = {o.Name for o in exportList if hasattr(o, "Name")}
+
+    def walk(obj, matrix, layer, through_link):
+        if _is_definitions_group(obj):
+            return
+        layer = getattr(obj, "SketchUpLayer", "") or layer
+        if _is_type(obj, "App::Link"):
+            target = obj.LinkedObject
+            if target is None:
+                return
+            link_matrix = obj.Placement.toMatrix()
+            scale = getattr(obj, "ScaleVector", None)
+            if scale is not None and (scale.x, scale.y, scale.z) != (1.0, 1.0, 1.0):
+                s = App.Matrix()
+                s.scale(scale)
+                link_matrix = link_matrix * s
+            if getattr(obj, "LinkTransform", False) and hasattr(target, "Placement"):
+                link_matrix = link_matrix * target.Placement.toMatrix()
+            yield from walk(target, matrix * link_matrix, layer, True)
+            return
+        # Only App::Part is opened up: a PartDesign Body is a container too,
+        # but its Shape (the tip) is the solid it stands for.
+        if _is_type(obj, "App::Part"):
+            inner = matrix if through_link else matrix * obj.Placement.toMatrix()
+            for child in obj.Group:
+                yield from walk(child, inner, layer, False)
+            return
+        if _is_type(obj, "App::DocumentObjectGroup"):
+            for child in obj.Group:
+                yield from walk(child, matrix, layer, False)
+            return
+        shape = getattr(obj, "Shape", None)
+        if shape is None or shape.isNull():
+            return
+        # The shape's points include the object's own Placement; through a
+        # link the link's placement replaces it, so take it back out.
+        leaf = matrix * obj.Placement.toMatrix().inverse() if through_link else matrix
+        yield obj, shape, leaf, layer
+
+    for obj in exportList:
+        if any(a.Name in selected or _is_definitions_group(a) for a in _ancestors(obj)):
+            continue
+        parent_group = getattr(obj, "getParentGeoFeatureGroup", lambda: None)()
+        base = parent_group.getGlobalPlacement().toMatrix() if parent_group is not None else App.Matrix()
+        yield from walk(obj, base, getattr(obj, "Label", ""), False)
+
+
 def export(exportList, filename):
     """Called by FreeCAD when exporting to .skp (File > Export).
 
-    Every Part::Feature (and anything else exposing a real .Shape) in
-    exportList is flattened into a flat set of faces at the root of a
-    new .skp file - global placement resolved so nested/linked objects
-    land in the right position. No component/group structure is
-    reconstructed (there's no reliable way to infer "this should be one
-    reusable component" purely from arbitrary FreeCAD geometry).
+    Everything the selection shows (see _export_leaves: plain shapes, and
+    the parts, tag groups and links of an imported hierarchy) is flattened
+    into a flat set of faces at the root of a new .skp file, each in its
+    world position. No component/group structure is written (yet), so an
+    imported hierarchy exports as its geometry.
 
     Each object's own Label becomes its SketchUp layer/tag - unlike
     Blender's exporter (which has to fall back to Collection membership,
     since one Blender object has no per-object "layer" slot), this is an
-    exact match for what layers-import already produces: one object per
-    layer, Label set to the real layer name (see this module's own
-    "Layers" docstring section above) - so re-exporting an unmodified,
-    just-imported set of layer objects reproduces the same tags exactly,
-    not an approximation. For freshly modelled FreeCAD content that was
-    never imported, this just means each object's own Label doubles as
-    its exported tag - a predictable, if occasionally literal (a "Box"
-    exports to a layer named "Box"), rule rather than trying to guess
-    which Labels look "meaningful."
+    exact match for what the merged import produces: one object per
+    layer, Label set to the real layer name - so re-exporting an
+    unmodified, just-imported set of layer objects reproduces the same
+    tags exactly, not an approximation. In an imported hierarchy the tags
+    come from the ``SketchUpLayer`` property the import set on tag groups
+    and links. For freshly modelled FreeCAD content that was never
+    imported, this just means each object's own Label doubles as its
+    exported tag - a predictable, if occasionally literal (a "Box" exports
+    to a layer named "Box"), rule rather than trying to guess which
+    Labels look "meaningful."
 
     Each object's own ViewObject.DiffuseColor (one RGBA entry per
     Shape.Faces, the same property materials-import applies) becomes a
@@ -865,42 +1324,35 @@ def export(exportList, filename):
     from openskp import create
 
     builder = create()
+    leaves = list(_export_leaves(exportList))
 
     # openskp's writer requires materials, then layers, then faces, in
     # that order - add_material must precede add_layer (both depend on
     # the final material count for their own slot numbering), and both
     # must precede the first add_face call. So materials are resolved
     # and registered first here, then layers - two dedup passes over
-    # exportList, not two export passes, and the same ordering the
+    # the leaves, not two export passes, and the same ordering the
     # Blender exporter's own export_skp() uses.
     material_handle_by_key = {}
     object_material_handles = {}
-    for obj in exportList:
-        if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
-            continue
-        object_material_handles[id(obj)] = _register_face_materials(obj, builder, material_handle_by_key)
+    for obj, _shape, _transform, _layer in leaves:
+        if id(obj) not in object_material_handles:
+            object_material_handles[id(obj)] = _register_face_materials(obj, builder, material_handle_by_key)
 
     layer_handle_by_label = {}
-    for obj in exportList:
-        if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
-            continue
-        label = getattr(obj, "Label", None)
-        if label and label not in layer_handle_by_label:
-            layer_handle_by_label[label] = builder.add_layer(label)
+    for _obj, _shape, _transform, layer in leaves:
+        if layer and layer not in layer_handle_by_label:
+            layer_handle_by_label[layer] = builder.add_layer(layer)
 
     stats = {
         "faces_written": 0, "faces_skipped": 0, "objects_skipped": 0,
         "materials_written": len(material_handle_by_key), "layers_written": len(layer_handle_by_label),
     }
+    stats["objects_skipped"] = sum(1 for o in exportList if not _can_export(o))
 
-    for obj in exportList:
-        if not hasattr(obj, "Shape") or obj.Shape is None or obj.Shape.isNull():
-            stats["objects_skipped"] += 1
-            continue
-        placement = obj.getGlobalPlacement() if hasattr(obj, "getGlobalPlacement") else obj.Placement
-        layer = layer_handle_by_label.get(getattr(obj, "Label", None))
-        material_handles = object_material_handles.get(id(obj))
-        _add_shape_faces(builder, obj.Shape, placement, stats, layer, material_handles)
+    for obj, shape, transform, layer in leaves:
+        _add_shape_faces(builder, shape, transform, stats, layer_handle_by_label.get(layer),
+                         object_material_handles.get(id(obj)))
 
     with _real_open(filename, "wb") as f:
         f.write(builder.to_bytes())

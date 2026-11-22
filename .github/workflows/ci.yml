@@ -74,6 +74,9 @@ jobs:
       - name: Run non-planar face regression tests
         run: ${{ steps.locate.outputs.freecadcmd }} tests/test_nonplanar.py
 
+      - name: Run component hierarchy tests
+        run: ${{ steps.locate.outputs.freecadcmd }} tests/test_hierarchy.py
+
       # The tests above call the importer directly, so none of them can tell whether
       # FreeCAD registers the .skp types by itself at startup (#14). This one starts a
       # fresh freecadcmd whose user data directory holds an installed copy of the add-on
