@@ -125,6 +125,7 @@ class _Archive:
         self.r = _R(data)
         self.slots: Dict[int, tuple] = {}    # slot -> ('class'|'obj', name, value)
         self.class_slot: Dict[str, int] = {}
+        self.first_class_slot: Dict[str, int] = {}   # slot of the class record, as written
         self.class_schema: Dict[str, int] = {}
         self.current_class: Optional[str] = None  # class of the object being read
         self.current_obj_slot: Optional[int] = None
@@ -134,6 +135,7 @@ class _Archive:
         self.current_loop: Optional[int] = None
         self.in_entity_list = False
         self._as_item = False
+        self.seen_line_style = False  # a CCustomLineStyle has been read
         # Burned store-map indices (see _read_edgeuse): the writer maps an
         # annotation's connection points into the store map WITHOUT writing
         # bytes, so file back-references beyond each burn run ahead of the
@@ -147,6 +149,9 @@ class _Archive:
         self.cum_delta = 0
         self.annot_watermark: Optional[int] = None
         self.burn_stack: list = []    # per-entity-list burned-item credits
+        # per-entity-list instances an annotation's path wrote in full (see
+        # _path_ref) that the list has not listed yet, slot -> None in order
+        self.inline_stack: list = []
 
     def alloc(self, entry) -> int:
         s = self.next_slot
@@ -171,6 +176,7 @@ class _Archive:
             name = r.raw(namelen).decode('ascii')
             self.alloc(('class', name, schema))
             self.class_slot[name] = self.next_slot - 1
+            self.first_class_slot.setdefault(name, self.next_slot - 1)
             self.class_schema[name] = schema
             return self._new_obj(r, name)
         if tag & 0x8000:                       # class ref -> new object
@@ -262,6 +268,46 @@ class _Archive:
             return True
         return unmatched_class_ref and (tag & 0x8000) != 0 and tag != 0xFFFF
 
+    # A tag may point at a line style right after its 21-byte tail: nothing
+    # (u16 0) for a plain tag, the style written in full on first use (a new
+    # CCustomLineStyle class record, or a class-ref once the class is known),
+    # or a back-ref to the style object a previous tag already wrote. Only
+    # these forms are consumed; everything else is left for the callers below.
+    #
+    # The slot-base probe (single- and no-material files) numbers from 1<<20,
+    # so the file's own class-refs and back-refs cannot be looked up there:
+    # a class-ref is matched through its distance from the CLayer class-ref
+    # (the same in both numberings), and once a style has been read, any
+    # other plain object ref at this position is the style's back-ref.
+    def _read_clayer_line_style(self, r: _R) -> None:
+        if r.pos + 2 > len(self.data):
+            return
+        tag = r.peek_u16()
+        cls = 'CCustomLineStyle'
+        probing = self.walk_base >= (1 << 20)
+        if tag == 0xFFFF:
+            at = r.pos + 4
+            if (self.data[at:at + 2] != struct.pack('<H', len(cls))
+                    or self.data[at + 2:at + 2 + len(cls)] != cls.encode('ascii')):
+                return
+        elif tag & 0x8000:
+            cs = self.class_slot.get(cls)
+            lay, lay0 = self.class_slot.get('CLayer'), self.first_class_slot.get('CLayer')
+            if cs is not None and lay is not None and lay0 is not None:
+                cs += lay - lay0
+            if cs != (tag & 0x7FFF):
+                return
+        elif tag == 0 or tag == 0x7FFF:
+            return
+        elif probing:
+            if not self.seen_line_style:
+                return
+        else:
+            ent = self.slots.get(tag)
+            if ent is None or ent[0] != 'obj' or ent[1] != cls:
+                return
+        self.read_object(r, expect=cls)
+
     # Colour CLayer ends in a 21-byte tail. Some v18 zero-material files
     # (custom tag listed first, then Layer0) write 12 zero bytes + u32
     # after that, then another CLayer. Skip those 16 bytes only when they
@@ -294,6 +340,11 @@ class _Archive:
         if ea[0] == 'class' or eb[0] == 'class':
             return
         if ea[1] != 'CLayer' or eb[1] != 'CLayer':
+            return
+        # <anchor u16><def_count u32><definition> is already the usual
+        # layout: a def_count whose low u16 matches a CLayer slot is not a
+        # parent back-ref.
+        if r.pos + 6 < len(self.data) and _definition_starts_at(self, r.pos + 6):
             return
         r.pos += 2
 
@@ -399,6 +450,30 @@ def _retry_count_after_v20_filler(r: _R, count_pos: int, limit: int, ar=None) ->
     return None
 
 
+def _v20_filler_before_empty_root(data: bytes, count_pos: int) -> Optional[int]:
+    """The SketchUp 2020 layout of a model with NO component definitions AND no
+    root entities. ``_retry_count_after_v20_filler`` cannot see it: behind the
+    filler (an empty string record, then 13 bytes of padding) the only count is
+    the ROOT entity count, and it is 0, which that search skips as "no count".
+
+    Returns the offset of that root count (so the caller can put the cursor
+    there and read the zero), or ``None`` when the bytes are not that layout:
+    the empty string record has to sit within 12 bytes of *count_pos*, and the
+    13 padding bytes and the count behind it have to be all zero.
+    """
+    for i in range(count_pos, min(count_pos + 12, len(data) - 3)):
+        if data[i:i + 3] == _STR_MARKER:
+            break
+    else:
+        return None
+    if data[i + 3] != 0:                  # non-empty string: real data
+        return None
+    root_count_at = i + 4 + 13
+    if root_count_at + 4 > len(data) or any(data[i + 3:root_count_at + 4]):
+        return None
+    return root_count_at
+
+
 # ── shared record blocks ─────────────────────────────────────────────────
 
 def _is_class_ref(data: bytes, p: int, slot: int) -> bool:
@@ -446,6 +521,10 @@ _FIRST_V4 = 4
 # preamble) in SketchUp 6. SketchUp 3, 4 and 5 write it as a bare inline
 # subtype/length/bytes record straight after the material's flag word.
 _FIRST_DIB_OBJECT = 6
+
+# A tag's custom line style (CCustomLineStyle) first appears in SketchUp 2019,
+# which writes its entity preamble twice; SketchUp 2020 and later write it once.
+_FIRST_SINGLE_PREAMBLE_LINE_STYLE = 20
 
 # First version whose instances and groups carry a name string (SketchUp 3 and
 # 4 files have none; where the name is optional the reader checks for one).
@@ -761,10 +840,29 @@ def _read_layer(ar, r):
     rgba = r.raw(4)
     r.utf16()
     r.raw(17 if ar.ver < _FIRST_V4 else 21)  # SketchUp 3's tail is 4 bytes shorter
+    ar._read_clayer_line_style(r)
     ar._skip_clayer_colour_ext(r)
     ar._skip_clayer_parent_ref(r, ar.current_obj_slot)
     return {'k': 'layer', 'name': name, 'hidden': mid[0] if mid else 0,
             'rgba': tuple(rgba)}
+
+
+def _read_customlinestyle(ar, r):
+    """A tag's line style (SketchUp 2019 and 2020, "Dash", "Solid Basic", ...).
+
+    It is written inline at the point where a tag first uses it, so it is an
+    object in the walk like any other and takes a store-map slot. SketchUp
+    2020 opens it with one entity preamble; SketchUp 2019 writes the
+    preamble twice. After the preamble come the style's name, its dash
+    pattern as text ("12.0, -6.0") and three doubles."""
+    _early_preamble(ar, r)
+    if ar.ver < _FIRST_SINGLE_PREAMBLE_LINE_STYLE:
+        _early_preamble(ar, r)
+    name = r.utf16()
+    pattern = r.utf16()
+    values = (r.f64(), r.f64(), r.f64())
+    ar.seen_line_style = True
+    return {'k': 'linestyle', 'name': name, 'pattern': pattern, 'values': values}
 
 
 def _texture_block(ar, r):
@@ -802,19 +900,21 @@ def _texture_block(ar, r):
     w = r.f64()
     h = r.f64()
     fname = r.utf16()
-    avg = r.raw(9)               # RGBA + 00 + RGBA (colour stored twice)
+    avg = r.raw(9)               # image average RGBA + 00 + the material's paint RGBA
     r.utf16()
-    blob = r.raw(8)              # u32 + u32 colorized flag
+    blob = r.raw(8)              # u32 material type (1 textured, 2 colorized) + u32 colorize mode
     opacity = r.f64()
     use_op = r.u8()
-    # A colourized (re-tinted) texture stores the ORIGINAL image plus
-    # the tint as the average colour; flagged by the second blob u32
-    # or by alpha 0xFF on the stored colour.
-    colorized = bool(blob[4]) or avg[3] == 0xFF
-    return {'rgba': tuple(avg[:4]), 'opacity': opacity, 'use_opacity': use_op,
+    # Checked against materials written by SketchUp's own library: the first
+    # blob u32 is SUMaterialGetType (2 = a colorized texture, which keeps the
+    # ORIGINAL image and stores the tint as the paint colour) and the second is
+    # SUMaterialGetColorizeType (0 shift, 1 tint). The alpha byte of the image
+    # average says nothing about either - it is 0xFF on plain textures too.
+    colorized = blob[0] == 2
+    return {'rgba': (avg[5], avg[6], avg[7], 255), 'opacity': opacity, 'use_opacity': use_op,
             'tex_dib': s, 'tex_data': dib['data'] if s is None else None,
             'tex_w': w, 'tex_h': h, 'tex_file': fname,
-            'colorized': colorized}
+            'colorized': colorized, 'colorize_type': 1 if blob[4] == 1 else 0}
 
 
 def _read_material(ar, r):
@@ -1451,10 +1551,10 @@ def _read_dimlinear(ar, r):
     # front of the first connection block; keep the block's later offsets
     # the same by supplying them as zeros.
     b37 = (b'\x00' * 5 if ar.ver < 6 else b'') + r.raw(32 if ar.ver < 6 else 37)
-    c1 = _entity_ref(ar, r)          # connection point 1 (may be null)
+    c1 = _path_ref(ar, r)            # connection point 1 (may be null; may be written in full)
     path1 = _connection_paths(ar, r)
     b32 = r.raw(32)
-    c2 = _entity_ref(ar, r)          # connection point 2 (may be null)
+    c2 = _path_ref(ar, r)            # connection point 2 (may be null; may be written in full)
     path2 = _connection_paths(ar, r)
     b72 = r.raw(72 if ar.ver >= 6 else 68)   # SketchUp 4 and 5: no trailing u32
     # the dimension-line offset (inches, signed) sits at a fixed position
@@ -1483,17 +1583,20 @@ def _connection_paths(ar, r):
         if count > 1000:
             raise LegacyParseError(
                 f"implausible dimension path length {r.ctx()}")
-        lists.append([_path_ref(ar, r) for _ in range(count)])
+        lists.append([_path_ref(ar, r, member=not i) for i in range(count)])
     return extra, lists[0], lists[1]
 
 
-def _path_ref(ar, r):
+def _path_ref(ar, r, member=False):
     """One instance of a dimension's path. Usually a reference, but MFC
     writes an object IN FULL the first time anything points at it — and a
     dimension serialized before the group it is anchored in carries that
     whole group right here (the root list later holds a back-reference).
     Read it like any object then, so it is registered and the stream stays
-    aligned; return its slot either way."""
+    aligned; return its slot either way. A path runs from the outermost
+    instance in, so its first one (*member*) is an entity of the list the
+    annotation is in; one written here in full is noted for that list
+    (see _read_entity_list)."""
     tag = r.peek_u16()
     new = tag == 0xFFFF or (tag != 0x7FFF and tag & 0x8000)
     if tag == 0x7FFF:
@@ -1501,16 +1604,17 @@ def _path_ref(ar, r):
         new = bool(big & 0x80000000)
     if new:
         slot, _name, _value = ar.read_object(r)
+        inline = getattr(ar, 'inline_stack', None)
+        if member and inline:
+            inline[-1][slot] = None
         return slot
     return _entity_ref(ar, r)
 
 
-def _read_text(ar, r):
-    _preamble(ar, r)
-    db = _drawbase(ar, r)
-    ar.read_object(r, expect='CSkFont')
-    # variable-length variant middle, delimited by an 11-byte block
-    # `01 00 00 00 ?? 00 03 00 00 00 01` right before the text string
+def _text_delimiter(r):
+    """Where a text's string starts: the variable-length variant middle
+    ends in an 11-byte block `01 00 00 00 ?? 00 03 00 00 00 01` right
+    before it."""
     p = r.pos
     while True:
         idx = r.data.find(_STR_MARKER, p, r.pos + 512)
@@ -1520,16 +1624,49 @@ def _read_text(ar, r):
         arrow = struct.unpack_from('<I', blk, 6)[0]
         if (blk[:4] == b'\x01\x00\x00\x00'
                 and arrow <= 8 and blk[10] == 1):
-            break                    # blk[6:10] is the ARROW TYPE (0-4 seen)
+            return idx               # blk[6:10] is the ARROW TYPE (0-4 seen)
         p = idx + 3
-    # The variant middle carries the same free-connection block dimensions
-    # use: [u32 type=1][u32 4][point3d]. Type 1 stores the anchor inline
-    # (world inches); anchored texts (type 2) zero the point, so only
-    # type 1 is trusted.
+
+
+def _anchored_connection(data, pos):
+    """Whether the text whose font ends at *pos* is anchored to an entity:
+    after the two screen-fraction f64s comes the connection block,
+    [u32 type][u32 4][point3d], and a type other than 0 or 1 (2, 4, 5 and 7
+    seen; see docs/dimension-record-notes.md) anchors the label."""
+    if data[pos + 20:pos + 24] != b'\x04\x00\x00\x00':
+        return False
+    return 2 <= struct.unpack_from('<I', data, pos + 16)[0] <= 15
+
+
+def _read_text(ar, r):
+    _preamble(ar, r)
+    db = _drawbase(ar, r)
+    ar.read_object(r, expect='CSkFont')
     point = None
     label = None
+    connect = None
+    paths = None
+    anchored = _anchored_connection(r.data, r.pos)
+    if anchored:
+        # An anchored connection block is followed, as a dimension's is
+        # (see _read_dimlinear), by the anchored entity's ref and its
+        # instance paths — and MFC writes a path instance IN FULL there
+        # when nothing has pointed at it before (a label anchored to a
+        # component instance serialized after it, its class declaration
+        # included when it is the file's first instance). Skipped as
+        # bytes, that instance never gets its store-map slots and every
+        # later reference is off by them ("class-ref to non-class slot");
+        # read it instead. The block's point is zero (types 2 and 4) or
+        # not known to be a world position (5, and 7's face fractions), so
+        # it is not kept.
+        r.raw(16 + 32)
+        connect = _entity_ref(ar, r)
+        paths = _connection_paths(ar, r)
+    idx = _text_delimiter(r)
+    # A free text's block has type 1 and its anchor inline (world inches),
+    # followed by the null ref and empty paths (the 12 zero bytes below).
     mid = r.data[r.pos:idx]
-    off = mid.find(b'\x01\x00\x00\x00\x04\x00\x00\x00')
+    off = -1 if anchored else mid.find(b'\x01\x00\x00\x00\x04\x00\x00\x00')
     if off >= 0 and off + 32 <= len(mid):
         point = struct.unpack_from('<3d', mid, off + 8)
         # placement tail: [12B zeros][point3d LABEL][16B zeros][f64 1.0]
@@ -1557,21 +1694,61 @@ def _read_text(ar, r):
         r.raw(6)
         attach.append(val)
     return {'k': 'text', 'text': text, 'db': db, 'attach': attach,
-            'p': point, 'lp': label}
+            'p': point, 'lp': label, 'connect': connect, 'paths': paths}
 
 
 def _read_entity_list(ar, r, count, owner):
     ents = []
     ar.burn_stack.append(0)
+    ar.inline_stack.append({})
     try:
-        return _read_entity_list_inner(ar, r, count, owner, ents)
+        ents = _read_entity_list_inner(ar, r, count, owner, ents)
+        # An instance an annotation wrote in full (see _path_ref) is one of
+        # this list's items, and the declared count holds it — but SketchUp
+        # does not always list it again with a back-reference (labels
+        # anchored to the loudspeakers of an auditorium: of five instances
+        # written in a definition's labels, three were listed again, two
+        # not). Keep the ones never listed, as the list's own entities.
+        for slot in ar.inline_stack[-1]:
+            if len(ents) < count:
+                _, name, value = ar.slots[slot]
+                ents.append((slot, name, value))
+        return ents
     finally:
         ar.burn_stack.pop()
+        ar.inline_stack.pop()
+
+
+def _peek_backref(ar, r):
+    """The walker slot of the back-reference at the cursor, without moving
+    it; ``None`` when the next tag is anything else."""
+    if r.pos + 2 > len(r.data):
+        return None
+    tag = struct.unpack_from('<H', r.data, r.pos)[0]
+    if tag == 0x7FFF:
+        if r.pos + 6 > len(r.data):
+            return None
+        slot = struct.unpack_from('<I', r.data, r.pos + 2)[0]
+        if slot & 0x80000000:
+            return None
+    elif tag == 0 or tag & 0x8000:
+        return None
+    else:
+        slot = tag
+    if ar.burns and slot >= ar.burns[0][0]:
+        return ar._translate_ref(slot)
+    return slot
 
 
 def _read_entity_list_inner(ar, r, count, owner, ents):
     while len(ents) < count:
         p = r.pos
+        inline = ar.inline_stack[-1] if ar.inline_stack else {}
+        if (inline and len(ents) + len(inline) >= count
+                and _peek_backref(ar, r) not in inline):
+            # every item left is an instance an annotation already wrote in
+            # full and the list does not list again (see _read_entity_list)
+            break
         if (owner == 'def' and ar.burn_stack and ar.burn_stack[-1]
                 and struct.unpack_from('<I', r.data, p)[0] == 0
                 and r.data[p + 22:p + 25] == _STR_MARKER):
@@ -1600,6 +1777,7 @@ def _read_entity_list_inner(ar, r, count, owner, ents):
             raise
         finally:
             ar.in_entity_list = prev_flag
+        inline.pop(s, None)
         ents.append((s, n, v))
     return ents
 
@@ -1635,7 +1813,10 @@ def _reanchor_on_string_marker(data: bytes, pos: int) -> int:
 
 
 def _read_definition(ar, r):
-    _preamble(ar, r)
+    # The preamble's attribute container is the DEFINITION's own attribute
+    # dictionaries (where SketchUp keeps a dynamic component's formulas and
+    # options); kept for full_parse_legacy.
+    pre = _preamble(ar, r)
     # undecoded base block (13 bytes in SketchUp 3)
     r.raw(22 if ar.ver >= 17 else (20 if ar.ver >= 5 else (19 if ar.ver >= _FIRST_V4 else 13)))
     nlayers = r.u32()
@@ -1723,7 +1904,8 @@ def _read_definition(ar, r):
     ar.read_object(r, expect='CThumbnail')
     return {'k': 'definition', 'name': name, 'guid': guid.hex().upper(),
             'ents': ents, 'faces_camera': bool(behavior & 1),
-            'shadows_face_sun': bool(behavior & 2), 'is_group': is_group}
+            'shadows_face_sun': bool(behavior & 2), 'is_group': is_group,
+            'attrs': pre['attrs']}
 
 
 def _read_instance(ar, r):
@@ -1782,6 +1964,7 @@ _READERS = {
     'CConstructionPoint': _read_constructionpoint,
     'CSectionPlane': _read_sectionplane, 'CSkFont': _read_skfont,
     'CDimensionLinear': _read_dimlinear, 'CText': _read_text,
+    'CCustomLineStyle': _read_customlinestyle,
 }
 
 
@@ -1994,6 +2177,13 @@ def _walk_model(data: bytes, ver: int, start: int, mat_count: int,
                 # root count, so put it back.
                 def_count = 0
                 r.pos -= 4
+        else:
+            # No count behind the filler at all: an entirely empty model,
+            # whose root count is 0 (the retry only accepts counts > 0).
+            root_count_at = _v20_filler_before_empty_root(r.data, r.pos - 4)
+            if root_count_at is not None:
+                def_count = 0
+                r.pos = root_count_at
     if def_count > 1_000_000:
         raise LegacyParseError("implausible definition count")
     for _ in range(def_count):
@@ -2280,6 +2470,92 @@ def _add_edge(builder, slot, e, slots):
         builder.arc_curves[curve] = cv['params']
 
 
+def _premodel_attribute_dictionaries(data: bytes) -> Dict[str, Dict[str, Any]]:
+    """The MODEL's own attribute dictionaries of a classic file.
+
+    They sit in the region before the material manager that ``_walk`` never
+    walks (the model header: thumbnail, attribute containers, camera,
+    rendering options …). A component saved as its own file keeps there what
+    SketchUp's Dynamic Components extension stored on the component's
+    definition — ``dynamic_attributes`` with the formulas and options the
+    parts refer to as ``Name!Attr`` — so a file of a dynamic component read
+    without them loses its top level.
+
+    The region is not walked, so the store-map numbering is learned from the
+    bytes: the first CAttributeContainer is a new-class record, followed by
+    its first CAttributeNamed new-class record (slots b, b+1, b+2); every
+    later dictionary is a class-ref to b+2, which gives b. Later containers
+    are the class-refs to b that read as one. Returns ``{name: {key: value}}``
+    with the dictionaries of every container found, ``{}`` when none."""
+    ver_m = re.search(rb'\{(\d+)\.', data[:0x60].replace(b'\x00', b''))
+    if not ver_m:
+        return {}
+    ver = int(ver_m.group(1))
+    end = len(data)
+    for name in (b'CMaterial', b'CLayer', b'CComponentDefinition'):
+        m = re.search(re.escape(b'\xff\xff') + b'..'
+                      + re.escape(struct.pack('<H', len(name)) + name),
+                      data, re.DOTALL)
+        if m:
+            end = min(end, m.start())
+    cls = data.find(b'\xff\xff', 0, end)
+    while cls >= 0 and data[cls + 4:cls + 25] != b'\x13\x00CAttributeContainer':
+        cls = data.find(b'\xff\xff', cls + 1, end)
+    if cls < 0:
+        return {}
+
+    pid = rb'\x00' if ver >= 17 else b''
+    named_refs: Dict[int, int] = {}
+    for m in re.finditer(rb'(?=([\x01-\xff][\x80-\xff])\x00\x00' + pid
+                         + rb'....\xff\xfe\xff)', data[cls:end], re.DOTALL):
+        tag = int.from_bytes(m.group(1), 'little') & 0x7FFF
+        named_refs[tag] = named_refs.get(tag, 0) + 1
+    named = max(named_refs, key=named_refs.get) if named_refs else 3
+    base = max(named - 2, 1)
+
+    ar = _Archive(data, ver)
+    ar.readers.update(_READERS)
+    ar.next_slot = base
+    ar.walk_base = base
+    r = ar.r
+    containers = []
+    r.pos = cls
+    _, n, v = ar.read_object(r)
+    if n == 'CAttributeContainer' and isinstance(v, dict):
+        containers.append(v)
+    cslot = ar.class_slot.get('CAttributeContainer')
+    if cslot is not None:
+        tag = struct.pack('<H', 0x8000 | cslot)
+        pos = r.pos
+        while True:
+            pos = data.find(tag, pos, end)
+            if pos < 0:
+                break
+            saved = ar.next_slot
+            try:
+                r.pos = pos
+                _, n, v = ar.read_object(r)
+            except (LegacyParseError, struct.error, IndexError,
+                    UnicodeDecodeError, ValueError):
+                ar.next_slot = saved
+                pos += 1
+                continue
+            if n == 'CAttributeContainer' and isinstance(v, dict):
+                containers.append(v)
+            pos = max(r.pos, pos + 1)
+    out: Dict[str, Dict[str, Any]] = {}
+    for c in containers:
+        for name, entries in _extract_legacy_attribute_dictionaries(c).items():
+            out.setdefault(name, {}).update(entries)
+    # ``ModelProperties`` (Name, Description, IsDynamic, ...) is SketchUp's own
+    # model-info record. It is stored in a container, but SketchUp's API does
+    # not list it among the model's attribute dictionaries (checked with the
+    # SDK on 440 corpus files: absent every time it is stored), so it is not
+    # one here either.
+    out.pop('ModelProperties', None)
+    return out
+
+
 def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
     """Parse a classic MFC ``.skp`` into the ``full_parse`` dict shape."""
     t0 = time.monotonic()
@@ -2333,9 +2609,7 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
             'name': v['name'],
             'color': {'r': rgba[0], 'g': rgba[1], 'b': rgba[2], 'a': rgba[3]},
             'transparency': trans,
-            # colourize type is not decoded in the legacy record; tint is
-            # the correct rendering for the grey base textures observed
-            'colorized': colorized, 'colorize_type': 1 if colorized else 0,
+            'colorized': colorized, 'colorize_type': v.get('colorize_type', 0),
         }
         if 'tex_dib' in v:
             dib = slots.get(v['tex_dib']) if v['tex_dib'] is not None else None
@@ -2376,6 +2650,8 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
                                 'is_group': d.get('is_group', False),
                                 'always_faces_camera': d.get('faces_camera', False),
                                 'shadows_face_sun': d.get('shadows_face_sun', False),
+                                'attribute_dictionaries':
+                                    _extract_legacy_attribute_dictionaries(d.get('attrs')),
                                 'builder': b}
                 processed += 1
                 if processed % _PROGRESS_INTERVAL == 0:
@@ -2388,8 +2664,14 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
 
     root_builder = _Builder()
     _fill_builder(root_builder, root, slots)
+    try:
+        model_attribute_dicts = _premodel_attribute_dictionaries(data)
+    except Exception:  # noqa: BLE001 - the model's dictionaries are optional
+        logger.debug("model attribute dictionaries unreadable", exc_info=True)
+        model_attribute_dicts = {}
     defs_dict['ROOT'] = {'guid': 'ROOT', 'name': 'ROOT_MODEL',
-                         'builder': root_builder}
+                         'builder': root_builder,
+                         'attribute_dictionaries': model_attribute_dicts}
 
     try:
         pages = _read_page_list(data, ar)
@@ -2404,6 +2686,7 @@ def full_parse_legacy(skp_path: str) -> Dict[str, Any]:
     )
 
     return {
+        'model_attribute_dictionaries': model_attribute_dicts,
         'version': version,
         'dimensions': [d for d in root_builder.dimensions
                        if d.get('a') and d.get('b')],
