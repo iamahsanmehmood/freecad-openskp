@@ -9,7 +9,7 @@ Run by CI under a virtual display (see the "gui" job in .github/workflows/ci.yml
 It imports tests/_synthetic.py's model, measures the bounding box of what the 3D view's
 scene graph actually draws, compares it with what SketchUp shows (VISIBLE_BOUNDS_IN), and
 does the same for the merged import. Writes PASS or the failure to $GUI_OUT/result.txt and
-screenshots of the view and the window (with the model tree) next to it, then exits.
+pictures of the window (view and model tree) next to it, then exits.
 """
 import os
 import sys
@@ -50,22 +50,29 @@ def _check_bounds(label, got, want_in, mm):
 
 
 def _show(doc, name):
+    """Shows ``doc`` fitted in an isometric view and saves a picture of the
+    whole window, model tree expanded. (A grab of the window, not
+    View.saveImage: under the virtual display the off-screen renderer that
+    saveImage uses leaves most of either import out.)"""
     import FreeCADGui as Gui
+    from PySide import QtGui
 
     gui_doc = Gui.getDocument(doc.Name)
     Gui.ActiveDocument = gui_doc
     view = gui_doc.activeView()
     view.viewIsometric()
     view.fitAll()
+    window = Gui.getMainWindow()
+    for tree in window.findChildren(QtGui.QTreeWidget):
+        tree.expandAll()
     Gui.updateGui()
-    view.saveImage(os.path.join(OUT, f"{name}.png"), 1400, 900, "White")
+    window.grab().save(os.path.join(OUT, f"{name}.png"))
     return view
 
 
 def main():
     try:
         import FreeCAD as App
-        import FreeCADGui as Gui
 
         import importSKP
         from _synthetic import VISIBLE_BOUNDS_IN, write_synthetic
@@ -92,17 +99,6 @@ def main():
         drawn = _drawn_bounds(view)
         _check_bounds("hierarchy", drawn, VISIBLE_BOUNDS_IN, mm)
         lines.append(f"hierarchy: the view draws {drawn} mm, as SketchUp shows it")
-        # The window with the model tree expanded, for a person to look at.
-        tree = Gui.getMainWindow()
-        for obj in (model_part, *tags.values()):
-            Gui.Selection.addSelection(obj)
-        try:
-            Gui.runCommand("Std_TreeExpand")
-        except Exception:
-            pass  # only for the screenshot
-        Gui.Selection.clearSelection()
-        Gui.updateGui()
-        tree.grab().save(os.path.join(OUT, "hierarchy-window.png"))
 
         merged = App.newDocument("Merged")
         importSKP.import_skp(path, merged, merge=True)

@@ -63,7 +63,13 @@ and a radius, instead of the polyline (see _make_arc_edge). Faces are not
 changed: SketchUp has no curved surfaces, so a disc is still a flat face with
 a polygon boundary, and an arc that bounds a face stays part of it.
 
-Layers (SketchUp calls them "tags"): unlike materials, which fit onto
+Component hierarchy (the default; see _HierarchyImport): one App::Part per
+component definition and one App::Link per placement, the way SketchUp
+organises the model (freecad-openskp#5). The merged layout described in the
+rest of this docstring is kept for very large models (merge=True or the
+MergeOnImport preference); both show the same geometry.
+
+Layers in the merged layout (SketchUp calls them "tags"): unlike materials, which fit onto
 the existing single-compound design as one ViewObject.DiffuseColor per
 face, a layer needs its own Part::Feature object to be independently
 toggleable at all - FreeCAD has no per-face visibility mechanism the way
