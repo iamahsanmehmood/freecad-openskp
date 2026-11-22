@@ -27,7 +27,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import _core
 from ._curves import _chain_loose_edges, _solve_run_arc
-from ._face_groups import FaceGroupContext, build_local_face_groups
+from ._face_groups import FaceGroupContext, FaceGroupKey, build_local_face_groups
 from .errors import SkpParseError
 
 logger = logging.getLogger("openskp.scene")
@@ -72,6 +72,14 @@ class InstanceNode:
     # attach their own richer per-instance data under their own dictionary
     # name instead, which this project never surfaced before.
     attribute_dictionaries: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # The attribute dictionaries of the DEFINITION this instance places,
+    # every one by name (``dynamic_attributes`` included), values
+    # stringified like `properties`. SketchUp's Dynamic Components keep a
+    # component's attributes, formulas and options on the definition and
+    # only the current values on each instance, so a reader needs both.
+    # Shared by every placement of the same definition. Empty for classic
+    # (pre-2021) files.
+    definition_attribute_dictionaries: Dict[str, Dict[str, str]] = field(default_factory=dict)
     children: List["InstanceNode"] = field(default_factory=list)
     # Same full-path string that scoping instance's own meshes (and every
     # nested descendant's meshes) carry as MeshMetadata.path - lets a
@@ -143,7 +151,11 @@ class SceneTexture:
         data: The image file's raw bytes, exactly as stored in the .skp.
         mime_type: Sniffed from the bytes, not from ``filename`` -
             SketchUp records the authoring machine's path, whose
-            extension can disagree with the content.
+            extension can disagree with the content. ``image/png`` or
+            ``image/jpeg``, the two formats glTF holds, unless the scene
+            was built with ``original_textures=True``: then also the real
+            type of a TIFF, GIF, BMP, TGA, WebP, PSD, DDS or JPEG 2000
+            texture (``image/tiff``, ...), kept as SketchUp stores it.
         filename: Best-effort original filename, for diagnostics only.
     """
 
@@ -248,10 +260,87 @@ def _sniff_image_mime(data: bytes) -> Optional[str]:
     return None
 
 
+def _describe_image_format(data: bytes, filename: str = "") -> str:
+    """A short name for an image's format, for a message about a texture the
+    scene cannot carry: from the bytes' own signature, else from the source
+    file name's extension (TGA has no signature at the start), else a plain
+    "unrecognized format"."""
+    head = data[:16]
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "TIFF"
+    if head[:2] == b"BM":
+        return "BMP"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "GIF"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "WebP"
+    if head[:4] == b"8BPS":
+        return "PSD"
+    if head[:4] == b"DDS ":
+        return "DDS"
+    if head[:8] == b"\x00\x00\x00\x0cjP  ":
+        return "JPEG 2000"
+    if b"TRUEVISION-XFILE" in data[-26:]:
+        return "TGA"
+    ext = filename.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[-1] if "." in filename else ""
+    return ext.upper() if 0 < len(ext) <= 5 else "an unrecognized format"
+
+
+# The real MIME type of an image format a scene cannot carry as glTF but a consumer
+# may well read (Blender reads all of these), by the name _describe_image_format gives it.
+_ORIGINAL_IMAGE_MIME = {
+    "TIFF": "image/tiff",
+    "GIF": "image/gif",
+    "BMP": "image/bmp",
+    "TGA": "image/x-tga",
+    "WebP": "image/webp",
+    "PSD": "image/vnd.adobe.photoshop",
+    "DDS": "image/vnd.ms-dds",
+    "JPEG 2000": "image/jp2",
+}
+
+
+def _original_image_mime(data: bytes) -> Optional[str]:
+    """The MIME type of an image that is not PNG or JPEG, from its signature
+    (or, for a TGA, its footer), or ``None`` when the format is not one of
+    the known ones. A format named only by the source file's extension is not
+    trusted: the bytes could be anything."""
+    name = _describe_image_format(data)
+    return _ORIGINAL_IMAGE_MIME.get(name)
+
+
+def _warn_skipped_texture(
+    log: logging.Logger,
+    warned: set,
+    material_name: Optional[str],
+    tex: Dict[str, Any],
+    data: bytes,
+) -> None:
+    """Say, once per material and format, that a texture the scene cannot
+    carry (anything but PNG and JPEG) was left out, so the material is built
+    without it. Before, the texture just vanished."""
+    filename = tex.get("filename") or ""
+    fmt = _describe_image_format(data, filename)
+    if (material_name, fmt) in warned:
+        return
+    warned.add((material_name, fmt))
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1]
+    keepable = _original_image_mime(data) is not None
+    log.warning(
+        "Texture of material %r%s is %s, which a scene cannot carry (only PNG and JPEG): "
+        "the material is built without its texture%s",
+        material_name or "(unnamed)",
+        f" ({base})" if base else "",
+        fmt,
+        " (pass original_textures=True to keep it in its own format)" if keepable else "",
+    )
+
+
 def build_scene(
     parsed: Dict[str, Any],
     name_override_keys: Sequence[str] = ("name", "label", "code"),
     include_curve_sets: bool = True,
+    original_textures: bool = False,
 ) -> Scene:
     """Bake every instance actually placed in ``parsed`` (the output of
     :func:`openskp._core.full_parse` / ``full_parse_legacy``) into
@@ -294,6 +383,22 @@ def build_scene(
 
     logger.info("Building scene: %d definitions available", len(defs_dict))
 
+    # Each definition's own dictionaries, stringified once and shared by
+    # every InstanceNode that places it (see
+    # InstanceNode.definition_attribute_dictionaries).
+    definition_dicts_cache: Dict[Any, Dict[str, Dict[str, str]]] = {}
+
+    def _definition_dicts(ref_idx) -> Dict[str, Dict[str, str]]:
+        cached = definition_dicts_cache.get(ref_idx)
+        if cached is None:
+            raw = (defs_dict.get(ref_idx) or {}).get("attribute_dictionaries") or {}
+            cached = {
+                name: {k: _core._stringify_vff_attr_value(v) for k, v in entries.items()}
+                for name, entries in raw.items()
+            }
+            definition_dicts_cache[ref_idx] = cached
+        return cached
+
     instance_counter = [0]
     mesh_counter = [0]
     mesh_index: Dict[str, MeshMetadata] = {}
@@ -318,16 +423,21 @@ def build_scene(
     # the export size for nothing.
     textures: List[SceneTexture] = []
     texture_index_by_key: Dict[str, int] = {}
+    skipped_textures: set = set()
 
-    def texture_index_for(tex: Optional[Dict[str, Any]]) -> Optional[int]:
+    def texture_index_for(tex: Optional[Dict[str, Any]], material_name: Optional[str] = None) -> Optional[int]:
         if not tex:
             return None
         data = tex.get("data")
         if not data:
             return None
         mime_type = _sniff_image_mime(data)
+        if mime_type is None and original_textures:
+            mime_type = _original_image_mime(data)
         if mime_type is None:
-            return None  # a format glTF cannot carry
+            # a format glTF cannot carry: leave it out, but say so
+            _warn_skipped_texture(logger, skipped_textures, material_name, tex, data)
+            return None
         # length plus a short byte prefix is enough to tell real images
         # apart without hashing megabytes on every face
         key = f"{len(data)}:{data[:16].hex()}"
@@ -339,7 +449,7 @@ def build_scene(
         texture_index_by_key[key] = idx
         return idx
 
-    color_to_material_index: Dict[Tuple[Tuple[int, int, int], bool, Optional[int], float], int] = {}
+    color_to_material_index: Dict[FaceGroupKey, int] = {}
     gltf_materials: List[Dict[str, Any]] = []
 
     # Definitions currently being instantiated on the active recursion
@@ -357,12 +467,16 @@ def build_scene(
         double_sided: bool,
         texture_index: Optional[int],
         transparency: float = 1.0,
+        material_name: Optional[str] = None,
+        colorized: bool = False,
+        colorize_type: int = 0,
     ) -> int:
         # The texture is part of the identity, not just the color: two
         # different images can average to the same RGB (real files do
         # this), and keying on color alone would merge them into one
-        # material and lose one of the images.
-        key = (color, double_sided, texture_index, transparency)
+        # material and lose one of the images. The name is too, so two
+        # differently named SketchUp materials stay two materials.
+        key = (color, double_sided, texture_index, transparency, material_name)
         if key in color_to_material_index:
             return color_to_material_index[key]
         idx = len(gltf_materials)
@@ -378,6 +492,11 @@ def build_scene(
         if texture_index is not None:
             pbr["baseColorTexture"] = {"index": texture_index}
         mat_dict: Dict[str, Any] = {"pbrMetallicRoughness": pbr}
+        if material_name:
+            mat_dict["name"] = material_name
+        if colorized:
+            # See openskp.instanced_scene's get_material_index.
+            mat_dict["extras"] = {"sketchup": {"colorized": True, "colorize_type": colorize_type}}
         if double_sided:
             mat_dict["doubleSided"] = True
         # glTF's default alphaMode is OPAQUE, which tells a conformant
@@ -407,6 +526,7 @@ def build_scene(
         parent_layer: str = "Layer0",
         path_name: str = "ROOT",
         inherited_color: Optional[Tuple[int, int, int]] = None,
+        inherited_material: Optional[Dict[str, Any]] = None,
     ) -> List[InstanceNode]:
         d = defs_dict.get(def_id)
         if d is None:
@@ -449,10 +569,11 @@ def build_scene(
                     texture_index_for=texture_index_for,
                     fallback_color=fallback_color,
                     definition_id=def_id,
+                    fallback_material=inherited_material,
                 ),
             )
 
-            for (face_color, double_sided, tex_index, transparency), group in face_groups.items():
+            for (face_color, double_sided, tex_index, transparency, material_name), group in face_groups.items():
                 local_faces = group["local_faces"]
                 if not local_faces:
                     continue
@@ -521,7 +642,10 @@ def build_scene(
                     indices[i * 3 + 1] = tri[1]
                     indices[i * 3 + 2] = tri[2]
 
-                material_index = get_material_index(face_color, double_sided, tex_index, transparency)
+                material_index = get_material_index(
+                    face_color, double_sided, tex_index, transparency,
+                    material_name, group["colorized"], group["colorize_type"],
+                )
                 glb_primitives.append(
                     GlbPrimitive(
                         positions=positions,
@@ -604,6 +728,7 @@ def build_scene(
 
             l_name = parent_layer
             inst_color = inherited_color
+            inst_material = inherited_material
             # Legacy (pre-2021 MFC) instances carry a precomputed
             # "properties" dict (see legacy._extract_legacy_dynamic_
             # properties) - VFF instances don't set this key at all, so
@@ -629,6 +754,7 @@ def build_scene(
                     if mat:
                         c = mat["color"]
                         inst_color = (c["r"], c["g"], c["b"])
+                        inst_material = mat
 
                 try:
                     all_dicts = _core.extract_attribute_dictionaries(d007)
@@ -687,7 +813,7 @@ def build_scene(
                     stage="build_scene", definition_id=ref_idx,
                 )
             active_definitions.add(ref_idx)
-            child_nodes = instantiate(ref_idx, new_matrix, l_name, full_path_name, inst_color)
+            child_nodes = instantiate(ref_idx, new_matrix, l_name, full_path_name, inst_color, inst_material)
             active_definitions.discard(ref_idx)
 
             tx = new_matrix[9] * INCHES_TO_MM if len(new_matrix) > 9 else 0.0
@@ -702,6 +828,7 @@ def build_scene(
                 position_mm=(round(tx, 2), round(ty, 2), round(tz, 2)),
                 properties=properties,
                 attribute_dictionaries=attribute_dicts,
+                definition_attribute_dictionaries=_definition_dicts(ref_idx),
                 children=child_nodes,
                 path=full_path_name,
             )

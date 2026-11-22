@@ -2,11 +2,11 @@
 
 `vendor/openskp/` is a vendored copy of [openskp](https://github.com/iamahsanmehmood/openskp)
 (PyPI: [`openskp`](https://pypi.org/project/openskp/)), pinned to
-the **1.4.0 release** (tag `python-v1.4.0`, commit
-[`d673706`](https://github.com/iamahsanmehmood/openskp/commit/d673706fdb3239311ddb9079d36d24d9fc5bc16d),
-also on [PyPI](https://pypi.org/project/openskp/1.4.0/)). It is a release now:
-the previous pins were commits on `main` because 1.3.0 predated fixes this
-add-on needs (see "Why this release" below).
+the **1.6.0 release** (tag `python-v1.6.0`, commit
+[`5021ffc`](https://github.com/iamahsanmehmood/openskp/commit/5021ffcaca68f9493127286a6fc0a7c7b95435f1),
+also on [PyPI](https://pypi.org/project/openskp/1.6.0/)). Pins before 1.4.0
+were commits on `main` because 1.3.0 predated fixes this add-on needs (see
+"Why this release" below).
 
 ## Why vendored instead of a declared dependency
 
@@ -38,9 +38,45 @@ local patch is gone.
 
 ## Why this release
 
-Moved on 2026-10-27 from `13ae161` (via `4046d12`, an unreleased commit of the same
+Moved on 2026-11-22 from 1.4.0 (`d673706`). What the new copy changes for this
+add-on:
+
+- **More classic (pre-2021) files import in full.** A dimension whose
+  connection point is a vertex no longer ends the root entity list, which
+  dropped everything after it
+  ([openskp#484](https://github.com/iamahsanmehmood/openskp/pull/484)); a text
+  anchored to an entity no longer throws the reader off for every later
+  reference ([#473](https://github.com/iamahsanmehmood/openskp/pull/473)); and a
+  SketchUp 2018 file with 11 to 13 component definitions no longer fails with
+  "class-ref to non-class slot"
+  ([#534](https://github.com/iamahsanmehmood/openskp/pull/534)).
+- **Classic textured materials keep their real colour.** Every textured
+  material read as colorized, with the image's average colour; the type, mode
+  and paint colour now agree with SketchUp's own library
+  ([#485](https://github.com/iamahsanmehmood/openskp/pull/485)).
+- **A blank SketchUp 2020 file opens** as an empty model instead of failing
+  with "implausible definition count"
+  ([#490](https://github.com/iamahsanmehmood/openskp/pull/490)).
+- **Malformed files fail cleanly:** nesting is limited and a truncated
+  `model.dat` is rejected
+  ([#512](https://github.com/iamahsanmehmood/openskp/pull/512)).
+- **Export:** the writer stores each face's plane with SketchUp's own sign
+  ([#489](https://github.com/iamahsanmehmood/openskp/pull/489)). SketchUp
+  recomputes the plane on open, so exported files looked the same before; the
+  raw record now matches what SketchUp writes.
+- Also new, not used by this add-on: a definition's and the model's own
+  attribute dictionaries
+  ([#530](https://github.com/iamahsanmehmood/openskp/pull/530),
+  [#532](https://github.com/iamahsanmehmood/openskp/pull/532)), a 2019/2020
+  tag's line style ([#515](https://github.com/iamahsanmehmood/openskp/pull/515)),
+  and scene/glTF changes (material names, painted groups, TIFF/TGA/GIF
+  textures; [#502](https://github.com/iamahsanmehmood/openskp/pull/502),
+  [#538](https://github.com/iamahsanmehmood/openskp/pull/538),
+  [#539](https://github.com/iamahsanmehmood/openskp/pull/539)).
+
+The 1.4.0 pin itself moved on 2026-10-27 from `13ae161` (via `4046d12`, an unreleased commit of the same
 day; the only difference to 1.4.0 is the writers' group flag, which this add-on
-does not use). What the new copy adds for an import:
+does not use). What that copy added for an import:
 
 - **Instances scaled through the matrix's scale term
   ([openskp#444](https://github.com/iamahsanmehmood/openskp/issues/444)).**

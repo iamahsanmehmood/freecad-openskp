@@ -419,8 +419,11 @@ class Dimension:
         b: Second measured point.
         offset: Offset distance (inches) — how far the dimension line sits
             from the ``a``–``b`` segment, along the in-plane perpendicular.
-        plane_x: The dimension plane's x-axis, or ``None``.
-        normal: The dimension plane's normal, or ``None``.
+        plane_x: Historical name: for a VFF dimension this is tag ``5BCF``, which
+            is the plane NORMAL (SketchUp's ``SUDimensionLinearGetNormal``
+            equals it), or ``None``.
+        normal: Historical name: for a VFF dimension this is tag ``5BD0``, the
+            plane's X axis, or ``None``.
     """
 
     text: str = ""
@@ -561,6 +564,12 @@ class Definition:
         arcs: The analytic arc of every curve that is one, keyed by curve id
             - the :attr:`Edge.curve_id` of the edges that form it. A curve
             that is not an arc (a freehand or polygon curve) has no entry.
+        attribute_dictionaries: The definition's OWN attribute
+            dictionaries, keyed by dictionary name, values in their real
+            types (2021+ files; not read from classic files yet). SketchUp's
+            Dynamic Components keep a component's attributes, formulas and
+            option definitions here (``"dynamic_attributes"``), while each
+            placement only stores its current values on the instance.
         always_faces_camera: SketchUp's "always face camera" component
             behavior (2D people / tree cut-outs that rotate to face the
             viewer). Consumers typically render such instances as
@@ -597,6 +606,7 @@ class Definition:
     shadows_face_sun: bool = False
     is_image: bool = False
     is_group: bool = False
+    attribute_dictionaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 def loose_edge_runs(definition: "Definition") -> List[Tuple[List[int], List[int], bool]]:
@@ -677,6 +687,10 @@ class SkpModel:
             the join table for :attr:`Face.material_id`.  Several IDs may
             alias the same :class:`Material` object.
         styles: List of :class:`Style` objects found in the file.
+        attribute_dictionaries: The model entity's own attribute
+            dictionaries (2021+ files; not read from classic files yet). A
+            component saved as its own file keeps its Dynamic Components
+            attributes here.
         units: The model's unit-system string (e.g. ``"Millimeter"``),
             read from ``meta/meta.dat`` in modern (VFF) files.  ``None``
             for legacy (pre-2021 MFC) files, which carry no equivalent
@@ -700,6 +714,7 @@ class SkpModel:
     materials_by_id: Dict[int, Material] = field(default_factory=dict)
     styles: List[Style] = field(default_factory=list)
     units: Optional[str] = None
+    attribute_dictionaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
 # ── SkpFile entry-point ──────────────────────────────────────────────────
@@ -804,6 +819,7 @@ class SkpFile:
         model = SkpModel()
         model.version = parsed.get("version", "unknown")
         model.units = parsed.get("units")
+        model.attribute_dictionaries = parsed.get("model_attribute_dictionaries") or {}
 
         layer_id_to_name = parsed.get("layer_id_to_name", {})
 
@@ -818,6 +834,7 @@ class SkpFile:
                 shadows_face_sun=d.get("shadows_face_sun", False),
                 is_image=d.get("is_image", False),
                 is_group=d.get("is_group", False),
+                attribute_dictionaries=d.get("attribute_dictionaries") or {},
             )
             # Completed VFF builders can retain dense private tables. Iterate
             # those directly; their public accessors still return cached dicts.
@@ -1000,6 +1017,7 @@ class SkpFile:
         self,
         name_override_keys: Sequence[str] = ("name", "label", "code"),
         include_curve_sets: bool = True,
+        original_textures: bool = False,
     ) -> "scene.Scene":
         """Bake every instance actually placed in the model into
         world-space, triangulated mesh data - SketchUp's component/group
@@ -1031,6 +1049,14 @@ class SkpFile:
                 model that has both solids and curves), not a correctness
                 one. On a curve-only model it is not a lever at all: the
                 curve sets are the entire content.
+            original_textures: Keep a texture that is not PNG or JPEG
+                (SketchUp stores TIFF, TGA and GIF textures as they were
+                imported) in its own format, with its real
+                :attr:`SceneTexture.mime_type` (``image/tiff``, ...),
+                instead of leaving it out with a warning. Off by default:
+                a consumer that assumes every texture is PNG or JPEG (a
+                glTF writer of its own) would break on the others. The
+                GLB exporters need no change: they decode through Pillow.
 
         Returns:
             A populated :class:`openskp.scene.Scene`.
@@ -1043,11 +1069,13 @@ class SkpFile:
             parsed,
             name_override_keys=name_override_keys,
             include_curve_sets=include_curve_sets,
+            original_textures=original_textures,
         )
 
     def build_instanced_scene(
         self,
         name_override_keys: Sequence[str] = ("name", "label", "code"),
+        original_textures: bool = False,
     ) -> "instanced_scene.InstancedScene":
         """Build the placed scene graph with SketchUp's component/group
         INSTANCING PRESERVED, instead of baked into world-space vertex data.
@@ -1066,6 +1094,9 @@ class SkpFile:
             name_override_keys: See :meth:`build_scene` - same meaning,
                 same default, same generic (not tied to any one plugin's
                 own dictionary name) lookup.
+            original_textures: Keep a texture that is not PNG or JPEG in
+                its own format, with its real MIME type; see
+                :meth:`build_scene`.
 
         Returns:
             A populated :class:`openskp.instanced_scene.InstancedScene`.
@@ -1074,5 +1105,7 @@ class SkpFile:
         from . import instanced_scene
 
         parsed = _core.full_parse(str(self.path))
-        return instanced_scene.build_instanced_scene(parsed, name_override_keys=name_override_keys)
+        return instanced_scene.build_instanced_scene(
+            parsed, name_override_keys=name_override_keys, original_textures=original_textures
+        )
 
