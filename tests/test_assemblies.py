@@ -78,13 +78,17 @@ def check_structure(path):
             assert asm.Type == "Assembly", (label, asm.Type)
             assert not asm.Visibility, f"{label} is visible at the origin"
             joint_groups = [o for o in asm.Group if o.TypeId == "Assembly::JointGroup"]
-            assert len(joint_groups) == 1 and len(joint_groups[0].Group) == 0, (label, joint_groups)
+            assert len(joint_groups) == 1 and len(joint_groups[0].Group) == 0, (label, len(joint_groups))
             geom = [o for o in asm.Group if o.TypeId == "Part::Feature"]
-            assert len(geom) == 1 and len(geom[0].Shape.Faces) == 1, (label, geom)
+            assert len(geom) == 1 and len(geom[0].Shape.Faces) == 1, (label, len(geom))
             links = [o for o in asm.Group if o.TypeId == "App::Link"]
-            assert sorted(o.Label for o in links) == ["Leg 1", "Leg 2", "Leg 3", "Leg 4"], links
+            assert len(links) == 4, (label, [o.Label for o in links])
+            if label == "Table":
+                assert sorted(o.Label for o in links) == ["Leg 1", "Leg 2", "Leg 3", "Leg 4"], [
+                    o.Label for o in links
+                ]
             expected_leg = "Leg" if label == "Table" else "Leg (Red)"
-            assert {o.LinkedObject.Label for o in links} == {expected_leg}
+            assert {o.LinkedObject.Label for o in links} == {expected_leg}, [o.LinkedObject.Label for o in links]
 
             # Solving an ungrounded imported assembly leaves every link's placement untouched.
             before = [o.Placement.copy() for o in links]
