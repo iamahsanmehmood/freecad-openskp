@@ -103,6 +103,10 @@ def check(fixture_name):
                 f"{fixture_name}: expected {expected} "
                 f"(faces, invalid, nan_area, loose_edges, layers, hidden_layers), got {got}"
             )
+        assert importSKP.last_import_stats["unread_root_entities"] == 0, fixture_name
+        assert importSKP.last_import_stats["warnings"] == [], (
+            fixture_name, importSKP.last_import_stats["warnings"]
+        )
         check_face_colors(fixture_name, len(faces))
         return got
     finally:
@@ -339,6 +343,106 @@ def check_scale_term(fixture_name):
         App.closeDocument(doc.Name)
 
 
+def check_partial_read_warning():
+    """When openskp reports a classic file whose root entity list stopped early
+    (SkpModel.unread_root_entities / openskp.legacy warning, openskp#552),
+    import_skp surfaces a warning in FreeCAD's console and records the unread
+    count in last_import_stats, while working unchanged with older openskp
+    releases that lack SkpModel.unread_root_entities."""
+    import logging
+    import tempfile
+
+    import openskp
+
+    path = os.path.join(FIXTURES_DIR, "arcs_2017.skp")
+    orig_parse = openskp.SkpFile.parse
+    orig_print_warning = App.Console.PrintWarning
+    printed = []
+
+    def record_warning(msg):
+        printed.append(msg)
+        orig_print_warning(msg)
+
+    root_logger = logging.getLogger()
+    saved_root_level = root_logger.level
+    App.Console.PrintWarning = record_warning
+    try:
+        # 1. Attribute-only signal (SkpModel.unread_root_entities > 0, no log).
+        def parse_attr_only(self):
+            m = orig_parse(self)
+            m.unread_root_entities = 6
+            return m
+
+        openskp.SkpFile.parse = parse_attr_only
+        doc = App.newDocument()
+        try:
+            printed.clear()
+            importSKP.import_skp(path, doc, merge=True)
+            stats = importSKP.last_import_stats
+            assert stats["unread_root_entities"] == 6, stats
+            assert len(stats["warnings"]) == 1 and "read only in part" in stats["warnings"][0], stats
+            assert any("read only in part" in m and "6" in m for m in printed), printed
+        finally:
+            App.closeDocument(doc.Name)
+
+        # 2. Both openskp.legacy warning log and unread_root_entities attribute,
+        # even when the root logger is silenced to ERROR: emitted once, not twice.
+        def parse_both(self):
+            m = orig_parse(self)
+            m.unread_root_entities = 6
+            logging.getLogger("openskp.legacy").warning(
+                "Classic .skp root entity list stopped early after 4 entities "
+                "(6 unread): this file was read only in part"
+            )
+            return m
+
+        root_logger.setLevel(logging.ERROR)
+        openskp.SkpFile.parse = parse_both
+        doc = App.newDocument()
+        try:
+            printed.clear()
+            importSKP.import_skp(path, doc, merge=False)
+            stats = importSKP.last_import_stats
+            assert stats["unread_root_entities"] == 6, stats
+            assert len(stats["warnings"]) == 1 and "stopped early" in stats["warnings"][0], stats
+            assert sum("read only in part" in m for m in printed) == 1, printed
+        finally:
+            App.closeDocument(doc.Name)
+
+        # 3. End-to-end check once a post-openskp#552 release is vendored.
+        openskp.SkpFile.parse = orig_parse
+        root_logger.setLevel(saved_root_level)
+        if hasattr(openskp.SkpModel, "unread_root_entities"):
+            builder = openskp.create()
+            builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
+            builder.add_text("First", (0, 0, 0))
+            builder.add_text("Broken", (5, 0, 0))
+            builder.add_face([(20, 0, 0), (30, 0, 0), (30, 10, 0), (20, 10, 0)])
+            raw = bytearray(builder.to_bytes())
+            at = raw.find(b"\x01\xff\xfe\xff\x06B\x00")
+            assert at >= 0
+            raw[at : at + 4] = b"\x00\x00\x00\x00"
+            with tempfile.TemporaryDirectory() as tmp:
+                broken = os.path.join(tmp, "partial.skp")
+                with open(broken, "wb") as f:
+                    f.write(raw)
+                doc = App.newDocument()
+                try:
+                    printed.clear()
+                    importSKP.import_skp(broken, doc, merge=True)
+                    stats = importSKP.last_import_stats
+                    assert stats["unread_root_entities"] > 0, stats
+                    assert any("read only in part" in m for m in stats["warnings"]), stats
+                    assert any("read only in part" in m for m in printed), printed
+                finally:
+                    App.closeDocument(doc.Name)
+    finally:
+        openskp.SkpFile.parse = orig_parse
+        root_logger.setLevel(saved_root_level)
+        App.Console.PrintWarning = orig_print_warning
+    print("check_partial_read_warning: OK")
+
+
 def _main():
     _checked = 0
     for _name in os.listdir(FIXTURES_DIR):
@@ -353,6 +457,7 @@ def _main():
     check_arcs("arcs_2021.skp")
     check_scale_term("instance_scale_term_2021.skp")
     check_scale_term("instance_scale_term_v6.skp")
+    check_partial_read_warning()
 
 
 # Note: freecadcmd runs a script file as a module named after the file
