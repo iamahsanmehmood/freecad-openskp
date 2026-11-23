@@ -77,6 +77,20 @@ says how many. It works in both layouts; in the hierarchy each component's
 geometry object becomes the solid and its links place it. Colours stay on
 their faces.
 
+**Assemblies** (an option, off by default): in the component hierarchy,
+setting `ImportAssemblies` to `true` (Tools > Edit parameters,
+`BaseApp/Preferences/Mod/OpenSKP`, Boolean) or passing
+`import_skp(path, doc, assemblies=True)` builds every component or group
+definition that contains other components or groups as a FreeCAD 1.x
+`Assembly::AssemblyObject` instead of an `App::Part`, ready to open and add
+joints in the Assembly workbench. Leaf definitions with only their own
+geometry stay `App::Part`, and since SketchUp stores no kinematic joints,
+imported assemblies start with an empty `Joints` group and keep every link's
+placement as imported. When FreeCAD's Assembly module is not present, the
+import falls back to `App::Part`. Export follows `Assembly::AssemblyObject`
+containers the same way it follows `App::Part` and `App::Link`, skipping
+joint/view/BOM/simulation metadata groups.
+
 The two layouts show exactly the same geometry: the tests import every
 fixture both ways and compare faces, areas, vertices and edges
 (`tests/test_hierarchy.py`), and check in FreeCAD's real GUI that the 3D
