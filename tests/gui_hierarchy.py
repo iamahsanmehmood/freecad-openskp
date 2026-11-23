@@ -121,6 +121,44 @@ def main():
         _check_bounds("solids", drawn, VISIBLE_BOUNDS_IN, mm)
         lines.append(f"solids: the view draws {drawn} mm, the same")
 
+        # ImportAssemblies (#22): Table and Table (Red) become Assembly::AssemblyObject,
+        # leaf parts stay App::Part, the 3D view draws the same extent, and the Assembly
+        # workbench activates the imported assembly cleanly.
+        import FreeCADGui as Gui
+        import UtilsAssembly
+
+        asm_doc = App.newDocument("Assemblies")
+        importSKP.import_skp(path, asm_doc, merge=False, assemblies=True)
+        stats = importSKP.last_import_stats
+        assert stats["assemblies"] == 2, stats
+        components = asm_doc.getObject(stats["components_group"])
+        by_label = {o.Label: o for o in components.Group}
+        for label in ("Table", "Table (Red)"):
+            assert by_label[label].TypeId == "Assembly::AssemblyObject", by_label[label].TypeId
+            assert not by_label[label].ViewObject.Visibility
+        for label in ("Leg", "Leg (Red)", "Spare"):
+            assert by_label[label].TypeId == "App::Part", by_label[label].TypeId
+            assert not by_label[label].ViewObject.Visibility
+        for name in stats["object_face_colors"]:
+            obj = asm_doc.getObject(name)
+            assert len(obj.ViewObject.DiffuseColor) == len(obj.Shape.Faces), name
+        view = _show(asm_doc, "assemblies")
+        drawn = _drawn_bounds(view)
+        _check_bounds("assemblies", drawn, VISIBLE_BOUNDS_IN, mm)
+
+        App.setActiveDocument(asm_doc.Name)
+        Gui.activateWorkbench("AssemblyWorkbench")
+        Gui.updateGui()
+        table = by_label["Table"]
+        assert Gui.getDocument(asm_doc.Name).setEdit(table.Name), "setEdit(Table) returned False"
+        Gui.updateGui()
+        assert UtilsAssembly.activeAssembly() == table, UtilsAssembly.activeAssembly()
+        assert UtilsAssembly.number_of_components_in(table) == 5, UtilsAssembly.number_of_components_in(table)
+        _show(asm_doc, "assembly_workbench")
+        Gui.getDocument(asm_doc.Name).resetEdit()
+        Gui.updateGui()
+        lines.append(f"assemblies: the view draws {drawn} mm, AssemblyWorkbench activates Table (5 components)")
+
         _finish("PASS\n" + "\n".join(lines), 0)
     except BaseException:
         _finish("FAIL\n" + traceback.format_exc(), 1)

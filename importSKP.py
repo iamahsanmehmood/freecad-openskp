@@ -732,6 +732,19 @@ def _merge_on_import_preference():
         return False
 
 
+def _assembly_available():
+    """Whether FreeCAD's built-in Assembly module (1.0+) is available and its
+    object types are registered."""
+    try:
+        import AssemblyApp  # noqa: F401
+
+        if App.GuiUp:
+            import AssemblyGui  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
 def _link_transform(m13):
     """Splits a 13-value instance matrix into what an App::Link can hold:
     ``(placement, scale_vector)``, the placement in millimetres, or ``None``
@@ -790,6 +803,10 @@ class _HierarchyImport:
       "SketchUp components" group: its own faces and loose edges as one
       Part::Feature, and an ``App::Link`` for every component or group placed
       inside it. Definitions that are not placed anywhere are included too.
+      With ``assemblies=True`` (#22), a definition that contains other
+      components or groups becomes a FreeCAD 1.x ``Assembly::AssemblyObject``
+      instead (with an empty ``Assembly::JointGroup``, since SketchUp stores
+      no joints), while leaf definitions stay ``App::Part``.
     - The model itself is an ``App::Part`` named after the file, with one
       group per SketchUp tag used at its top level; each holds the links of
       the top-level instances on that tag (and the model's own loose
@@ -810,14 +827,15 @@ class _HierarchyImport:
     that cut across the hierarchy the way SketchUp's tags do.
     """
 
-    def __init__(self, doc, model, stats, progress, title):
+    def __init__(self, doc, model, stats, progress, title, assemblies=False):
         self.doc = doc
         self.model = model
         self.stats = stats
         self.progress = progress
         self.title = title
+        self.assemblies = bool(assemblies)
         self.layer_hidden = {layer.name: layer.hidden for layer in model.layers}
-        self.parts = {}  # (id(definition), effective inherited material) -> App::Part
+        self.parts = {}  # (id(definition), effective inherited material) -> App::Part / AssemblyObject
         self.built_definitions = set()  # id(definition)
         self.paint_memo = {}
         self.merged_cache = {}  # for sheared placements, see _place
@@ -874,11 +892,16 @@ class _HierarchyImport:
         if App.GuiUp:
             obj.ViewObject.Visibility = False
 
+    def _has_child_instances(self, definition):
+        return any(self.model.definitions.get(inst.ref_idx) is not None for inst in definition.instances)
+
     # -- the hierarchy ---------------------------------------------------
 
     def component(self, definition, inherited_material_id, visiting=frozenset()):
-        """The App::Part for ``definition`` as it looks when placed with
-        ``inherited_material_id`` passed down, built on first use."""
+        """The App::Part (or Assembly::AssemblyObject when ``self.assemblies``
+        is enabled and ``definition`` contains nested instances) for
+        ``definition`` as it looks when placed with ``inherited_material_id``
+        passed down, built on first use."""
         material_key = inherited_material_id if self._passes_paint_down(definition) else None
         key = (id(definition), material_key)
         if key in self.parts:
@@ -887,7 +910,14 @@ class _HierarchyImport:
             return None  # a cycle in the instance graph
         name = definition.name or ("Group" if definition.is_group else "Component")
         label = name if material_key is None else f"{name} ({self._material_name(material_key)})"
-        part = self._add("App::Part", "Component", label)
+        if self.assemblies and self._has_child_instances(definition):
+            part = self._add("Assembly::AssemblyObject", "Assembly", label)
+            part.Type = "Assembly"
+            joints = part.newObject("Assembly::JointGroup", "Joints")
+            joints.Label = "Joints"
+            self.stats["assemblies"] += 1
+        else:
+            part = self._add("App::Part", "Component", label)
         self.components.addObject(part)
         self._hide(part)  # shown through its links, not at the origin
         self.parts[key] = part
@@ -1013,7 +1043,7 @@ class _HierarchyImport:
         return model_part
 
 
-def import_skp(filepath, doc=None, merge=None, solids=None):
+def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
     Two layouts:
@@ -1033,6 +1063,13 @@ def import_skp(filepath, doc=None, merge=None, solids=None):
     either layout. ``solids=None`` reads the ``MakeSolids`` preference
     (False unless set).
 
+    ``assemblies=True`` builds every definition that contains other
+    components or groups as a FreeCAD 1.x ``Assembly::AssemblyObject``
+    instead of an ``App::Part`` (#22), while leaf parts stay ``App::Part``;
+    falls back to ``App::Part`` when FreeCAD's Assembly module is not
+    available. ``assemblies=None`` reads the ``ImportAssemblies`` preference
+    (False unless set).
+
     Each face's resolved color/opacity (its own paint, or whatever an
     ancestor group/component painted itself with, or a neutral default)
     is applied as ViewObject.DiffuseColor, one entry per Shape.Faces -
@@ -1050,6 +1087,18 @@ def import_skp(filepath, doc=None, merge=None, solids=None):
         merge = _merge_on_import_preference()
     if solids is None:
         solids = _bool_preference("MakeSolids")
+    if assemblies is None:
+        assemblies = _bool_preference("ImportAssemblies")
+
+    use_assemblies = False
+    if assemblies and not merge:
+        if _assembly_available():
+            use_assemblies = True
+        else:
+            App.Console.PrintWarning(
+                "openskp: FreeCAD Assembly module is not available; "
+                "importing components as App::Part instead\n"
+            )
 
     print(f"openskp: parsing {os.path.basename(filepath)} "
           "(can take a while for a large file - this is real work, not a hang)...")
@@ -1064,6 +1113,7 @@ def import_skp(filepath, doc=None, merge=None, solids=None):
         "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
         "hidden_layers": 0, "merged": bool(merge),
         "make_solids": bool(solids), "solids_built": 0, "faces_left_open": 0,
+        "import_assemblies": bool(assemblies), "assemblies": 0,
     }
     last_import_stats = stats
 
@@ -1088,7 +1138,7 @@ def import_skp(filepath, doc=None, merge=None, solids=None):
             stats.update({"components": 0, "links": 0, "sheared_copies": 0,
                           "unplaced_components": 0, "object_face_colors": {}})
             title = os.path.splitext(os.path.basename(filepath))[0] or "SketchUp model"
-            _HierarchyImport(doc, model, stats, progress, title).run()
+            _HierarchyImport(doc, model, stats, progress, title, assemblies=use_assemblies).run()
             built = stats["components"]
     finally:
         if progress is not None:
@@ -1111,8 +1161,13 @@ def import_skp(filepath, doc=None, merge=None, solids=None):
             f"({stats['hidden_layers']} hidden)"
         )
     else:
+        comp_summary = (
+            f"{stats['components']} components ({stats['assemblies']} assemblies)"
+            if assemblies
+            else f"{stats['components']} components"
+        )
         print(
-            f"openskp: {stats['components']} components built in {time.time() - t0:.1f}s {common}, "
+            f"openskp: {comp_summary} built in {time.time() - t0:.1f}s {common}, "
             f"{stats['links']} links, {stats['sheared_copies']} sheared copies, "
             f"{stats['unplaced_components']} unplaced components; {stats['layers']} tags at the top level "
             f"({stats['hidden_layers']} hidden)"
@@ -1300,8 +1355,16 @@ def _ancestors(obj):
         parent = _parent_of(parent)
 
 
+def _is_part_or_assembly(obj):
+    return _is_type(obj, "App::Part") or _is_type(obj, "Assembly::AssemblyObject")
+
+
 def _is_container(obj):
-    return _is_type(obj, "App::Link") or _is_type(obj, "App::Part") or _is_type(obj, "App::DocumentObjectGroup")
+    return (
+        _is_type(obj, "App::Link")
+        or _is_part_or_assembly(obj)
+        or _is_type(obj, "App::DocumentObjectGroup")
+    )
 
 
 def _can_export(obj):
@@ -1323,17 +1386,30 @@ def _is_definitions_group(obj):
     return bool(getattr(obj, "SketchUpDefinitions", False))
 
 
+_ASSEMBLY_META_GROUPS = (
+    "Assembly::JointGroup",
+    "Assembly::ViewGroup",
+    "Assembly::BomGroup",
+    "Assembly::SimulationGroup",
+)
+
+
+def _is_skipped_export_group(obj):
+    return _is_definitions_group(obj) or any(_is_type(obj, t) for t in _ASSEMBLY_META_GROUPS)
+
+
 def _export_leaves(exportList):
     """Yields ``(obj, shape, transform, layer)`` for every piece of geometry
     the selection shows, flattened into world space.
 
     The selection can be plain shapes (as before) or the hierarchy an import
-    builds (#5): App::Part containers, tag groups and App::Link placements,
-    each followed down to the Part::Features they show, with the links'
-    placements and scale applied. An object whose ancestor is also selected
-    is reached through that ancestor, not twice, and the hidden "SketchUp
-    components" group is skipped, since its definitions sit at the origin
-    and are already exported wherever a link places them.
+    builds (#5, #22): App::Part and Assembly::AssemblyObject containers, tag
+    groups and App::Link placements, each followed down to the Part::Features
+    they show, with the links' placements and scale applied. An object whose
+    ancestor is also selected is reached through that ancestor, not twice, and
+    the hidden "SketchUp components" group (plus Assembly joint/view/BOM/
+    simulation metadata groups) is skipped, since definitions sit at the
+    origin and are already exported wherever a link places them.
 
     ``transform`` maps the shape's own points (which already include the
     object's own Placement) into world millimetres. ``layer`` is the nearest
@@ -1342,7 +1418,7 @@ def _export_leaves(exportList):
     selected = {o.Name for o in exportList if hasattr(o, "Name")}
 
     def walk(obj, matrix, layer, through_link):
-        if _is_definitions_group(obj):
+        if _is_skipped_export_group(obj):
             return
         layer = getattr(obj, "SketchUpLayer", "") or layer
         if _is_type(obj, "App::Link"):
@@ -1359,9 +1435,9 @@ def _export_leaves(exportList):
                 link_matrix = link_matrix * target.Placement.toMatrix()
             yield from walk(target, matrix * link_matrix, layer, True)
             return
-        # Only App::Part is opened up: a PartDesign Body is a container too,
-        # but its Shape (the tip) is the solid it stands for.
-        if _is_type(obj, "App::Part"):
+        # Only App::Part / Assembly::AssemblyObject are opened up: a PartDesign
+        # Body is a container too, but its Shape (the tip) is the solid it stands for.
+        if _is_part_or_assembly(obj):
             inner = matrix if through_link else matrix * obj.Placement.toMatrix()
             for child in _direct_children(obj):
                 yield from walk(child, inner, layer, False)
@@ -1379,7 +1455,7 @@ def _export_leaves(exportList):
         yield obj, shape, leaf, layer
 
     for obj in exportList:
-        if any(a.Name in selected or _is_definitions_group(a) for a in _ancestors(obj)):
+        if any(a.Name in selected or _is_skipped_export_group(a) for a in _ancestors(obj)):
             continue
         parent_group = getattr(obj, "getParentGeoFeatureGroup", lambda: None)()
         base = parent_group.getGlobalPlacement().toMatrix() if parent_group is not None else App.Matrix()
