@@ -33,8 +33,12 @@ def _world_shapes(doc, stats, merge):
     if merge:
         return [o.Shape.copy() for o in doc.Objects if hasattr(o, "Shape")]
     model_part = doc.getObject(stats["model_part"])
-    return [shape.transformGeometry(transform)
-            for _obj, shape, transform, _layer in importSKP._export_leaves([model_part])]
+    out = []
+    for _obj, shape, transform, _layer in importSKP._export_leaves([model_part]):
+        placed = shape.copy()
+        placed.transformShape(transform, False, True)
+        out.append(placed)
+    return out
 
 
 def _signature(shapes):
@@ -138,7 +142,8 @@ def check_plate_with_hole(fixture_name):
                 assert abs(circle.Center.x) < 1e-5 and abs(circle.Center.y) < 1e-5, tuple(circle.Center)
                 assert abs(circle.Center.z - z_in * MM) < 1e-5, circle.Center.z
                 assert abs(face.Area - expected_area) < 1e-2, (face.Area, expected_area)
-                normal = face.normalAt(0.0, 0.0)
+                u0, u1, v0, v1 = face.ParameterRange
+                normal = face.normalAt(0.5 * (u0 + u1), 0.5 * (v0 + v1))
                 assert abs(normal.x) < 1e-6 and abs(normal.y) < 1e-6 and abs(normal.z - nz) < 1e-6, tuple(normal)
         finally:
             App.closeDocument(doc.Name)
