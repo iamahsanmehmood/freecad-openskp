@@ -67,6 +67,16 @@ To use it, open Tools > Edit parameters, go to
 `BaseApp/Preferences/Mod/OpenSKP` and add a Boolean `MergeOnImport` set to
 `true`; from Python, `importSKP.import_skp(path, doc, merge=True)`.
 
+**Solids** (an option, off by default): SketchUp stores only faces, so a
+board or a leg arrives as a hollow set of faces. With `MakeSolids` set to
+`true` (Tools > Edit parameters, `BaseApp/Preferences/Mod/OpenSKP`, Boolean)
+or `import_skp(path, doc, solids=True)`, each component's own faces are sewn
+and every closed shell becomes a solid, with its volume, ready for booleans
+and measurements. Faces that close no volume stay faces, and the console
+says how many. It works in both layouts; in the hierarchy each component's
+geometry object becomes the solid and its links place it. Colours stay on
+their faces.
+
 The two layouts show exactly the same geometry: the tests import every
 fixture both ways and compare faces, areas, vertices and edges
 (`tests/test_hierarchy.py`), and check in FreeCAD's real GUI that the 3D
