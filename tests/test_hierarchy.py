@@ -253,6 +253,85 @@ def check_merge_preference(path):
         params.RemBool("MergeOnImport")
 
 
+def check_large_hierarchy_warning():
+    """Models at or above _LARGE_HIERARCHY_DEFINITION_THRESHOLD (1,000
+    definitions, #31) print a console warning suggesting MergeOnImport when
+    imported in the hierarchy layout, and stay quiet below the threshold or
+    when merge=True."""
+    import tempfile
+
+    import openskp
+
+    threshold = importSKP._LARGE_HIERARCHY_DEFINITION_THRESHOLD
+    assert threshold == 1000, threshold
+
+    orig_print_warning = App.Console.PrintWarning
+    printed = []
+
+    def record_warning(msg):
+        printed.append(msg)
+        orig_print_warning(msg)
+
+    App.Console.PrintWarning = record_warning
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            small_path = os.path.join(tmp, "small.skp")
+            b_small = openskp.create()
+            small_defs = []
+            for i in range(10):
+                with b_small.add_component_definition(f"P_{i}") as comp:
+                    comp.add_face([(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)])
+                small_defs.append(comp)
+            for i, comp in enumerate(small_defs):
+                b_small.add_instance(comp, translation=(i * 3.0, 0.0, 0.0))
+            with open(small_path, "wb") as f:
+                f.write(b_small.to_bytes())
+
+            doc = App.newDocument()
+            try:
+                printed.clear()
+                importSKP.import_skp(small_path, doc, merge=False)
+                assert importSKP.last_import_stats["large_hierarchy_warning"] is False
+                assert not any("MergeOnImport" in m for m in printed), printed
+            finally:
+                App.closeDocument(doc.Name)
+
+            big_path = os.path.join(tmp, "thousand.skp")
+            b_big = openskp.create()
+            big_defs = []
+            for i in range(threshold):
+                with b_big.add_component_definition(f"D_{i}") as comp:
+                    comp.add_face([(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)])
+                big_defs.append(comp)
+            for i, comp in enumerate(big_defs):
+                b_big.add_instance(comp, translation=((i % 50) * 3.0, (i // 50) * 3.0, 0.0))
+            with open(big_path, "wb") as f:
+                f.write(b_big.to_bytes())
+
+            # Hierarchy layout at threshold -> warns and suggests MergeOnImport.
+            doc = App.newDocument()
+            try:
+                printed.clear()
+                importSKP.import_skp(big_path, doc, merge=False)
+                assert importSKP.last_import_stats["large_hierarchy_warning"] is True
+                assert any(str(threshold) in m and "MergeOnImport" in m for m in printed), printed
+            finally:
+                App.closeDocument(doc.Name)
+
+            # Merged layout on the same model -> no warning.
+            doc = App.newDocument()
+            try:
+                printed.clear()
+                importSKP.import_skp(big_path, doc, merge=True)
+                assert importSKP.last_import_stats["large_hierarchy_warning"] is False
+                assert not any("MergeOnImport" in m for m in printed), printed
+            finally:
+                App.closeDocument(doc.Name)
+    finally:
+        App.Console.PrintWarning = orig_print_warning
+    print(f"check_large_hierarchy_warning: OK (warns at >= {threshold} defs in hierarchy, quiet when merged)")
+
+
 def _main():
     synthetic = os.path.join(FIXTURES_DIR, "_hierarchy_tmp.skp")
     write_synthetic(synthetic)
@@ -264,6 +343,7 @@ def _main():
         check_merge_preference(synthetic)
     finally:
         os.remove(synthetic)
+    check_large_hierarchy_warning()
     checked = 0
     for name in sorted(os.listdir(FIXTURES_DIR)):
         if name.endswith(".skp") and not name.startswith("_"):
