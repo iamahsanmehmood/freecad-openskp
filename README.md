@@ -234,6 +234,30 @@ placement (thousands of objects, each `App::Part` with its own origin), so
 for a model of that size set `MergeOnImport` (see
 [What it does](#what-it-does)).
 
+**Hierarchy vs. merged layout (`tests/bench_large_hierarchy.py`)** — measured on
+FreeCAD 1.1.3 (Linux x86_64) across three nested synthetic `.skp` models written
+with `openskp.create()` (80% 6-face box leaf parts, 10% sub-assemblies placing 4
+leaves + 1 base face, 10% top-level bays placing 2 sub-assemblies + 1 leaf across
+4 tags), each run in a fresh process:
+
+| Definitions | Layout | Document objects | Headless (`freecadcmd`) | FreeCAD GUI (`AppRun`) |
+|---:|---|---:|---|---|
+| **100** | Merged (`merge=True`) | **4** (`4 Part::Feature`) | 0.21 s · +34 MB RSS (134 MB peak) | **1.04 s** · +65 MB RSS (602 MB peak) |
+| **100** | Hierarchy (`merge=False`) | **1,124** (`101 App::Part`, `707` origin objs, `90 Part::Feature`, `120 App::Link`, `5` groups) | 0.15 s · +34 MB RSS (133 MB peak) | **2.71 s** · +187 MB RSS (723 MB peak) |
+| **1,000** | Merged (`merge=True`) | **4** (`4 Part::Feature`) | 1.60 s · +195 MB RSS (309 MB peak) | **3.98 s** · +324 MB RSS (874 MB peak) |
+| **1,000** | Hierarchy (`merge=False`) | **11,114** (`1,001 App::Part`, `7,007` origin objs, `900 Part::Feature`, `1,200 App::Link`, `5` groups) | 1.29 s · +187 MB RSS (302 MB peak) | **23.29 s** · +1,490 MB RSS (2,040 MB peak) |
+| **5,000** | Merged (`merge=True`) | **4** (`4 Part::Feature`) | 8.20 s · +863 MB RSS (1,088 MB peak) | **18.09 s** · +1,389 MB RSS (2,053 MB peak) |
+| **5,000** | Hierarchy (`merge=False`) | **55,514** (`5,001 App::Part`, `35,007` origin objs, `4,500 Part::Feature`, `6,000 App::Link`, `5` groups) | 14.34 s · +827 MB RSS (1,051 MB peak) | **168.38 s** · +7,160 MB RSS (7,808 MB peak) |
+
+Headless `freecadcmd` stays fast at every size because no Coin3D view providers
+or Qt model-tree items exist, whereas in the real GUI every `App::Part` brings 7
+origin objects (8 view providers per part before its geometry and links), pushing
+1,000 definitions past +1.5 GB / 23 s and 5,000 definitions past +7.1 GB / 2m 48s
+(over 9x the time and 5x the memory of `merge=True`). Importing a file with
+**1,000 or more** definitions in the hierarchy layout therefore prints a console
+warning suggesting `MergeOnImport` (`Tools > Edit parameters >
+BaseApp/Preferences/Mod/OpenSKP`, or `merge=True` from Python).
+
 Progress is visible throughout — FreeCAD's native progress bar
 (`Base.ProgressIndicator`) in the GUI, periodic console output under
 `freecadcmd` — so a multi-minute import doesn't look identical to a hang.

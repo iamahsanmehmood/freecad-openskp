@@ -2083,6 +2083,9 @@ def _reconcile_partial_read_warnings(model, filepath, library_warnings):
     return unread
 
 
+_LARGE_HIERARCHY_DEFINITION_THRESHOLD = 1000
+
+
 def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, curved_surfaces=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
@@ -2159,6 +2162,15 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
     unread_root_entities = _reconcile_partial_read_warnings(model, filepath, library_warnings)
     for message in library_warnings:
         App.Console.PrintWarning(f"openskp: {message}\n")
+    large_hierarchy = not merge and len(model.definitions) >= _LARGE_HIERARCHY_DEFINITION_THRESHOLD
+    if large_hierarchy:
+        App.Console.PrintWarning(
+            f"openskp: {os.path.basename(filepath)} has {len(model.definitions)} component/group "
+            "definitions; the component hierarchy creates ~8+ FreeCAD objects per definition, "
+            "which can use several gigabytes in the GUI. For faster, lighter imports on large "
+            "models, set MergeOnImport (Tools > Edit parameters > BaseApp/Preferences/Mod/OpenSKP) "
+            "or pass merge=True\n"
+        )
     print(f"openskp: parsed in {time.time() - t0:.1f}s, building geometry...")
 
     t0 = time.time()
@@ -2173,6 +2185,7 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         "curved_groups_unfitted": 0,
         "unread_root_entities": unread_root_entities,
         "warnings": list(library_warnings),
+        "large_hierarchy_warning": large_hierarchy,
     }
     last_import_stats = stats
 
