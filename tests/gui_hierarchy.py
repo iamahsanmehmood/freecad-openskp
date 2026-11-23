@@ -107,6 +107,20 @@ def main():
         _check_bounds("merged", drawn, VISIBLE_BOUNDS_IN, mm)
         lines.append(f"merged: the view draws {drawn} mm, the same")
 
+        # MakeSolids (#21): the same model with each closed component a solid draws the
+        # same, and every solid's faces still carry one colour each.
+        solid_doc = App.newDocument("Solids")
+        importSKP.import_skp(path, solid_doc, merge=False, solids=True)
+        stats = importSKP.last_import_stats
+        assert stats["solids_built"] == 2, stats["solids_built"]
+        for name, colors in stats["object_face_colors"].items():
+            obj = solid_doc.getObject(name)
+            assert len(obj.ViewObject.DiffuseColor) == len(obj.Shape.Faces), name
+        view = _show(solid_doc, "solids")
+        drawn = _drawn_bounds(view)
+        _check_bounds("solids", drawn, VISIBLE_BOUNDS_IN, mm)
+        lines.append(f"solids: the view draws {drawn} mm, the same")
+
         _finish("PASS\n" + "\n".join(lines), 0)
     except BaseException:
         _finish("FAIL\n" + traceback.format_exc(), 1)
