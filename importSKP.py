@@ -480,6 +480,63 @@ def _make_face_shape(definition, face):
     return Part.makeCompound(triangles)
 
 
+_SEW_TOLERANCE_MM = 1e-4  # far below SketchUp's own vertex merge distance (~0.001 in)
+
+
+def _face_key(face):
+    c = face.CenterOfMass
+    return (round(c.x, 4), round(c.y, 4), round(c.z, 4), round(face.Area, 4))
+
+
+def _make_solids(faces, colors, stats):
+    """Sews ``faces`` (one definition's own faces, with one RGBA each in
+    ``colors``) and turns every closed shell into a solid (#21). Returns
+    ``(shapes, colors)``: the solids, then every face no closed shell
+    took, as they were, with the colours in the order of the result's
+    faces. Sewing rebuilds faces, so each colour follows its face by
+    centre of mass and area; a face that matches nothing keeps the default
+    colour."""
+    if not faces:
+        return [], []
+    color_by_key = {}
+    for face, rgba in zip(faces, colors):
+        color_by_key.setdefault(_face_key(face), rgba)
+    try:
+        sewn = Part.makeCompound([f.copy() for f in faces])
+        sewn.sewShape(_SEW_TOLERANCE_MM)
+    except Exception:
+        return faces, colors
+    solids = []
+    used = set()
+    for shell in sewn.Shells:
+        if not shell.isClosed():
+            continue
+        try:
+            solid = Part.Solid(shell)
+            if solid.Volume < 0:
+                solid.reverse()
+            if not solid.isValid() or solid.Volume <= 0:
+                continue
+        except Exception:
+            continue
+        solids.append(solid)
+        used.update(_face_key(f) for f in solid.Faces)
+    if not solids:
+        stats["faces_left_open"] = stats.get("faces_left_open", 0) + len(faces)
+        return faces, colors
+    out_shapes, out_colors = [], []
+    for solid in solids:
+        out_shapes.append(solid)
+        out_colors.extend(color_by_key.get(_face_key(f), _DEFAULT_FACE_RGBA) for f in solid.Faces)
+    for face, rgba in zip(faces, colors):
+        if _face_key(face) not in used:
+            out_shapes.append(face)
+            out_colors.append(rgba)
+            stats["faces_left_open"] = stats.get("faces_left_open", 0) + 1
+    stats["solids_built"] = stats.get("solids_built", 0) + len(solids)
+    return out_shapes, out_colors
+
+
 def _build_own_geometry(definition, model, stats, inherited_material_id):
     """One definition's OWN faces and loose-edge runs (not its nested
     instances), in its local space: ``(shapes, colors)``, where ``colors``
@@ -540,6 +597,11 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
             shapes.append(wire)
         else:
             stats["edge_runs_skipped"] += 1
+    if stats.get("make_solids"):
+        faces = [s for s in shapes if s.ShapeType == "Face"]
+        others = [s for s in shapes if s.ShapeType != "Face"]
+        solid_shapes, colors = _make_solids(faces, colors, stats)
+        shapes = solid_shapes + others
     return shapes, colors
 
 
@@ -650,6 +712,14 @@ _PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/OpenSKP"
 # The statistics of the most recent import_skp() call, for tests and scripts:
 # under headless freecadcmd there is no ViewObject to read colours back from.
 last_import_stats: dict = {}
+
+
+def _bool_preference(name):
+    """A Boolean preference of BaseApp/Preferences/Mod/OpenSKP, False when unset."""
+    try:
+        return App.ParamGet(_PARAM_PATH).GetBool(name, False)
+    except Exception:
+        return False
 
 
 def _merge_on_import_preference():
@@ -869,7 +939,8 @@ class _HierarchyImport:
         instances included), transformed and stored as one Part::Feature,
         built the same way as the merged import."""
         scratch = {"faces_built": 0, "faces_skipped": 0, "placements": 0,
-                   "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0}
+                   "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
+                   "make_solids": self.stats.get("make_solids", False)}
         buckets = _get_local_shape(child, self.model, scratch, self.merged_cache, frozenset(), None,
                                    child_material, "Layer0")
         shapes, colors = [], []
@@ -942,7 +1013,7 @@ class _HierarchyImport:
         return model_part
 
 
-def import_skp(filepath, doc=None, merge=None):
+def import_skp(filepath, doc=None, merge=None, solids=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
     Two layouts:
@@ -956,6 +1027,11 @@ def import_skp(filepath, doc=None, merge=None):
 
     ``merge=None`` reads the ``MergeOnImport`` preference (Tools > Edit
     parameters, BaseApp/Preferences/Mod/OpenSKP), which is False unless set.
+
+    ``solids=True`` sews each component's own faces and turns every closed
+    shell into a solid (#21); faces that close no volume stay faces. In
+    either layout. ``solids=None`` reads the ``MakeSolids`` preference
+    (False unless set).
 
     Each face's resolved color/opacity (its own paint, or whatever an
     ancestor group/component painted itself with, or a neutral default)
@@ -972,6 +1048,8 @@ def import_skp(filepath, doc=None, merge=None):
         doc = App.ActiveDocument or App.newDocument("SketchUpImport")
     if merge is None:
         merge = _merge_on_import_preference()
+    if solids is None:
+        solids = _bool_preference("MakeSolids")
 
     print(f"openskp: parsing {os.path.basename(filepath)} "
           "(can take a while for a large file - this is real work, not a hang)...")
@@ -985,6 +1063,7 @@ def import_skp(filepath, doc=None, merge=None):
         "faces_built": 0, "faces_skipped": 0, "placements": 0,
         "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
         "hidden_layers": 0, "merged": bool(merge),
+        "make_solids": bool(solids), "solids_built": 0, "faces_left_open": 0,
     }
     last_import_stats = stats
 
@@ -1022,6 +1101,9 @@ def import_skp(filepath, doc=None, merge=None):
         f"{stats.get('triangles_built', 0)} triangles; "
         f"{stats['edge_runs_built']} loose-edge runs, {stats['edge_runs_skipped']} skipped)"
     )
+    if solids:
+        common += (f"; {stats['solids_built']} solids, {stats['faces_left_open']} faces "
+                   "closing no volume left as faces")
     if merge:
         print(
             f"openskp: {built} unique definitions built in {time.time() - t0:.1f}s {common}, "
