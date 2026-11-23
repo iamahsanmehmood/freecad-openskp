@@ -735,13 +735,16 @@ def _make_solids(faces, colors, stats):
     for shell in sewn.Shells:
         if not shell.isClosed():
             continue
+        solid = None
         try:
-            solid = Part.Solid(shell)
-            if solid.Volume < 0:
-                solid.reverse()
-            if not solid.isValid() or solid.Volume <= 0:
-                continue
+            cand_solid = Part.Solid(shell)
+            if cand_solid.Volume < 0:
+                cand_solid.reverse()
+            if cand_solid.isValid() and cand_solid.Volume > 0:
+                solid = cand_solid
         except Exception:
+            solid = None
+        if solid is None:
             continue
         solids.append(solid)
         solid_face_colors.extend(_claim_source_face(f) for f in solid.Faces)
@@ -751,19 +754,21 @@ def _make_solids(faces, colors, stats):
     for idx, (face, rgba) in enumerate(zip(faces, colors)):
         if idx in used_indices or isinstance(face.Surface, Part.Plane):
             continue
+        closed_solid = None
         try:
             sh = Part.Shell([face.copy()])
-            if not sh.isClosed():
-                continue
-            solid = Part.Solid(sh)
-            if solid.Volume < 0:
-                solid.reverse()
-            if solid.isValid() and solid.Volume > 0:
-                solids.append(solid)
-                solid_face_colors.append(rgba)
-                used_indices.add(idx)
+            if sh.isClosed():
+                cand_solid = Part.Solid(sh)
+                if cand_solid.Volume < 0:
+                    cand_solid.reverse()
+                if cand_solid.isValid() and cand_solid.Volume > 0:
+                    closed_solid = cand_solid
         except Exception:
-            continue
+            closed_solid = None
+        if closed_solid is not None:
+            solids.append(closed_solid)
+            solid_face_colors.append(rgba)
+            used_indices.add(idx)
     if not solids:
         stats["faces_left_open"] = stats.get("faces_left_open", 0) + len(faces)
         return faces, colors
