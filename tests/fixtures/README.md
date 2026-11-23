@@ -32,9 +32,10 @@ through-hole (`SUArcCurve` full circles on the top and bottom perforated faces,
 `tests/test_curved_surfaces.py`. No private content.
 
 `cylinder_2017.skp`, `cylinder_2021.skp`, `frustum_2017.skp`, `frustum_2021.skp`,
-`smoothed_blob_2017.skp` and `smoothed_blob_2021.skp` were likewise built and
-saved through SketchUp's own C library as SketchUp 2017 and 2021 files (#18):
-a radius 5 in, height 12 in cylinder (26 faces), a `r1 = 6` in to `r2 = 3` in,
-height 4 in frustum (26 faces), and a closed asymmetric wavy blob with all 252
-edges marked soft and smooth (168 triangular faces, which must stay faceted).
-No private content.
+`sphere_2017.skp`, `sphere_2021.skp`, `smoothed_blob_2017.skp` and
+`smoothed_blob_2021.skp` were likewise built and saved through SketchUp's own C
+library as SketchUp 2017 and 2021 files (#18): a radius 5 in, height 12 in
+cylinder (26 faces), a `r1 = 6` in to `r2 = 3` in, height 4 in frustum (26
+faces), a radius 5 in sphere (128 smoothed faces, no `SUArcCurve` records), and
+a closed asymmetric wavy blob with all 252 edges marked soft and smooth (168
+triangular faces, which must stay faceted). No private content.

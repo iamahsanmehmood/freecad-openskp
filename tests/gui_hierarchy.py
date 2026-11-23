@@ -185,6 +185,19 @@ def main():
         _check_bounds("frustum", frustum_drawn, ((-6, 6), (-6, 6), (0, 4)), mm, tol=0.5)
         lines.append(f"frustum: the view draws {frustum_drawn} mm, 3-face conical solid")
 
+        sphere_path = os.path.join(TESTS, "fixtures", "sphere_2021.skp")
+        sphere_doc = App.newDocument("Sphere")
+        importSKP.import_skp(sphere_path, sphere_doc, merge=False, solids=True, curved_surfaces=True)
+        stats = importSKP.last_import_stats
+        assert stats["spheres_built"] == 1 and stats["solids_built"] == 1, stats
+        for name in stats["object_face_colors"]:
+            obj = sphere_doc.getObject(name)
+            assert len(obj.ViewObject.DiffuseColor) == len(obj.Shape.Faces), name
+        view = _show(sphere_doc, "sphere")
+        sphere_drawn = _drawn_bounds(view)
+        _check_bounds("sphere", sphere_drawn, ((-5, 5), (-5, 5), (-5, 5)), mm, tol=0.5)
+        lines.append(f"sphere: the view draws {sphere_drawn} mm, 1-face spherical solid")
+
         _finish("PASS\n" + "\n".join(lines), 0)
     except BaseException:
         _finish("FAIL\n" + traceback.format_exc(), 1)

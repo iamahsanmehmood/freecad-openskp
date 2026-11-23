@@ -67,6 +67,8 @@ EXPECTED = {
     "frustum_2021.skp": (26, 0, 0, 0, 1, 0),
     "smoothed_blob_2017.skp": (168, 0, 0, 0, 1, 0),
     "smoothed_blob_2021.skp": (168, 0, 0, 0, 1, 0),
+    "sphere_2017.skp": (128, 0, 0, 0, 1, 0),
+    "sphere_2021.skp": (128, 0, 0, 0, 1, 0),
 }
 
 
