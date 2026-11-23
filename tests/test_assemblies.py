@@ -186,8 +186,9 @@ def check_with_solids(path):
 
 
 def check_export(path):
-    """Exporting an imported assembly hierarchy writes the exact placed geometry
-    and skips both the hidden definitions group and any joints inside Joints."""
+    """Exporting an imported assembly hierarchy preserves component definitions
+    and instances while skipping both the hidden definitions group and any
+    joints inside Joints (#22, #28)."""
     import JointObject
     import openskp
 
@@ -208,14 +209,19 @@ def check_export(path):
 
         importSKP.export(list(doc.Objects), out_path)
         model = openskp.SkpFile.open(out_path).parse()
-        by_tag = {}
-        for face in model.root.faces.values():
-            by_tag[face.layer] = by_tag.get(face.layer, 0) + 1
-        total = sum(by_tag.values())
-        assert total == 69, f"exported {total} faces, expected 69: {by_tag}"
+        defs_by_name = {d.name: d for d in model.definitions.values() if d is not model.root}
+        assert sorted(defs_by_name) == ["Leg", "Leg (Red)", "Table", "Table (Red)"], sorted(defs_by_name)
+        assert len(model.root.instances) == 4 and len(model.root.faces) == 7
         assert sorted(layer.name for layer in model.layers) == ["Closed", "Layer0", "Open"]
-        assert sorted(by_tag.values()) == [19, 25, 25], by_tag
-        print("check_export: OK (69 faces across Closed/Layer0/Open, joints and definitions skipped)")
+
+        re_doc = App.newDocument()
+        try:
+            importSKP.import_skp(out_path, re_doc, merge=True)
+            per_tag = sorted(len(o.Shape.Faces) for o in re_doc.Objects if hasattr(o, "Shape"))
+            assert sum(per_tag) == 69 and per_tag == [19, 25, 25], per_tag
+        finally:
+            App.closeDocument(re_doc.Name)
+        print("check_export: OK (4 definitions + 4 root instances -> 69 placed faces across Closed/Layer0/Open, joints skipped)")
     finally:
         App.closeDocument(doc.Name)
         if os.path.exists(out_path):
@@ -223,8 +229,9 @@ def check_export(path):
 
 
 def check_export_standalone_assembly():
-    """Exporting a top-level FreeCAD Assembly::AssemblyObject directly follows
-    its links and placement and skips its JointGroup."""
+    """Exporting a top-level FreeCAD Assembly::AssemblyObject directly exports
+    its linked part as a component definition, places its links with the
+    assembly + link transforms, and skips its JointGroup."""
     import AssemblyApp  # noqa: F401
     import openskp
 
@@ -255,12 +262,24 @@ def check_export_standalone_assembly():
 
         importSKP.export([asm], out_path)
         model = openskp.SkpFile.open(out_path).parse()
-        assert len(model.root.faces) == 12, len(model.root.faces)
-        xs = {round(v.x, 3) for v in model.root.vertices.values()}
-        ys = {round(v.y, 3) for v in model.root.vertices.values()}
-        assert xs == {10.0, 11.0}, xs
-        assert ys == {0.0, 1.0, 2.0, 3.0}, ys
-        print("check_export_standalone_assembly: OK (12 faces at exact assembly + link coordinates)")
+        defs = [d for d in model.definitions.values() if d is not model.root]
+        assert len(defs) == 1 and defs[0].name == "LeafPart" and len(defs[0].faces) == 6, defs
+        assert len(model.root.instances) == 2 and len(model.root.faces) == 0
+        translations = sorted((round(i.matrix[9], 3), round(i.matrix[10], 3), round(i.matrix[11], 3)) for i in model.root.instances)
+        assert translations == [(10.0, 0.0, 0.0), (10.0, 2.0, 0.0)], translations
+
+        re_doc = App.newDocument()
+        try:
+            importSKP.import_skp(out_path, re_doc, merge=True)
+            shapes = [o.Shape for o in re_doc.Objects if hasattr(o, "Shape")]
+            assert sum(len(s.Faces) for s in shapes) == 12
+            xs = {round(v.X / MM, 3) for s in shapes for v in s.Vertexes}
+            ys = {round(v.Y / MM, 3) for s in shapes for v in s.Vertexes}
+            assert xs == {10.0, 11.0}, xs
+            assert ys == {0.0, 1.0, 2.0, 3.0}, ys
+        finally:
+            App.closeDocument(re_doc.Name)
+        print("check_export_standalone_assembly: OK (1 definition + 2 instances at exact assembly + link coordinates)")
     finally:
         App.closeDocument(doc.Name)
         if os.path.exists(out_path):

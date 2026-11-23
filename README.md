@@ -143,16 +143,18 @@ same gap already found and fixed in the
 [Blender addon](https://github.com/iamahsanmehmood/blender-openskp).
 
 **Export** (File -> Export, or File -> Save As with a .skp extension)
-flattens the selected FreeCAD objects' faces (global placement
-resolved, so translated/nested objects land in the right world
-position) into a new .skp file - each face's outer boundary and any
-holes preserved. An imported hierarchy can be exported as it is: parts,
-tag groups and links are followed down to the geometry they show, with
-each link's placement and scale, and the hidden definitions are not
-written a second time. Export does not write components yet, so
-everything lands flat at the file's root, on the tags the import
-recorded. Round-trip-verified: exported coordinates match the
-original geometry exactly (see tests/test_export.py).
+writes selected FreeCAD objects back to a native `.skp` file, preserving
+component hierarchy (#28): each definition (`App::Part` or
+`Assembly::AssemblyObject`) reached through `App::Link` becomes one
+SketchUp component definition in bottom-up order, and each `App::Link`
+becomes a component instance carrying its placement, non-uniform scale,
+mirroring (`matrix3x3`) and `SketchUpLayer` tag, while hidden unplaced
+definitions are skipped. Plain objects outside links (such as merged-import
+compounds, sheared copies, or standalone FreeCAD shapes) stay loose
+geometry at the file's root, keeping flat export as a fallback. Each
+face's outer boundary and any holes are preserved, and exported world
+geometry matches the flat export (see `tests/test_export.py` and
+`tests/test_hierarchy.py`).
 
 **Layer export**: each exported object's own `Label` becomes its
 SketchUp layer/tag. This is an exact match for what layers-import

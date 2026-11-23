@@ -202,33 +202,230 @@ def check_link_placements(path):
         App.closeDocument(doc.Name)
 
 
+def _save_export_sample(src_path, out_name):
+    out_dir = os.environ.get("SKP_EXPORT_OUT")
+    if out_dir:
+        import shutil
+
+        os.makedirs(out_dir, exist_ok=True)
+        shutil.copyfile(src_path, os.path.join(out_dir, out_name))
+
+
+def _face_signature(shapes):
+    """Face count, total face area, and face-boundary vertex set (excluding
+    loose-edge wires, which export does not write)."""
+    faces = [f for s in shapes for f in s.Faces]
+    points = sorted({(round(v.X, 2), round(v.Y, 2), round(v.Z, 2)) for f in faces for v in f.Vertexes})
+    return len(faces), round(sum(f.Area for f in faces), 2), points
+
+
+def _flat_export_file(export_list, filename):
+    """Writes ``export_list`` flattened through ``_export_leaves`` (the pre-#28
+    flat export) so tests can check exact geometry parity against it."""
+    import openskp
+
+    b = openskp.create()
+    leaves = list(importSKP._export_leaves(export_list))
+    layers = {}
+    for _obj, _shape, _tr, layer in leaves:
+        if layer and layer != "Layer0" and layer not in layers:
+            layers[layer] = b.add_layer(layer)
+    stats = {"faces_written": 0, "faces_skipped": 0}
+    for _obj, shape, tr, layer in leaves:
+        importSKP._add_shape_faces(b, shape, tr, stats, layers.get(layer), None)
+    with open(filename, "wb") as f:
+        f.write(b.to_bytes())
+
+
+def _fold_m13(m13):
+    s = m13[12] if len(m13) > 12 else 1.0
+    return tuple(round(v * s, 6) for v in m13[:12])
+
+
 def check_export(path):
-    """Exporting the imported hierarchy writes the geometry it shows, with the
-    tags the import recorded, and nothing from the hidden definitions."""
+    """Exporting the imported hierarchy preserves component definitions and
+    instances (including nested links, non-uniform scale, mirroring and tags),
+    keeps sheared copies and root faces as loose geometry, omits unplaced
+    definitions, and matches the flat export's world geometry (#28)."""
     import openskp
 
     doc = App.newDocument()
     out_path = os.path.join(FIXTURES_DIR, "_hierarchy_export_tmp.skp")
     try:
         importSKP.import_skp(path, doc, merge=False)
+        want_sig = _signature(_world_shapes(doc, importSKP.last_import_stats))
         # Selecting the model part and everything in it (as Ctrl+A would) must not
         # write anything twice, and the definitions group must add nothing.
         importSKP.export(list(doc.Objects), out_path)
+        _save_export_sample(out_path, "synthetic_roundtrip.skp")
         model = openskp.SkpFile.open(out_path).parse()
-        by_tag = {}
-        for face in model.root.faces.values():
-            by_tag[face.layer] = by_tag.get(face.layer, 0) + 1
-        total = sum(by_tag.values())
-        assert total == 69, f"exported {total} faces, expected 69 (1 + 25 + 25 + 3 x 6): {by_tag}"
-        assert sorted(layer.name for layer in model.layers) == ["Closed", "Layer0", "Open"], [
-            layer.name for layer in model.layers]
-        assert sorted(by_tag.values()) == [19, 25, 25], by_tag
-        print(f"check_export: OK ({total} faces, tags {sorted(layer.name for layer in model.layers)}, "
-              f"{sorted(by_tag.values())} faces per tag)")
+
+        defs_by_name = {d.name: d for d in model.definitions.values() if d is not model.root}
+        assert sorted(defs_by_name) == ["Leg", "Leg (Red)", "Table", "Table (Red)"], sorted(defs_by_name)
+        assert len(defs_by_name["Leg"].faces) == 6 and len(defs_by_name["Leg"].instances) == 0
+        assert len(defs_by_name["Leg (Red)"].faces) == 6 and len(defs_by_name["Leg (Red)"].instances) == 0
+        for tname, leg_name in (("Table", "Leg"), ("Table (Red)", "Leg (Red)")):
+            tdef = defs_by_name[tname]
+            assert len(tdef.faces) == 1 and len(tdef.instances) == 4, (tname, len(tdef.faces), len(tdef.instances))
+            assert sorted(i.name for i in tdef.instances) == ["Leg 1", "Leg 2", "Leg 3", "Leg 4"]
+            assert {model.definitions[i.ref_idx].name for i in tdef.instances} == {leg_name}
+            got_xy = sorted((round(i.matrix[9], 3), round(i.matrix[10], 3)) for i in tdef.instances)
+            assert got_xy == [(0.0, 0.0), (0.0, 18.0), (38.0, 0.0), (38.0, 18.0)], got_xy
+
+        # Root loose faces: 1 root quad + 6 faces from the sheared copy (7 total).
+        assert len(model.root.faces) == 7, len(model.root.faces)
+        assert sorted(layer.name for layer in model.layers) == ["Closed", "Layer0", "Open"]
+
+        root_insts = {i.name: i for i in model.root.instances}
+        assert sorted(root_insts) == ["Mirrored leg", "Scaled leg", "Table closed", "Table open"], sorted(root_insts)
+        assert model.definitions[root_insts["Table closed"].ref_idx].name == "Table"
+        assert root_insts["Table closed"].layer == "Closed"
+        assert model.definitions[root_insts["Table open"].ref_idx].name == "Table (Red)"
+        assert root_insts["Table open"].layer == "Open"
+        assert _fold_m13(root_insts["Table open"].matrix)[9:12] == (100.0, 0.0, 0.0)
+
+        for name, (m, t) in TOP_LEVEL_LEGS.items():
+            inst = root_insts[name]
+            assert model.definitions[inst.ref_idx].name == "Leg"
+            assert inst.layer in ("", "Layer0"), inst.layer
+            assert _fold_m13(inst.matrix) == tuple(float(v) for v in (*m, *t)), (name, _fold_m13(inst.matrix))
+
+        # Re-importing the exported .skp reproduces the exact 69 placed faces,
+        # vertex set, total area, and [19, 25, 25] per-tag face counts.
+        re_doc = App.newDocument()
+        try:
+            importSKP.import_skp(out_path, re_doc, merge=True)
+            re_shapes = [o.Shape.copy() for o in re_doc.Objects if hasattr(o, "Shape")]
+            got_sig = _signature(re_shapes)
+            # Synthetic model has no loose edges, so face count, area, vertices, and edge count/length match.
+            assert got_sig[0] == 69 and got_sig[:3] == want_sig[:3], (got_sig, want_sig)
+            per_tag = sorted(len(o.Shape.Faces) for o in re_doc.Objects if hasattr(o, "Shape"))
+            assert per_tag == [19, 25, 25], per_tag
+        finally:
+            App.closeDocument(re_doc.Name)
+        print("check_export: OK (4 definitions, 12 instances, 7 loose faces, 69 placed faces across Closed/Layer0/Open)")
     finally:
         App.closeDocument(doc.Name)
         if os.path.exists(out_path):
             os.remove(out_path)
+
+
+def check_fixture_component_round_trip():
+    """Round-trips nested components and real component fixtures through
+    import -> export -> re-parse, checking definitions, instance counts,
+    placements, tags, and geometry equivalence with the flat export (#28)."""
+    import openskp
+
+    # 1. Three-level nested component model (Bolt -> Bracket -> Frame) with
+    #    non-uniform scale, mirroring, and tags on both nested and root links.
+    nested_src = os.path.join(FIXTURES_DIR, "_nested_roundtrip_src.skp")
+    nested_out = os.path.join(FIXTURES_DIR, "_nested_roundtrip_out.skp")
+    b = openskp.create()
+    tag_hw = b.add_layer("Hardware")
+    tag_frame = b.add_layer("Framing")
+    with b.add_component_definition("Bolt") as bolt:
+        bolt.add_face([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)])
+    with b.add_component_definition("Bracket") as bracket:
+        bracket.add_face([(0, 0, 0), (6, 0, 0), (6, 4, 0), (0, 4, 0)])
+        bracket.add_instance(bolt, name="B1", translation=(1, 1, 0), layer=tag_hw)
+        bracket.add_instance(
+            bolt, name="B2", matrix3x3=(0, -2, 0, 1.5, 0, 0, 0, 0, 1), translation=(5, 3, 0), layer=tag_hw
+        )
+    with b.add_component_definition("Frame") as frame:
+        frame.add_face([(0, 0, 0), (40, 0, 0), (40, 2, 0), (0, 2, 0)])
+        frame.add_instance(bracket, name="LeftBracket", translation=(0, 2, 0))
+        frame.add_instance(
+            bracket, name="RightBracket", matrix3x3=(-1, 0, 0, 0, 1, 0, 0, 0, 1), translation=(40, 2, 0)
+        )
+    b.add_instance(frame, name="Bay 1", translation=(0, 0, 0), layer=tag_frame)
+    b.add_instance(frame, name="Bay 2", translation=(60, 0, 0), layer=tag_frame)
+    with open(nested_src, "wb") as f:
+        f.write(b.to_bytes())
+    _save_export_sample(nested_src, "nested_original.skp")
+
+    try:
+        for src_path, sample_name in (
+            (nested_src, "nested_roundtrip.skp"),
+            (os.path.join(FIXTURES_DIR, "capilla_quiroz_v17.skp"), "capilla_quiroz_v17_roundtrip.skp"),
+            (os.path.join(FIXTURES_DIR, "instance_scale_term_2021.skp"), "instance_scale_term_2021_roundtrip.skp"),
+            (os.path.join(FIXTURES_DIR, "instance_scale_term_v6.skp"), "instance_scale_term_v6_roundtrip.skp"),
+        ):
+            orig = openskp.SkpFile.open(src_path).parse()
+            orig_defs = {
+                d.name: (len(d.faces), len(d.instances))
+                for d in orig.definitions.values()
+                if d is not orig.root and (d.faces or d.instances)
+            }
+            orig_root_insts = sorted(
+                (
+                    i.name,
+                    orig.definitions[i.ref_idx].name,
+                    i.layer or "Layer0",
+                    _fold_m13(i.matrix),
+                )
+                for i in orig.root.instances
+            )
+
+            flat_out = os.path.join(FIXTURES_DIR, "_nested_flat_out.skp")
+            doc = App.newDocument()
+            try:
+                importSKP.import_skp(src_path, doc, merge=False)
+                _flat_export_file(list(doc.Objects), flat_out)
+                importSKP.export(list(doc.Objects), nested_out)
+                _save_export_sample(nested_out, sample_name)
+            finally:
+                App.closeDocument(doc.Name)
+
+            rt = openskp.SkpFile.open(nested_out).parse()
+            rt_defs = {
+                d.name: (len(d.faces), len(d.instances))
+                for d in rt.definitions.values()
+                if d is not rt.root
+            }
+            assert rt_defs == orig_defs, f"{sample_name}: defs {rt_defs} != {orig_defs}"
+
+            rt_root_insts = sorted(
+                (
+                    i.name,
+                    rt.definitions[i.ref_idx].name,
+                    i.layer or "Layer0",
+                    _fold_m13(i.matrix),
+                )
+                for i in rt.root.instances
+            )
+            assert len(rt_root_insts) == len(orig_root_insts), (sample_name, len(rt_root_insts), len(orig_root_insts))
+            for (rn, rd, rl, rm), (on, od, ol, om) in zip(rt_root_insts, orig_root_insts):
+                assert (rn, rd, rl) == (on, od, ol), (sample_name, (rn, rd, rl), (on, od, ol))
+                assert all(abs(a - b) < 1e-5 for a, b in zip(rm, om)), (sample_name, rm, om)
+
+            # World-space face count, area, and vertices must match the flat export.
+            flat_doc = App.newDocument()
+            re_doc = App.newDocument()
+            try:
+                importSKP.import_skp(flat_out, flat_doc, merge=True)
+                importSKP.import_skp(nested_out, re_doc, merge=True)
+                flat_face_sig = _face_signature([o.Shape for o in flat_doc.Objects if hasattr(o, "Shape")])
+                rt_face_sig = _face_signature([o.Shape for o in re_doc.Objects if hasattr(o, "Shape")])
+                assert rt_face_sig[0] == flat_face_sig[0], (sample_name, rt_face_sig[0], flat_face_sig[0])
+                assert abs(rt_face_sig[1] - flat_face_sig[1]) <= 1e-5 * max(1.0, flat_face_sig[1]), (
+                    sample_name, rt_face_sig[1], flat_face_sig[1]
+                )
+                assert rt_face_sig[2] == flat_face_sig[2], (
+                    sample_name,
+                    sorted(set(rt_face_sig[2]) - set(flat_face_sig[2]))[:5],
+                    sorted(set(flat_face_sig[2]) - set(rt_face_sig[2]))[:5],
+                )
+            finally:
+                App.closeDocument(flat_doc.Name)
+                App.closeDocument(re_doc.Name)
+                if os.path.exists(flat_out):
+                    os.remove(flat_out)
+            print(f"check_fixture_component_round_trip({sample_name}): OK ({len(rt_defs)} defs, "
+                  f"{len(rt_root_insts)} root instances, {rt_face_sig[0]} placed faces)")
+    finally:
+        for p in (nested_src, nested_out):
+            if os.path.exists(p):
+                os.remove(p)
 
 
 def check_merge_preference(path):
@@ -343,6 +540,7 @@ def _main():
         check_merge_preference(synthetic)
     finally:
         os.remove(synthetic)
+    check_fixture_component_round_trip()
     check_large_hierarchy_warning()
     checked = 0
     for name in sorted(os.listdir(FIXTURES_DIR)):
