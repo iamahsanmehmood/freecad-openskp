@@ -64,11 +64,12 @@ polygon boundaries by default; with curved_surfaces=True (or FitCurvedSurfaces),
 analytic circles and circular arcs bounding planar faces become real FreeCAD
 circle/arc edges too (see _make_curved_loop_wire).
 
-Component hierarchy (the default; see _HierarchyImport): one App::Part per
-component definition and one App::Link per placement, the way SketchUp
-organises the model (freecad-openskp#5). The merged layout described in the
-rest of this docstring is kept for very large models (merge=True or the
-MergeOnImport preference); both show the same geometry.
+Component hierarchy (the default below 1,000 definitions; see _HierarchyImport):
+one App::Part per component definition and one App::Link per placement, the way
+SketchUp organises the model (freecad-openskp#5). Models with 1,000 or more
+definitions import in the merged layout automatically unless the user explicitly
+chose the hierarchy via MergeOnImport=false or merge=False (#38); both layouts
+show the same geometry.
 
 Layers in the merged layout (SketchUp calls them "tags"): unlike materials, which fit onto
 the existing single-compound design as one ViewObject.DiffuseColor per
@@ -1706,13 +1707,33 @@ def _bool_preference(name):
 
 
 def _merge_on_import_preference():
-    """The ``MergeOnImport`` preference (Tools > Edit parameters >
-    BaseApp/Preferences/Mod/OpenSKP), False when unset: by default an import
-    keeps SketchUp's component hierarchy."""
+    """Returns the ``MergeOnImport`` Boolean preference under
+    BaseApp/Preferences/Mod/OpenSKP as ``True`` or ``False`` when explicitly
+    set by the user, or ``None`` when the key is not set (#38)."""
     try:
-        return App.ParamGet(_PARAM_PATH).GetBool("MergeOnImport", False)
+        params = App.ParamGet(_PARAM_PATH)
+        contents = params.GetContents() or ()
+        for kind, key, value in contents:
+            if key == "MergeOnImport" and kind == "Boolean":
+                return bool(value)
+        if hasattr(params, "GetBools") and "MergeOnImport" in (params.GetBools() or ()):
+            return bool(params.GetBool("MergeOnImport", False))
+        return None
     except Exception:
-        return False
+        return None
+
+
+def _resolve_import_layout(merge_arg, num_definitions, assemblies_requested=False):
+    """Returns ``(merge_bool, layout_reason)`` where ``layout_reason`` is
+    ``'argument'``, ``'preference'``, ``'assemblies'`` or ``'automatic'`` (#38)."""
+    if merge_arg is not None:
+        return bool(merge_arg), "argument"
+    pref = _merge_on_import_preference()
+    if pref is not None:
+        return bool(pref), "preference"
+    if assemblies_requested:
+        return False, "assemblies"
+    return num_definitions >= _LARGE_HIERARCHY_DEFINITION_THRESHOLD, "automatic"
 
 
 def _assembly_available():
@@ -2109,15 +2130,21 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
 
     Two layouts:
 
-    - **Component hierarchy** (the default, ``merge=False``): one object per
-      component definition and a link per placement, the way SketchUp
-      organises the model; see _HierarchyImport.
-    - **Merged** (``merge=True``): one Part::Feature compound per SketchUp
+    - **Component hierarchy** (the default below 1,000 definitions, or when
+      ``merge=False``): one object per component definition and a link per
+      placement, the way SketchUp organises the model; see _HierarchyImport.
+    - **Merged** (automatic at 1,000+ definitions when ``MergeOnImport`` is
+      unset, or when ``merge=True``): one Part::Feature compound per SketchUp
       tag; see _import_merged. Lighter for a very large model, where
       thousands of definitions would each become an object.
 
-    ``merge=None`` reads the ``MergeOnImport`` preference (Tools > Edit
-    parameters, BaseApp/Preferences/Mod/OpenSKP), which is False unless set.
+    ``merge=None`` checks the ``MergeOnImport`` preference (Tools > Edit
+    parameters, BaseApp/Preferences/Mod/OpenSKP): an explicit ``true`` or
+    ``false`` always wins; when unset, models below 1,000 definitions (or when
+    assemblies are requested via ``ImportAssemblies`` or ``assemblies=True``)
+    keep the component hierarchy and models with 1,000 or more definitions
+    switch to the merged layout automatically (#38). An explicit ``merge=True``
+    or ``merge=False`` argument always wins over all of these.
 
     ``solids=True`` sews each component's own faces and turns every closed
     shell into a solid (#21); faces that close no volume stay faces. In
@@ -2152,14 +2179,36 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
 
     if doc is None:
         doc = App.ActiveDocument or App.newDocument("SketchUpImport")
-    if merge is None:
-        merge = _merge_on_import_preference()
     if solids is None:
         solids = _bool_preference("MakeSolids")
     if assemblies is None:
         assemblies = _bool_preference("ImportAssemblies")
     if curved_surfaces is None:
         curved_surfaces = _bool_preference("FitCurvedSurfaces")
+
+    print(f"openskp: parsing {os.path.basename(filepath)} "
+          "(can take a while for a large file - this is real work, not a hang)...")
+    t0 = time.time()
+    with _capture_library_warnings() as library_warnings:
+        skp = openskp.SkpFile.open(filepath)
+        model = skp.parse()
+    unread_root_entities = _reconcile_partial_read_warnings(model, filepath, library_warnings)
+    for message in library_warnings:
+        App.Console.PrintWarning(f"openskp: {message}\n")
+
+    num_definitions = len(model.definitions)
+    merge, layout_reason = _resolve_import_layout(
+        merge, num_definitions, assemblies_requested=bool(assemblies)
+    )
+    layout_name = "merged" if merge else "hierarchy"
+    auto_merged = bool(merge and layout_reason == "automatic")
+    if auto_merged:
+        App.Console.PrintMessage(
+            f"openskp: {os.path.basename(filepath)} has {num_definitions} component/group "
+            "definitions; imported in the merged layout automatically for speed. To keep the "
+            "component hierarchy instead, set MergeOnImport to false (Tools > Edit parameters > "
+            "BaseApp/Preferences/Mod/OpenSKP) or pass merge=False\n"
+        )
 
     use_assemblies = False
     if assemblies and not merge:
@@ -2171,19 +2220,10 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
                 "importing components as App::Part instead\n"
             )
 
-    print(f"openskp: parsing {os.path.basename(filepath)} "
-          "(can take a while for a large file - this is real work, not a hang)...")
-    t0 = time.time()
-    with _capture_library_warnings() as library_warnings:
-        skp = openskp.SkpFile.open(filepath)
-        model = skp.parse()
-    unread_root_entities = _reconcile_partial_read_warnings(model, filepath, library_warnings)
-    for message in library_warnings:
-        App.Console.PrintWarning(f"openskp: {message}\n")
-    large_hierarchy = not merge and len(model.definitions) >= _LARGE_HIERARCHY_DEFINITION_THRESHOLD
+    large_hierarchy = not merge and num_definitions >= _LARGE_HIERARCHY_DEFINITION_THRESHOLD
     if large_hierarchy:
         App.Console.PrintWarning(
-            f"openskp: {os.path.basename(filepath)} has {len(model.definitions)} component/group "
+            f"openskp: {os.path.basename(filepath)} has {num_definitions} component/group "
             "definitions; the component hierarchy creates ~8+ FreeCAD objects per definition, "
             "which can use several gigabytes in the GUI. For faster, lighter imports on large "
             "models, set MergeOnImport (Tools > Edit parameters > BaseApp/Preferences/Mod/OpenSKP) "
@@ -2196,6 +2236,8 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         "faces_built": 0, "faces_skipped": 0, "placements": 0,
         "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
         "hidden_layers": 0, "merged": bool(merge),
+        "layout": layout_name, "layout_reason": layout_reason,
+        "auto_merged": auto_merged,
         "make_solids": bool(solids), "solids_built": 0, "faces_left_open": 0,
         "import_assemblies": bool(assemblies), "assemblies": 0,
         "fit_curved_surfaces": bool(curved_surfaces), "face_arcs_built": 0,
