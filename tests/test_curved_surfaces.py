@@ -153,27 +153,27 @@ def check_plate_with_hole(fixture_name):
 def check_ellipse_stays_polygon():
     """A non-uniformly scaled ArcCurve (|x_axis| != |y_axis|) is an ellipse, not
     a circle: its face boundary stays polygonal."""
-    import openskp
+    from openskp.model import ArcCurve, Definition, Edge, Face, SkpModel, Vertex
 
     n = 24
     rx, ry = 10.0, 5.0
     verts = {
-        i: openskp.Vertex(id=i, x=rx * math.cos(2 * math.pi * i / n), y=ry * math.sin(2 * math.pi * i / n), z=0.0)
+        i: Vertex(id=i, x=rx * math.cos(2 * math.pi * i / n), y=ry * math.sin(2 * math.pi * i / n), z=0.0)
         for i in range(n)
     }
     edges = {
-        i: openskp.Edge(id=i, v1_id=i, v2_id=(i + 1) % n, curve_id=1)
+        i: Edge(id=i, v1_id=i, v2_id=(i + 1) % n, curve_id=1)
         for i in range(n)
     }
     loop = [(i, 1) for i in range(n)]
-    defn = openskp.Definition(
+    defn = Definition(
         id=0,
         name="EllipseDef",
         vertices=verts,
         edges=edges,
-        faces={1: openskp.Face(id=1, loops=[loop], normal=(0.0, 0.0, 1.0))},
+        faces={1: Face(id=1, loops=[loop], normal=(0.0, 0.0, 1.0))},
         arcs={
-            1: openskp.ArcCurve(
+            1: ArcCurve(
                 center=(0.0, 0.0, 0.0),
                 normal=(0.0, 0.0, 1.0),
                 x_axis=(rx, 0.0, 0.0),
@@ -183,7 +183,7 @@ def check_ellipse_stays_polygon():
             )
         },
     )
-    model = openskp.SkpModel(root=defn)
+    model = SkpModel(root=defn)
     stats = {
         "faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0,
         "edge_runs_skipped": 0, "arcs_built": 0,
