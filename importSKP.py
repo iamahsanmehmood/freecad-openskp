@@ -1903,7 +1903,7 @@ def _add_shape_faces(builder, shape, transform, stats, layer, material_handles):
     mirrored = transform.determinant() < 0
     for i, face in enumerate(shape.Faces):
         material = material_handles[i] if material_handles else None
-        if not isinstance(face.Surface, Part.Plane):
+        if isinstance(face.Surface, (Part.Cylinder, Part.Cone, Part.Sphere, Part.Toroid)):
             try:
                 tol = max(0.05, 0.01 * face.BoundBox.DiagonalLength)
                 verts_mm, tris = face.tessellate(tol)
