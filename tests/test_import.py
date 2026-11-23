@@ -59,6 +59,14 @@ EXPECTED = {
     # own library as 2017 and 2021; see tests/test_curved_surfaces.py.
     "plate_with_hole_2017.skp": (30, 0, 0, 0, 1, 0),
     "plate_with_hole_2021.skp": (30, 0, 0, 0, 1, 0),
+    # curved-surface fixtures (#18) built and saved via SketchUp's own C library as 2017 and 2021:
+    # cylinder (r=5, h=12), frustum (r1=6, r2=3, h=4), and an asymmetric smoothed blob (168 triangles).
+    "cylinder_2017.skp": (26, 0, 0, 0, 1, 0),
+    "cylinder_2021.skp": (26, 0, 0, 0, 1, 0),
+    "frustum_2017.skp": (26, 0, 0, 0, 1, 0),
+    "frustum_2021.skp": (26, 0, 0, 0, 1, 0),
+    "smoothed_blob_2017.skp": (168, 0, 0, 0, 1, 0),
+    "smoothed_blob_2021.skp": (168, 0, 0, 0, 1, 0),
 }
 
 

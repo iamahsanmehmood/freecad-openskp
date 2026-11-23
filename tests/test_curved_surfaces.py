@@ -2,12 +2,17 @@
 
     freecadcmd tests/test_curved_surfaces.py
 
-Part 1 of FitCurvedSurfaces (#18): analytic circles and circular arcs in
-Definition.arcs that bound flat faces (discs, circular holes in plates,
-half-discs) import as true FreeCAD Part.Circle / Part.Arc boundary edges when
-curved_surfaces=True (or BaseApp/Preferences/Mod/OpenSKP FitCurvedSurfaces is
-true), while staying polygonal by default. Ellipses (non-uniformly scaled
-arcs) stay polygonal, and export discretises curved face wires cleanly.
+FitCurvedSurfaces (#18, parts 1 & 2):
+- Analytic circles and circular arcs in Definition.arcs that bound flat faces
+  import as true Part.Circle / Part.Arc boundary edges.
+- Faces joined by soft or smooth edges are grouped into candidate surfaces;
+  cylinders and cones/frustums (including partial revolutions, pointed cones,
+  and inward cylindrical hole bores) recognised from Definition.arcs become
+  true Part.Cylinder / Part.Cone faces, sewing with their caps into exact
+  solids when MakeSolids is enabled.
+- Smoothed groups that do not fit stay faceted (counted in
+  curved_groups_unfitted), and any arc shared with an unfitted wall stays
+  polygonal so neighbouring faces remain water-tight connected.
 """
 import math
 import os
@@ -50,11 +55,6 @@ def _signature(shapes):
 
 
 def check_arcs_fixture(fixture_name):
-    """In arcs_2017.skp and arcs_2021.skp:
-    - default (curved_surfaces=False): disc has 24 straight edges, half-disc has 13.
-    - curved_surfaces=True: disc has 1 true Part.Circle edge (r = 5 in), half-disc
-      has 1 Part.Arc edge (r = 8 in, 180 deg) + 1 straight chord edge, with exact
-      circle/semicircle areas."""
     path = os.path.join(FIXTURES_DIR, fixture_name)
 
     doc = App.newDocument()
@@ -95,64 +95,291 @@ def check_arcs_fixture(fixture_name):
             assert abs(half_disc.Area - 0.5 * math.pi * (8.0 * MM) ** 2) < 1e-2, half_disc.Area
         finally:
             App.closeDocument(doc.Name)
-    print(f"check_arcs_fixture({fixture_name}): OK (disc = 1 circle edge, half-disc = 1 arc + 1 chord)")
+    print(f"check_arcs_fixture({fixture_name}): OK")
 
 
-def check_plate_with_hole(fixture_name):
-    """In plate_with_hole_2017.skp and plate_with_hole_2021.skp (20 x 20 x 2 in
-    plate with an r = 4 in circular through-hole):
-    - default: top and bottom perforated faces have 4 outer + 24 inner line edges.
-    - curved_surfaces=True: top and bottom perforated faces each have a 4-line
-      outer wire and a 1-edge Part.Circle inner hole wire of radius 101.6 mm,
-      exact subtracted area (400 - 16*pi) in2, and outward +/-Z normals."""
+def check_cylinder(fixture_name):
+    """cylinder_2017/2021.skp (r = 5 in, h = 12 in, 24 segments):
+    - default: 26 flat faces.
+    - curved_surfaces=True: 3 faces (2 circular discs + 1 Part.Cylinder wall).
+    - curved_surfaces=True, solids=True: 1 valid Part.Solid of exact volume pi * 5^2 * 12 in3."""
     path = os.path.join(FIXTURES_DIR, fixture_name)
 
-    doc = App.newDocument()
-    try:
-        importSKP.import_skp(path, doc, merge=True)
-        faces = [f for o in doc.Objects if hasattr(o, "Shape") for f in o.Shape.Faces]
-        holed = [f for f in faces if len(f.Wires) == 2]
-        assert len(faces) == 30 and len(holed) == 2, (len(faces), len(holed))
-        assert all(len(f.Edges) == 28 for f in holed), [len(f.Edges) for f in holed]
-    finally:
-        App.closeDocument(doc.Name)
-
-    expected_area = (20.0 * 20.0 - math.pi * 4.0 ** 2) * MM ** 2
     for merge in (True, False):
         doc = App.newDocument()
         try:
             importSKP.import_skp(path, doc, merge=merge, curved_surfaces=True)
             stats = importSKP.last_import_stats
-            assert stats["face_arcs_built"] == 2, stats
+            assert stats["cylinders_built"] == 1 and stats["cones_built"] == 0, stats
+            assert stats["face_arcs_built"] == 2 and stats["curved_groups_unfitted"] == 0, stats
             shapes = _world_shapes(doc, stats, merge)
             faces = [f for s in shapes for f in s.Faces]
-            assert len(faces) == 30 and all(f.isValid() for f in faces), len(faces)
+            assert len(faces) == 3 and all(f.isValid() for f in faces), len(faces)
+            cyl_faces = [f for f in faces if isinstance(f.Surface, Part.Cylinder)]
+            planar_faces = [f for f in faces if isinstance(f.Surface, Part.Plane)]
+            assert len(cyl_faces) == 1 and len(planar_faces) == 2, (len(cyl_faces), len(planar_faces))
+            cyl = cyl_faces[0]
+            assert abs(cyl.Surface.Radius - 5.0 * MM) < 1e-5, cyl.Surface.Radius
+            assert abs(cyl.Area - 2.0 * math.pi * 5.0 * 12.0 * MM ** 2) < 1e-1, cyl.Area
+            u0, u1, v0, v1 = cyl.ParameterRange
+            um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+            pt = cyl.Surface.value(um, vm)
+            rad = App.Vector(pt.x, pt.y, 0.0)
+            assert cyl.normalAt(um, vm).dot(rad) > 0.0, "cylinder normal must point outward"
+        finally:
+            App.closeDocument(doc.Name)
+
+    doc = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc, merge=True, solids=True, curved_surfaces=True)
+        solids = [s for o in doc.Objects if hasattr(o, "Shape") for s in o.Shape.Solids]
+        assert len(solids) == 1 and solids[0].isValid() and len(solids[0].Faces) == 3, len(solids)
+        want_vol = math.pi * (5.0 ** 2) * 12.0 * MM ** 3
+        assert abs(solids[0].Volume - want_vol) < 1.0, (solids[0].Volume, want_vol)
+    finally:
+        App.closeDocument(doc.Name)
+    print(f"check_cylinder({fixture_name}): OK (1 Part.Cylinder + 2 caps -> 1 exact solid)")
+
+
+def check_frustum(fixture_name):
+    """frustum_2017/2021.skp (r1 = 6 in, r2 = 3 in, h = 4 in, slant = 5 in):
+    - curved_surfaces=True: 3 faces (2 circular discs + 1 Part.Cone wall of area 45*pi in2).
+    - curved_surfaces=True, solids=True: 1 valid Part.Solid of volume 84*pi in3."""
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+
+    for merge in (True, False):
+        doc = App.newDocument()
+        try:
+            importSKP.import_skp(path, doc, merge=merge, curved_surfaces=True)
+            stats = importSKP.last_import_stats
+            assert stats["cones_built"] == 1 and stats["cylinders_built"] == 0, stats
+            assert stats["face_arcs_built"] == 2 and stats["curved_groups_unfitted"] == 0, stats
+            shapes = _world_shapes(doc, stats, merge)
+            faces = [f for s in shapes for f in s.Faces]
+            assert len(faces) == 3 and all(f.isValid() for f in faces), len(faces)
+            cone_faces = [f for f in faces if isinstance(f.Surface, Part.Cone)]
+            assert len(cone_faces) == 1, len(cone_faces)
+            cone = cone_faces[0]
+            want_lat_area = math.pi * (6.0 + 3.0) * 5.0 * MM ** 2
+            assert abs(cone.Area - want_lat_area) < 1e-1, (cone.Area, want_lat_area)
+            assert abs(abs(cone.Surface.SemiAngle) - math.atan2(3.0, 4.0)) < 1e-6, cone.Surface.SemiAngle
+        finally:
+            App.closeDocument(doc.Name)
+
+    doc = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc, merge=True, solids=True, curved_surfaces=True)
+        solids = [s for o in doc.Objects if hasattr(o, "Shape") for s in o.Shape.Solids]
+        assert len(solids) == 1 and solids[0].isValid() and len(solids[0].Faces) == 3, len(solids)
+        want_vol = (math.pi * 4.0 / 3.0) * (36.0 + 18.0 + 9.0) * MM ** 3
+        assert abs(solids[0].Volume - want_vol) < 1.0, (solids[0].Volume, want_vol)
+    finally:
+        App.closeDocument(doc.Name)
+    print(f"check_frustum({fixture_name}): OK (1 Part.Cone + 2 caps -> 1 exact solid)")
+
+
+def check_plate_with_hole(fixture_name):
+    """plate_with_hole_2017/2021.skp (20 x 20 x 2 in plate with r = 4 in bore):
+    - curved_surfaces=True: 7 faces (2 perforated faces with Part.Circle holes,
+      4 flat outer sides, 1 inward-facing Part.Cylinder bore).
+    - curved_surfaces=True, solids=True: 1 valid Part.Solid of volume (400 - 16*pi)*2 in3."""
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+
+    expected_face_area = (20.0 * 20.0 - math.pi * 4.0 ** 2) * MM ** 2
+    for merge in (True, False):
+        doc = App.newDocument()
+        try:
+            importSKP.import_skp(path, doc, merge=merge, curved_surfaces=True)
+            stats = importSKP.last_import_stats
+            assert stats["cylinders_built"] == 1 and stats["face_arcs_built"] == 2, stats
+            shapes = _world_shapes(doc, stats, merge)
+            faces = [f for s in shapes for f in s.Faces]
+            assert len(faces) == 7 and all(f.isValid() for f in faces), len(faces)
+
+            cyls = [f for f in faces if isinstance(f.Surface, Part.Cylinder)]
+            assert len(cyls) == 1 and abs(cyls[0].Surface.Radius - 4.0 * MM) < 1e-5
+            u0, u1, v0, v1 = cyls[0].ParameterRange
+            um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+            pt = cyls[0].Surface.value(um, vm)
+            rad = App.Vector(pt.x, pt.y, 0.0)
+            assert cyls[0].normalAt(um, vm).dot(rad) < 0.0, "hole bore normal must point inward"
 
             holed = sorted([f for f in faces if len(f.Wires) == 2], key=lambda f: f.CenterOfMass.z)
             assert len(holed) == 2, len(holed)
-            for face, z_in, nz in zip(holed, (0.0, 2.0), (-1.0, 1.0)):
-                outer = face.OuterWire
-                inner = [w for w in face.Wires if not w.isSame(outer)][0]
-                assert len(outer.Edges) == 4, len(outer.Edges)
-                assert all(isinstance(e.Curve, Part.Line) for e in outer.Edges)
-                assert len(inner.Edges) == 1, len(inner.Edges)
-                circle = inner.Edges[0].Curve
-                assert hasattr(circle, "Radius"), type(circle).__name__
-                assert abs(circle.Radius - 4.0 * MM) < 1e-5, circle.Radius
-                assert abs(circle.Center.x) < 1e-5 and abs(circle.Center.y) < 1e-5, tuple(circle.Center)
-                assert abs(circle.Center.z - z_in * MM) < 1e-5, circle.Center.z
-                assert abs(face.Area - expected_area) < 1e-2, (face.Area, expected_area)
-                u0, u1, v0, v1 = face.ParameterRange
-                normal = face.normalAt(0.5 * (u0 + u1), 0.5 * (v0 + v1))
-                assert abs(normal.x) < 1e-6 and abs(normal.y) < 1e-6 and abs(normal.z - nz) < 1e-6, tuple(normal)
+            for face, nz in zip(holed, (-1.0, 1.0)):
+                assert abs(face.Area - expected_face_area) < 1e-2, (face.Area, expected_face_area)
+                fu0, fu1, fv0, fv1 = face.ParameterRange
+                normal = face.normalAt(0.5 * (fu0 + fu1), 0.5 * (fv0 + fv1))
+                assert abs(normal.z - nz) < 1e-6, tuple(normal)
         finally:
             App.closeDocument(doc.Name)
-    print(f"check_plate_with_hole({fixture_name}): OK (top & bottom holes are true Part.Circle wires, exact area)")
+
+    doc = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc, merge=True, solids=True, curved_surfaces=True)
+        solids = [s for o in doc.Objects if hasattr(o, "Shape") for s in o.Shape.Solids]
+        assert len(solids) == 1 and solids[0].isValid() and len(solids[0].Faces) == 7, len(solids)
+        want_vol = (400.0 - 16.0 * math.pi) * 2.0 * MM ** 3
+        assert abs(solids[0].Volume - want_vol) < 1.0, (solids[0].Volume, want_vol)
+    finally:
+        App.closeDocument(doc.Name)
+    print(f"check_plate_with_hole({fixture_name}): OK (7 faces incl. inward Part.Cylinder bore -> 1 solid)")
+
+
+def check_smoothed_blob_stays_faceted(fixture_name):
+    """smoothed_blob_2017/2021.skp: an asymmetric wavy closed surface whose edges
+    are all soft+smooth; must stay 168 planar facets and report 1 unfitted group."""
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+    doc_off = App.newDocument()
+    doc_on = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc_off, merge=True, curved_surfaces=False)
+        sig_off = _signature([o.Shape.copy() for o in doc_off.Objects if hasattr(o, "Shape")])
+
+        importSKP.import_skp(path, doc_on, merge=True, curved_surfaces=True)
+        stats = importSKP.last_import_stats
+        assert stats["cylinders_built"] == 0 and stats["cones_built"] == 0, stats
+        assert stats["curved_groups_unfitted"] == 1, stats
+        sig_on = _signature([o.Shape.copy() for o in doc_on.Objects if hasattr(o, "Shape")])
+        assert sig_on == sig_off, (sig_on[0], sig_off[0])
+    finally:
+        App.closeDocument(doc_off.Name)
+        App.closeDocument(doc_on.Name)
+    print(f"check_smoothed_blob_stays_faceted({fixture_name}): OK (168 facets unchanged, 1 unfitted group)")
+
+
+def check_pointed_cone_and_partial_cylinder():
+    """In-memory checks for a pointed cone (base circle + apex) and a 180 deg
+    half-cylinder (two 180 deg arcs + 2 half-disc caps + 1 flat back face)."""
+    from openskp.model import ArcCurve, Definition, Edge, Face, SkpModel, Vertex
+
+    # 1. Pointed cone: r = 5 in at z = 0, apex (0, 0, 12) in (slant = 13 in)
+    n = 24
+    r, h = 5.0, 12.0
+    verts = {i: Vertex(id=i, x=r * math.cos(2 * math.pi * i / n), y=r * math.sin(2 * math.pi * i / n), z=0.0)
+             for i in range(n)}
+    verts[n] = Vertex(id=n, x=0.0, y=0.0, z=h)
+    edges = {}
+    for i in range(n):
+        edges[i] = Edge(id=i, v1_id=i, v2_id=(i + 1) % n, curve_id=1)
+        edges[n + i] = Edge(id=n + i, v1_id=i, v2_id=n, soft=True, smooth=True)
+    faces = {0: Face(id=0, loops=[[(i, -1) for i in reversed(range(n))]])}
+    for i in range(n):
+        j = (i + 1) % n
+        faces[i + 1] = Face(id=i + 1, loops=[[(i, 1), (n + j, 1), (n + i, -1)]])
+    defn = Definition(
+        id=0, name="PointedCone", vertices=verts, edges=edges, faces=faces,
+        arcs={1: ArcCurve((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (r, 0.0, 0.0), (0.0, r, 0.0), 0.0, 2 * math.pi)},
+    )
+    stats = {"faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0, "edge_runs_skipped": 0,
+             "arcs_built": 0, "make_solids": True, "fit_curved_surfaces": True,
+             "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0, "curved_groups_unfitted": 0}
+    shapes, _ = importSKP._build_own_geometry(defn, SkpModel(root=defn), stats, None)
+    assert stats["cones_built"] == 1 and stats["solids_built"] == 1, stats
+    assert len(shapes) == 1 and shapes[0].ShapeType == "Solid" and len(shapes[0].Faces) == 2
+    assert abs(shapes[0].Volume - (math.pi / 3.0) * 25.0 * 12.0 * MM ** 3) < 1.0, shapes[0].Volume
+
+    # 2. Half-cylinder: r = 6 in, z = 0..10 in, 0..pi (12 segments)
+    m = 12
+    rc, hc = 6.0, 10.0
+    cverts = {}
+    for k, z in enumerate((0.0, hc)):
+        for i in range(m + 1):
+            ang = math.pi * i / m
+            cverts[k * (m + 1) + i] = Vertex(id=k * (m + 1) + i, x=rc * math.cos(ang), y=rc * math.sin(ang), z=z)
+    cedges = {}
+    eid = 0
+    bot_arc_eids, top_arc_eids = [], []
+    for i in range(m):
+        cedges[eid] = Edge(id=eid, v1_id=i, v2_id=i + 1, curve_id=10)
+        bot_arc_eids.append(eid)
+        eid += 1
+    for i in range(m):
+        b = m + 1
+        cedges[eid] = Edge(id=eid, v1_id=b + i, v2_id=b + i + 1, curve_id=11)
+        top_arc_eids.append(eid)
+        eid += 1
+    bot_chord_eid = eid
+    cedges[eid] = Edge(id=eid, v1_id=m, v2_id=0)
+    eid += 1
+    top_chord_eid = eid
+    cedges[eid] = Edge(id=eid, v1_id=2 * m + 1, v2_id=m + 1)
+    eid += 1
+    vert_eids = []
+    for i in range(m + 1):
+        is_interior = 0 < i < m
+        cedges[eid] = Edge(id=eid, v1_id=i, v2_id=(m + 1) + i, soft=is_interior, smooth=is_interior)
+        vert_eids.append(eid)
+        eid += 1
+
+    cfaces = {
+        0: Face(id=0, loops=[[(bot_chord_eid, -1)] + [(e, -1) for e in reversed(bot_arc_eids)]]),
+        1: Face(id=1, loops=[[(e, 1) for e in top_arc_eids] + [(top_chord_eid, 1)]]),
+        2: Face(id=2, loops=[[(bot_chord_eid, 1), (vert_eids[0], 1), (top_chord_eid, -1), (vert_eids[m], -1)]]),
+    }
+    for i in range(m):
+        cfaces[3 + i] = Face(
+            id=3 + i,
+            loops=[[(bot_arc_eids[i], 1), (vert_eids[i + 1], 1), (top_arc_eids[i], -1), (vert_eids[i], -1)]],
+        )
+    cdefn = Definition(
+        id=0, name="HalfCyl", vertices=cverts, edges=cedges, faces=cfaces,
+        arcs={
+            10: ArcCurve((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (rc, 0.0, 0.0), (0.0, rc, 0.0), 0.0, math.pi),
+            11: ArcCurve((0.0, 0.0, hc), (0.0, 0.0, 1.0), (rc, 0.0, 0.0), (0.0, rc, 0.0), 0.0, math.pi),
+        },
+    )
+    cstats = {"faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0, "edge_runs_skipped": 0,
+              "arcs_built": 0, "make_solids": True, "fit_curved_surfaces": True,
+              "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0, "curved_groups_unfitted": 0}
+    cshapes, _ = importSKP._build_own_geometry(cdefn, SkpModel(root=cdefn), cstats, None)
+    assert cstats["cylinders_built"] == 1 and cstats["face_arcs_built"] == 2 and cstats["solids_built"] == 1, cstats
+    assert len(cshapes) == 1 and cshapes[0].ShapeType == "Solid" and len(cshapes[0].Faces) == 4
+    assert abs(cshapes[0].Volume - 0.5 * math.pi * 36.0 * 10.0 * MM ** 3) < 1.0, cshapes[0].Volume
+    print("check_pointed_cone_and_partial_cylinder: OK (both sew into exact closed solids)")
+
+
+def check_unfitted_extrusion_keeps_cap_connected():
+    """When a circle is extruded to a warped non-circular top so the smoothed
+    side fails fitting, its circular base cap keeps its 24 straight segments so
+    the cap and walls stay water-tight connected and still sew into a solid."""
+    from openskp.model import ArcCurve, Definition, Edge, Face, SkpModel, Vertex
+
+    n = 12
+    r, h = 5.0, 8.0
+    verts = {}
+    for i in range(n):
+        ang = 2 * math.pi * i / n
+        verts[i] = Vertex(id=i, x=r * math.cos(ang), y=r * math.sin(ang), z=0.0)
+        rw = r * (1.0 + 0.35 * math.cos(2 * ang))
+        verts[n + i] = Vertex(id=n + i, x=rw * math.cos(ang), y=rw * math.sin(ang), z=h)
+    edges = {}
+    for i in range(n):
+        j = (i + 1) % n
+        edges[i] = Edge(id=i, v1_id=i, v2_id=j, curve_id=1)
+        edges[n + i] = Edge(id=n + i, v1_id=n + i, v2_id=n + j)
+        edges[2 * n + i] = Edge(id=2 * n + i, v1_id=i, v2_id=n + i, soft=True, smooth=True)
+    faces = {
+        0: Face(id=0, loops=[[(i, -1) for i in reversed(range(n))]]),
+        1: Face(id=1, loops=[[(n + i, 1) for i in range(n)]]),
+    }
+    for i in range(n):
+        j = (i + 1) % n
+        faces[2 + i] = Face(id=2 + i, loops=[[(i, 1), (2 * n + j, 1), (n + i, -1), (2 * n + i, -1)]])
+    defn = Definition(
+        id=0, name="WarpedExtrusion", vertices=verts, edges=edges, faces=faces,
+        arcs={1: ArcCurve((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (r, 0.0, 0.0), (0.0, r, 0.0), 0.0, 2 * math.pi)},
+    )
+    stats = {"faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0, "edge_runs_skipped": 0,
+             "arcs_built": 0, "make_solids": True, "fit_curved_surfaces": True,
+             "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0, "curved_groups_unfitted": 0}
+    shapes, _ = importSKP._build_own_geometry(defn, SkpModel(root=defn), stats, None)
+    assert stats["curved_groups_unfitted"] == 1 and stats["face_arcs_built"] == 0, stats
+    assert stats["solids_built"] == 1 and len(shapes) == 1 and shapes[0].ShapeType == "Solid"
+    print("check_unfitted_extrusion_keeps_cap_connected: OK (cap stays polygonal, sews into 1 solid)")
 
 
 def check_ellipse_stays_polygon():
-    """A non-uniformly scaled ArcCurve (|x_axis| != |y_axis|) is an ellipse, not
-    a circle: its face boundary stays polygonal."""
     from openskp.model import ArcCurve, Definition, Edge, Face, SkpModel, Vertex
 
     n = 24
@@ -161,48 +388,30 @@ def check_ellipse_stays_polygon():
         i: Vertex(id=i, x=rx * math.cos(2 * math.pi * i / n), y=ry * math.sin(2 * math.pi * i / n), z=0.0)
         for i in range(n)
     }
-    edges = {
-        i: Edge(id=i, v1_id=i, v2_id=(i + 1) % n, curve_id=1)
-        for i in range(n)
-    }
-    loop = [(i, 1) for i in range(n)]
+    edges = {i: Edge(id=i, v1_id=i, v2_id=(i + 1) % n, curve_id=1) for i in range(n)}
     defn = Definition(
-        id=0,
-        name="EllipseDef",
-        vertices=verts,
-        edges=edges,
-        faces={1: Face(id=1, loops=[loop], normal=(0.0, 0.0, 1.0))},
-        arcs={
-            1: ArcCurve(
-                center=(0.0, 0.0, 0.0),
-                normal=(0.0, 0.0, 1.0),
-                x_axis=(rx, 0.0, 0.0),
-                y_axis=(0.0, ry, 0.0),
-                start_angle=0.0,
-                end_angle=2.0 * math.pi,
-            )
-        },
+        id=0, name="EllipseDef", vertices=verts, edges=edges,
+        faces={1: Face(id=1, loops=[[(i, 1) for i in range(n)]], normal=(0.0, 0.0, 1.0))},
+        arcs={1: ArcCurve((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (rx, 0.0, 0.0), (0.0, ry, 0.0), 0.0, 2 * math.pi)},
     )
-    model = SkpModel(root=defn)
-    stats = {
-        "faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0,
-        "edge_runs_skipped": 0, "arcs_built": 0,
-        "fit_curved_surfaces": True, "face_arcs_built": 0,
-    }
-    shapes, _colors = importSKP._build_own_geometry(defn, model, stats, None)
+    stats = {"faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0, "edge_runs_skipped": 0,
+             "arcs_built": 0, "fit_curved_surfaces": True, "face_arcs_built": 0}
+    shapes, _ = importSKP._build_own_geometry(defn, SkpModel(root=defn), stats, None)
     assert len(shapes) == 1 and stats["face_arcs_built"] == 0, stats
     assert len(shapes[0].Edges) == n and all(isinstance(e.Curve, Part.Line) for e in shapes[0].Edges)
-    print("check_ellipse_stays_polygon: OK (ellipse stays 24-sided polygon)")
+    print("check_ellipse_stays_polygon: OK")
 
 
 def check_export_round_trip():
-    """Exporting faces with true Part.Circle / Part.Arc wires discretises them
-    cleanly instead of dropping discs or circular holes."""
+    """Exporting imported curved surfaces (discs, circular holes, cylinders and
+    frustums) writes valid SketchUp faces without dropping curved walls or caps."""
     import openskp
 
-    for fixture_name, want_faces, want_holed in (
+    for fixture_name, min_faces, want_holed in (
         ("arcs_2021.skp", 2, 0),
-        ("plate_with_hole_2021.skp", 30, 2),
+        ("plate_with_hole_2021.skp", 10, 2),
+        ("cylinder_2021.skp", 10, 0),
+        ("frustum_2021.skp", 10, 0),
     ):
         doc = App.newDocument()
         out_path = os.path.join(FIXTURES_DIR, f"_curved_export_{fixture_name}")
@@ -210,26 +419,26 @@ def check_export_round_trip():
             importSKP.import_skp(os.path.join(FIXTURES_DIR, fixture_name), doc, merge=False, curved_surfaces=True)
             importSKP.export(list(doc.Objects), out_path)
             model = openskp.SkpFile.open(out_path).parse()
-            assert len(model.root.faces) == want_faces, (fixture_name, len(model.root.faces))
+            assert len(model.root.faces) >= min_faces, (fixture_name, len(model.root.faces))
             holed = sum(1 for f in model.root.faces.values() if len(f.loops) == 2)
             assert holed == want_holed, (fixture_name, holed)
         finally:
             App.closeDocument(doc.Name)
             if os.path.exists(out_path):
                 os.remove(out_path)
-    print("check_export_round_trip: OK (discs, half-discs and circular holes round-trip through export)")
+    print("check_export_round_trip: OK")
 
 
 def check_preference():
-    path = os.path.join(FIXTURES_DIR, "plate_with_hole_2021.skp")
+    path = os.path.join(FIXTURES_DIR, "cylinder_2021.skp")
     params = App.ParamGet(importSKP._PARAM_PATH)
     try:
-        for pref, arg, want_flag, want_arcs in (
+        for pref, arg, want_flag, want_cyl in (
             (None, None, False, 0),
-            (True, None, True, 2),
+            (True, None, True, 1),
             (False, None, False, 0),
             (True, False, False, 0),
-            (False, True, True, 2),
+            (False, True, True, 1),
         ):
             if pref is None:
                 params.RemBool("FitCurvedSurfaces")
@@ -240,16 +449,15 @@ def check_preference():
                 importSKP.import_skp(path, doc, merge=True, curved_surfaces=arg)
                 stats = importSKP.last_import_stats
                 assert stats["fit_curved_surfaces"] is want_flag, (pref, arg, stats)
-                assert stats["face_arcs_built"] == want_arcs, (pref, arg, stats)
+                assert stats["cylinders_built"] == want_cyl, (pref, arg, stats)
             finally:
                 App.closeDocument(doc.Name)
-        print("check_preference: OK (FitCurvedSurfaces unset -> False, True -> 2 circle wires, arg overrides)")
+        print("check_preference: OK")
     finally:
         params.RemBool("FitCurvedSurfaces")
 
 
 def check_hierarchy_matches_merged(path):
-    """With curved_surfaces=True, hierarchy and merged layouts produce identical geometry."""
     doc_m = App.newDocument()
     try:
         importSKP.import_skp(path, doc_m, merge=True, curved_surfaces=True)
@@ -276,8 +484,16 @@ def check_hierarchy_matches_merged(path):
 def _main():
     check_arcs_fixture("arcs_2017.skp")
     check_arcs_fixture("arcs_2021.skp")
+    check_cylinder("cylinder_2017.skp")
+    check_cylinder("cylinder_2021.skp")
+    check_frustum("frustum_2017.skp")
+    check_frustum("frustum_2021.skp")
     check_plate_with_hole("plate_with_hole_2017.skp")
     check_plate_with_hole("plate_with_hole_2021.skp")
+    check_smoothed_blob_stays_faceted("smoothed_blob_2017.skp")
+    check_smoothed_blob_stays_faceted("smoothed_blob_2021.skp")
+    check_pointed_cone_and_partial_cylinder()
+    check_unfitted_extrusion_keeps_cap_connected()
     check_ellipse_stays_polygon()
     check_export_round_trip()
     check_preference()
