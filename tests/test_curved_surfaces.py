@@ -248,6 +248,189 @@ def check_smoothed_blob_stays_faceted(fixture_name):
     print(f"check_smoothed_blob_stays_faceted({fixture_name}): OK (168 facets unchanged, 1 unfitted group)")
 
 
+def check_sphere(fixture_name):
+    """sphere_2017/2021.skp (r = 5 in, 128 smoothed facets, no ArcCurve records):
+    - default: 128 flat faces.
+    - curved_surfaces=True: 1 closed Part.Sphere face (r = 127 mm, area 4*pi*r^2).
+    - curved_surfaces=True, solids=True: 1 valid Part.Solid of volume (4/3)*pi*r^3."""
+    path = os.path.join(FIXTURES_DIR, fixture_name)
+
+    for merge in (True, False):
+        doc = App.newDocument()
+        try:
+            importSKP.import_skp(path, doc, merge=merge, curved_surfaces=True)
+            stats = importSKP.last_import_stats
+            assert stats["spheres_built"] == 1 and stats["cylinders_built"] == 0 and stats["cones_built"] == 0, stats
+            assert stats["curved_groups_unfitted"] == 0, stats
+            shapes = _world_shapes(doc, stats, merge)
+            faces = [f for s in shapes for f in s.Faces]
+            assert len(faces) == 1 and faces[0].isValid(), len(faces)
+            sph = faces[0]
+            assert isinstance(sph.Surface, Part.Sphere), type(sph.Surface).__name__
+            assert abs(sph.Surface.Radius - 5.0 * MM) < 1e-4, sph.Surface.Radius
+            assert sph.Surface.Center.Length < 1e-4, tuple(sph.Surface.Center)
+            want_area = 4.0 * math.pi * (5.0 * MM) ** 2
+            assert abs(sph.Area - want_area) < 1e-1, (sph.Area, want_area)
+            n_eq = sph.normalAt(0.0, 0.0)
+            p_eq = sph.Surface.value(0.0, 0.0)
+            assert n_eq.dot(p_eq) > 0.0, "sphere normal must point outward"
+        finally:
+            App.closeDocument(doc.Name)
+
+    doc = App.newDocument()
+    try:
+        importSKP.import_skp(path, doc, merge=True, solids=True, curved_surfaces=True)
+        solids = [s for o in doc.Objects if hasattr(o, "Shape") for s in o.Shape.Solids]
+        assert len(solids) == 1 and solids[0].isValid() and len(solids[0].Faces) == 1, len(solids)
+        want_vol = (4.0 / 3.0) * math.pi * (5.0 * MM) ** 3
+        assert abs(solids[0].Volume - want_vol) < 1.0, (solids[0].Volume, want_vol)
+    finally:
+        App.closeDocument(doc.Name)
+    print(f"check_sphere({fixture_name}): OK (128 facets -> 1 Part.Sphere -> 1 exact solid)")
+
+
+def check_hemisphere_and_open_dome():
+    """A translated hemisphere closed by a circular ArcCurve base sews into a
+    2-face solid of volume (2/3)*pi*r^3, and an open spherical polar cap without
+    ArcCurve metadata becomes a trimmed Part.Sphere face."""
+    from openskp.model import ArcCurve, Definition, Edge, Face, SkpModel, Vertex
+
+    # 1. Closed hemisphere at centre (30, -40, 10) in, r = 6 in, z >= 10 in
+    cx, cy, cz, r = 30.0, -40.0, 10.0, 6.0
+    n_rings, n_lon = 5, 16
+    verts = {0: Vertex(id=0, x=cx, y=cy, z=cz + r)}
+    rings = []
+    vid = 1
+    for ri in range(n_rings):
+        lat = (0.5 * math.pi) * ri / n_rings
+        ring = []
+        for li in range(n_lon):
+            lon = 2.0 * math.pi * li / n_lon
+            verts[vid] = Vertex(
+                id=vid,
+                x=cx + r * math.cos(lat) * math.cos(lon),
+                y=cy + r * math.cos(lat) * math.sin(lon),
+                z=cz + r * math.sin(lat),
+            )
+            ring.append(vid)
+            vid += 1
+        rings.append(ring)
+
+    edges = {}
+    eid = 0
+    ring_eids = []
+    for ri, ring in enumerate(rings):
+        re_list = []
+        for li in range(n_lon):
+            v1, v2 = ring[li], ring[(li + 1) % n_lon]
+            is_rim = (ri == 0)
+            edges[eid] = Edge(id=eid, v1_id=v1, v2_id=v2, soft=not is_rim, smooth=not is_rim,
+                              curve_id=1 if is_rim else None)
+            re_list.append(eid)
+            eid += 1
+        ring_eids.append(re_list)
+
+    meridian_eids = []
+    for ri in range(n_rings - 1):
+        me = []
+        for li in range(n_lon):
+            edges[eid] = Edge(id=eid, v1_id=rings[ri][li], v2_id=rings[ri + 1][li], soft=True, smooth=True)
+            me.append(eid)
+            eid += 1
+        meridian_eids.append(me)
+
+    pole_eids = []
+    for li in range(n_lon):
+        edges[eid] = Edge(id=eid, v1_id=rings[-1][li], v2_id=0, soft=True, smooth=True)
+        pole_eids.append(eid)
+        eid += 1
+
+    faces = {0: Face(id=0, loops=[[(e, -1) for e in reversed(ring_eids[0])]])}
+    fid = 1
+    for ri in range(n_rings - 1):
+        for li in range(n_lon):
+            nj = (li + 1) % n_lon
+            faces[fid] = Face(
+                id=fid,
+                loops=[[(ring_eids[ri][li], 1), (meridian_eids[ri][nj], 1),
+                        (ring_eids[ri + 1][li], -1), (meridian_eids[ri][li], -1)]],
+            )
+            fid += 1
+    for li in range(n_lon):
+        nj = (li + 1) % n_lon
+        faces[fid] = Face(
+            id=fid,
+            loops=[[(ring_eids[-1][li], 1), (pole_eids[nj], 1), (pole_eids[li], -1)]],
+        )
+        fid += 1
+
+    defn = Definition(
+        id=0, name="Hemisphere", vertices=verts, edges=edges, faces=faces,
+        arcs={1: ArcCurve((cx, cy, cz), (0.0, 0.0, 1.0), (r, 0.0, 0.0), (0.0, r, 0.0), 0.0, 2 * math.pi)},
+    )
+    stats = {"faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0, "edge_runs_skipped": 0,
+             "arcs_built": 0, "make_solids": True, "fit_curved_surfaces": True,
+             "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0,
+             "spheres_built": 0, "curved_groups_unfitted": 0}
+    shapes, _ = importSKP._build_own_geometry(defn, SkpModel(root=defn), stats, None)
+    assert stats["spheres_built"] == 1 and stats["face_arcs_built"] == 1 and stats["solids_built"] == 1, stats
+    assert len(shapes) == 1 and shapes[0].ShapeType == "Solid" and len(shapes[0].Faces) == 2
+    want_hemi_vol = (2.0 / 3.0) * math.pi * (r * MM) ** 3
+    assert abs(shapes[0].Volume - want_hemi_vol) < 1.0, (shapes[0].Volume, want_hemi_vol)
+
+    # 2. Open dome (no base face and no ArcCurve)
+    open_faces = {k: v for k, v in faces.items() if k != 0}
+    for e in edges.values():
+        e.curve_id = None
+    open_defn = Definition(id=0, name="OpenDome", vertices=verts, edges=edges, faces=open_faces, arcs={})
+    ostats = {"faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0, "edge_runs_skipped": 0,
+              "arcs_built": 0, "make_solids": False, "fit_curved_surfaces": True,
+              "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0,
+              "spheres_built": 0, "curved_groups_unfitted": 0}
+    oshapes, _ = importSKP._build_own_geometry(open_defn, SkpModel(root=open_defn), ostats, None)
+    assert ostats["spheres_built"] == 1 and len(oshapes) == 1, ostats
+    assert isinstance(oshapes[0].Surface, Part.Sphere)
+    assert abs(oshapes[0].Area - 2.0 * math.pi * (r * MM) ** 2) < 1e-1, oshapes[0].Area
+
+    # 3. Two-rim spherical zone (truncated hemisphere between lat 0 and 75 deg)
+    lat_top = 0.5 * math.pi * ((n_rings - 1) / n_rings)
+    r_top = r * math.cos(lat_top)
+    z_top = cz + r * math.sin(lat_top)
+    pole_set = set(pole_eids)
+    z_edges = {k: v for k, v in edges.items() if k not in pole_set}
+    for eid_b in ring_eids[0]:
+        e = z_edges[eid_b]
+        z_edges[eid_b] = Edge(id=e.id, v1_id=e.v1_id, v2_id=e.v2_id, soft=False, smooth=False, curve_id=1)
+    for eid_t in ring_eids[-1]:
+        e = z_edges[eid_t]
+        z_edges[eid_t] = Edge(id=e.id, v1_id=e.v1_id, v2_id=e.v2_id, soft=False, smooth=False, curve_id=2)
+    n_quad_faces = (n_rings - 1) * n_lon
+    z_faces = {fid_k: faces[fid_k] for fid_k in range(0, 1 + n_quad_faces)}
+    z_faces[999] = Face(id=999, loops=[[(e, 1) for e in ring_eids[-1]]])
+    z_defn = Definition(
+        id=0, name="SphericalZone", vertices=verts, edges=z_edges, faces=z_faces,
+        arcs={
+            1: ArcCurve((cx, cy, cz), (0.0, 0.0, 1.0), (r, 0.0, 0.0), (0.0, r, 0.0), 0.0, 2 * math.pi),
+            2: ArcCurve((cx, cy, z_top), (0.0, 0.0, 1.0), (r_top, 0.0, 0.0), (0.0, r_top, 0.0), 0.0, 2 * math.pi),
+        },
+    )
+    zstats = {"faces_built": 0, "faces_skipped": 0, "edge_runs_built": 0, "edge_runs_skipped": 0,
+              "arcs_built": 0, "make_solids": True, "fit_curved_surfaces": True,
+              "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0,
+              "spheres_built": 0, "curved_groups_unfitted": 0}
+    zshapes, _ = importSKP._build_own_geometry(z_defn, SkpModel(root=z_defn), zstats, None)
+    assert zstats["spheres_built"] == 1 and zstats["face_arcs_built"] == 2 and zstats["solids_built"] == 1, zstats
+    assert len(zshapes) == 1 and zshapes[0].ShapeType == "Solid" and len(zshapes[0].Faces) == 3, (
+        [s.ShapeType for s in zshapes],
+        zstats,
+    )
+    h_mm = r * math.sin(lat_top) * MM
+    r_mm = r * MM
+    want_zone_vol = math.pi * (r_mm * r_mm * h_mm - (h_mm ** 3) / 3.0)
+    assert abs(zshapes[0].Volume - want_zone_vol) < 1.0, (zshapes[0].Volume, want_zone_vol)
+    print("check_hemisphere_and_open_dome: OK (hemisphere solid + open dome + 2-rim spherical zone solid)")
+
+
 def check_pointed_cone_and_partial_cylinder():
     """In-memory checks for a pointed cone (base circle + apex) and a 180 deg
     half-cylinder (two 180 deg arcs + 2 half-disc caps + 1 flat back face)."""
@@ -412,6 +595,7 @@ def check_export_round_trip():
         ("plate_with_hole_2021.skp", 10, 2),
         ("cylinder_2021.skp", 10, 0),
         ("frustum_2021.skp", 10, 0),
+        ("sphere_2021.skp", 20, 0),
     ):
         doc = App.newDocument()
         out_path = os.path.join(FIXTURES_DIR, f"_curved_export_{fixture_name}")
@@ -492,6 +676,9 @@ def _main():
     check_plate_with_hole("plate_with_hole_2021.skp")
     check_smoothed_blob_stays_faceted("smoothed_blob_2017.skp")
     check_smoothed_blob_stays_faceted("smoothed_blob_2021.skp")
+    check_sphere("sphere_2017.skp")
+    check_sphere("sphere_2021.skp")
+    check_hemisphere_and_open_dome()
     check_pointed_cone_and_partial_cylinder()
     check_unfitted_extrusion_keeps_cap_connected()
     check_ellipse_stays_polygon()

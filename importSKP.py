@@ -682,15 +682,54 @@ def _make_solids(faces, colors, stats):
     if not faces:
         return [], []
     color_by_key = {}
-    for face, rgba in zip(faces, colors):
-        color_by_key.setdefault(_face_key(face), rgba)
+    indices_by_key = {}
+    coms = []
+    areas = []
+    for idx, (face, rgba) in enumerate(zip(faces, colors)):
+        key = _face_key(face)
+        color_by_key.setdefault(key, rgba)
+        indices_by_key.setdefault(key, []).append(idx)
+        coms.append(face.CenterOfMass)
+        areas.append(face.Area)
     try:
         sewn = Part.makeCompound([f.copy() for f in faces])
         sewn.sewShape(_SEW_TOLERANCE_MM)
     except Exception:
         return faces, colors
     solids = []
-    used = set()
+    solid_face_colors = []
+    used_indices = set()
+
+    def _claim_source_face(sf):
+        sf_key = _face_key(sf)
+        for cand in indices_by_key.get(sf_key, ()):
+            if cand not in used_indices:
+                used_indices.add(cand)
+                return colors[cand]
+        sf_com = sf.CenterOfMass
+        sf_area = sf.Area
+        tol_pos = max(1e-2, 1e-4 * sf.BoundBox.DiagonalLength)
+        best_idx = None
+        best_err = float("inf")
+        for cand in range(len(faces)):
+            if cand in used_indices:
+                continue
+            tol_area = max(1e-2, 1e-4 * max(sf_area, areas[cand]))
+            d_area = abs(sf_area - areas[cand])
+            if d_area > tol_area:
+                continue
+            d_pos = (sf_com - coms[cand]).Length
+            if d_pos > tol_pos:
+                continue
+            err = d_pos + d_area
+            if err < best_err:
+                best_err = err
+                best_idx = cand
+        if best_idx is not None:
+            used_indices.add(best_idx)
+            return colors[best_idx]
+        return color_by_key.get(sf_key, _DEFAULT_FACE_RGBA)
+
     for shell in sewn.Shells:
         if not shell.isClosed():
             continue
@@ -703,16 +742,33 @@ def _make_solids(faces, colors, stats):
         except Exception:
             continue
         solids.append(solid)
-        used.update(_face_key(f) for f in solid.Faces)
+        solid_face_colors.extend(_claim_source_face(f) for f in solid.Faces)
+    # A single self-closed curved face (such as a full Part.Sphere) has no
+    # inter-face seam for sewShape() to wrap into sewn.Shells; promote its
+    # 1-face closed shell directly.
+    for idx, (face, rgba) in enumerate(zip(faces, colors)):
+        if idx in used_indices or isinstance(face.Surface, Part.Plane):
+            continue
+        try:
+            sh = Part.Shell([face.copy()])
+            if not sh.isClosed():
+                continue
+            solid = Part.Solid(sh)
+            if solid.Volume < 0:
+                solid.reverse()
+            if solid.isValid() and solid.Volume > 0:
+                solids.append(solid)
+                solid_face_colors.append(rgba)
+                used_indices.add(idx)
+        except Exception:
+            continue
     if not solids:
         stats["faces_left_open"] = stats.get("faces_left_open", 0) + len(faces)
         return faces, colors
-    out_shapes, out_colors = [], []
-    for solid in solids:
-        out_shapes.append(solid)
-        out_colors.extend(color_by_key.get(_face_key(f), _DEFAULT_FACE_RGBA) for f in solid.Faces)
-    for face, rgba in zip(faces, colors):
-        if _face_key(face) not in used:
+    out_shapes = list(solids)
+    out_colors = list(solid_face_colors)
+    for idx, (face, rgba) in enumerate(zip(faces, colors)):
+        if idx not in used_indices:
             out_shapes.append(face)
             out_colors.append(rgba)
             stats["faces_left_open"] = stats.get("faces_left_open", 0) + 1
@@ -1025,6 +1081,357 @@ def _fit_cylinder_or_cone(definition, group_faces, curve_edge_counts):
         return None
 
 
+def _solve_linear(mat, rhs):
+    """Gaussian elimination with partial pivoting on a small dense n x n system;
+    returns the solution list or ``None`` when singular."""
+    n = len(rhs)
+    aug = [list(mat[r]) + [rhs[r]] for r in range(n)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[piv][col]) <= 1e-11:
+            return None
+        if piv != col:
+            aug[col], aug[piv] = aug[piv], aug[col]
+        inv_diag = 1.0 / aug[col][col]
+        for j in range(col, n + 1):
+            aug[col][j] *= inv_diag
+        for r in range(n):
+            if r == col:
+                continue
+            factor = aug[r][col]
+            if factor != 0.0:
+                for j in range(col, n + 1):
+                    aug[r][j] -= factor * aug[col][j]
+    return [aug[r][n] for r in range(n)]
+
+
+def _fit_sphere_center_radius(points_xyz):
+    """Fits ``(cx, cy, cz, radius)`` to 3-D points via coordinate-centred
+    algebraic least squares followed by geometric Gauss-Newton refinement, or
+    returns ``None`` when the point set is coplanar/degenerate."""
+    n = len(points_xyz)
+    if n < 8:
+        return None
+    mx = sum(p[0] for p in points_xyz) / n
+    my = sum(p[1] for p in points_xyz) / n
+    mz = sum(p[2] for p in points_xyz) / n
+    scale = max(math.sqrt((p[0] - mx) ** 2 + (p[1] - my) ** 2 + (p[2] - mz) ** 2) for p in points_xyz)
+    if scale <= 1e-4:
+        return None
+
+    ata = [[0.0] * 4 for _ in range(4)]
+    atb = [0.0] * 4
+    for x, y, z in points_xyz:
+        qx, qy, qz = (x - mx) / scale, (y - my) / scale, (z - mz) / scale
+        row = (2.0 * qx, 2.0 * qy, 2.0 * qz, 1.0)
+        b = qx * qx + qy * qy + qz * qz
+        for i in range(4):
+            ri = row[i]
+            atb[i] += ri * b
+            for j in range(4):
+                ata[i][j] += ri * row[j]
+
+    sol = _solve_linear(ata, atb)
+    if sol is None:
+        return None
+    sx, sy, sz, d = sol
+    rho_sq = d + sx * sx + sy * sy + sz * sz
+    if rho_sq <= 1e-12:
+        return None
+    cx = mx + scale * sx
+    cy = my + scale * sy
+    cz = mz + scale * sz
+    radius = scale * math.sqrt(rho_sq)
+
+    # Variable-projection Gauss-Newton refinement on geometric radial residuals.
+    for _ in range(3):
+        dists = []
+        dirs = []
+        ok = True
+        for x, y, z in points_xyz:
+            dx, dy, dz = x - cx, y - cy, z - cz
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist <= 1e-9:
+                ok = False
+                break
+            dists.append(dist)
+            dirs.append((dx / dist, dy / dist, dz / dist))
+        if not ok:
+            break
+        r_mean = sum(dists) / n
+        ux = sum(u[0] for u in dirs) / n
+        uy = sum(u[1] for u in dirs) / n
+        uz = sum(u[2] for u in dirs) / n
+        jtj = [[0.0] * 3 for _ in range(3)]
+        jtr = [0.0] * 3
+        for dist, (dux, duy, duz) in zip(dists, dirs):
+            jx, jy, jz = dux - ux, duy - uy, duz - uz
+            res = dist - r_mean
+            jrow = (jx, jy, jz)
+            for i in range(3):
+                jtr[i] += jrow[i] * res
+                for j in range(3):
+                    jtj[i][j] += jrow[i] * jrow[j]
+        step = _solve_linear(jtj, jtr)
+        if step is None:
+            break
+        cx += step[0]
+        cy += step[1]
+        cz += step[2]
+        radius = sum(
+            math.sqrt((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) for x, y, z in points_xyz
+        ) / n
+        if step[0] ** 2 + step[1] ** 2 + step[2] ** 2 <= 1e-20 * radius * radius:
+            break
+    return cx, cy, cz, radius
+
+
+def _fit_sphere(definition, group_faces, curve_edge_counts, edge_faces):
+    """Tries to recognise ``group_faces`` as a full sphere, spherical cap/dome,
+    or spherical band by algebraic/geometric fitting (#18: SketchUp stores no
+    analytic sphere record). Returns a ``Part.Face`` backed by ``Part.Sphere``
+    or ``None``."""
+    if len(group_faces) < 6:
+        return None
+    edge_use_count = {}
+    face_loops_pts = []
+    all_vids = set()
+    for face in group_faces:
+        if len(face.loops) != 1:
+            return None
+        pts = _loop_points(definition, face.loops[0])
+        if pts is None or len(pts) < 3:
+            return None
+        face_loops_pts.append(pts)
+        for eid, _sign in face.loops[0]:
+            edge = definition.edges.get(eid)
+            if edge is None:
+                return None
+            edge_use_count[eid] = edge_use_count.get(eid, 0) + 1
+            all_vids.add(edge.v1_id)
+            all_vids.add(edge.v2_id)
+
+    if len(all_vids) < 8 or any(cnt > 2 for cnt in edge_use_count.values()):
+        return None
+
+    pts_xyz = []
+    for vid in sorted(all_vids):
+        vv = definition.vertices.get(vid)
+        if vv is None:
+            return None
+        pts_xyz.append((vv.x * INCH_TO_MM, vv.y * INCH_TO_MM, vv.z * INCH_TO_MM))
+
+    est = _fit_sphere_center_radius(pts_xyz)
+    if est is None:
+        return None
+    cx, cy, cz, radius = est
+    if radius <= 1e-4:
+        return None
+    tol_r = 1e-3 * radius
+    for x, y, z in pts_xyz:
+        if abs(math.sqrt((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) - radius) > tol_r:
+            return None
+
+    center = App.Vector(cx, cy, cz)
+    facet_area_sum = 0.0
+    facet_sign = 0
+    for pts in face_loops_pts:
+        vecs = [App.Vector(*p) for p in pts]
+        centroid = sum(vecs, App.Vector()) / len(vecs)
+        rel = [v - centroid for v in vecs]
+        nf = App.Vector()
+        for a, b in zip(rel, rel[1:] + rel[:1]):
+            nf += a.cross(b)
+        area_2 = nf.Length
+        if area_2 <= 1e-12:
+            return None
+        facet_area_sum += 0.5 * area_2
+        rad_c = centroid - center
+        if rad_c.Length < 0.45 * radius:
+            return None
+        cos_ang = nf.dot(rad_c) / (area_2 * rad_c.Length)
+        if abs(cos_ang) < 0.65:
+            return None
+        s = 1 if cos_ang > 0.0 else -1
+        if facet_sign and s != facet_sign:
+            return None
+        facet_sign = s
+
+    if facet_sign == 0:
+        return None
+
+    boundary_eids = [eid for eid, cnt in edge_use_count.items() if cnt == 1]
+    arcs = getattr(definition, "arcs", None) or {}
+    if not boundary_eids:
+        xs, ys, zs = zip(*pts_xyz)
+        if min(max(cs) - min(cs) for cs in (xs, ys, zs)) < 1.5 * radius:
+            return None
+        axis_dir = App.Vector(0.0, 0.0, 1.0)
+        v_min, v_max = -0.5 * math.pi, 0.5 * math.pi
+    else:
+        boundary_cids = {definition.edges[eid].curve_id for eid in boundary_eids}
+        if (
+            len(boundary_cids) == 1
+            and None not in boundary_cids
+            and curve_edge_counts is not None
+        ):
+            cid = next(iter(boundary_cids))
+            arc = arcs.get(cid)
+            if (
+                arc is None
+                or not arc.is_full_circle
+                or len(boundary_eids) != curve_edge_counts.get(cid, 0)
+            ):
+                return None
+            params = _circle_arc_params(arc)
+            if params is None:
+                return None
+            rim_c, _ax, _ay, rim_n, rim_r = params
+            h_proj = (rim_c - center).dot(rim_n)
+            if ((rim_c - center) - rim_n * h_proj).Length > 2e-3 * radius:
+                return None
+            if abs(math.hypot(h_proj, rim_r) - radius) > 2e-3 * radius:
+                return None
+            rel_hs = [(App.Vector(*p) - rim_c).dot(rim_n) for p in pts_xyz]
+            if min(rel_hs) >= -2e-3 * radius and max(rel_hs) > 0.05 * radius:
+                axis_dir = rim_n
+            elif max(rel_hs) <= 2e-3 * radius and min(rel_hs) < -0.05 * radius:
+                axis_dir = -rim_n
+            else:
+                return None
+            # Snap (center, radius) onto the exact ArcCurve rim so the cap's
+            # Part.Circle edge coincides with the dome boundary within sewShape.
+            h_rim = (rim_c - center).dot(axis_dir)
+            c_exact = rim_c - axis_dir * h_rim
+            r_exact = math.hypot(h_rim, rim_r)
+            for x, y, z in pts_xyz:
+                if abs(math.sqrt((x - c_exact.x) ** 2 + (y - c_exact.y) ** 2 + (z - c_exact.z) ** 2) - r_exact) > 1e-3 * r_exact:
+                    return None
+            center, radius = c_exact, r_exact
+            v_min = math.asin(max(-1.0, min(1.0, h_rim / radius)))
+            v_max = 0.5 * math.pi
+        elif (
+            len(boundary_cids) == 2
+            and None not in boundary_cids
+            and curve_edge_counts is not None
+        ):
+            cids = list(boundary_cids)
+            by_c = {
+                c: [e for e in boundary_eids if definition.edges[e].curve_id == c]
+                for c in cids
+            }
+            if any(len(by_c[c]) != curve_edge_counts.get(c, 0) for c in cids):
+                return None
+            a1, a2 = arcs.get(cids[0]), arcs.get(cids[1])
+            if a1 is None or a2 is None or not (a1.is_full_circle and a2.is_full_circle):
+                return None
+            p1, p2 = _circle_arc_params(a1), _circle_arc_params(a2)
+            if p1 is None or p2 is None:
+                return None
+            rc1, _, _, rn1, rr1 = p1
+            rc2, _, _, rn2, rr2 = p2
+            if abs(abs(rn1.dot(rn2)) - 1.0) > 1e-4:
+                return None
+            axis_dir = rn1
+            if (rc2 - rc1).dot(axis_dir) < 0.0:
+                rc1, rc2 = rc2, rc1
+                rr1, rr2 = rr2, rr1
+            span_h = (rc2 - rc1).dot(axis_dir)
+            if span_h <= 1e-3 * radius or ((rc2 - rc1) - axis_dir * span_h).Length > 1e-3 * radius:
+                return None
+            d1 = (rr1 * rr1 - rr2 * rr2 - span_h * span_h) / (2.0 * span_h)
+            d2 = d1 + span_h
+            c_exact = 0.5 * ((rc1 - axis_dir * d1) + (rc2 - axis_dir * d2))
+            r_exact = 0.5 * (math.hypot(d1, rr1) + math.hypot(d2, rr2))
+            if (c_exact - center).Length > 5e-3 * radius or abs(r_exact - radius) > 2e-3 * radius:
+                return None
+            for x, y, z in pts_xyz:
+                if abs(math.sqrt((x - c_exact.x) ** 2 + (y - c_exact.y) ** 2 + (z - c_exact.z) ** 2) - r_exact) > 1e-3 * r_exact:
+                    return None
+            hs = [(App.Vector(*p) - c_exact).dot(axis_dir) for p in pts_xyz]
+            if min(hs) < d1 - 2e-3 * r_exact or max(hs) > d2 + 2e-3 * r_exact:
+                return None
+            center, radius = c_exact, r_exact
+            v_min = math.asin(max(-1.0, min(1.0, d1 / radius)))
+            v_max = math.asin(max(-1.0, min(1.0, d2 / radius)))
+        else:
+            # Open spherical cap without ArcCurve metadata: only fit when no
+            # adjacent face shares the straight boundary segments.
+            if any(len(edge_faces.get(eid, ())) > 1 for eid in boundary_eids):
+                return None
+            b_adj: dict = {}
+            for eid in boundary_eids:
+                e = definition.edges[eid]
+                b_adj.setdefault(e.v1_id, []).append(e.v2_id)
+                b_adj.setdefault(e.v2_id, []).append(e.v1_id)
+            if len(b_adj) < 4 or any(len(nb) != 2 for nb in b_adj.values()):
+                return None
+            ordered_vids = [next(iter(b_adj))]
+            prev_vid = None
+            while True:
+                cur_vid = ordered_vids[-1]
+                nxt_vids = [v for v in b_adj[cur_vid] if v != prev_vid]
+                if not nxt_vids:
+                    return None
+                nxt_vid = nxt_vids[0]
+                if nxt_vid == ordered_vids[0]:
+                    break
+                ordered_vids.append(nxt_vid)
+                prev_vid = cur_vid
+                if len(ordered_vids) > len(b_adj):
+                    return None
+            if len(ordered_vids) != len(b_adj):
+                return None
+            b_vecs = []
+            for vid in ordered_vids:
+                vv = definition.vertices[vid]
+                b_vecs.append(App.Vector(vv.x * INCH_TO_MM, vv.y * INCH_TO_MM, vv.z * INCH_TO_MM))
+            b_mean = sum(b_vecs, App.Vector()) / len(b_vecs)
+            b_rel = [v - b_mean for v in b_vecs]
+            rim_n = App.Vector()
+            for a, b in zip(b_rel, b_rel[1:] + b_rel[:1]):
+                rim_n += a.cross(b)
+            if rim_n.Length <= 1e-9:
+                return None
+            rim_n.normalize()
+            if max(abs(v.dot(rim_n)) for v in b_rel) > 2e-3 * radius:
+                return None
+            h_rim = (b_mean - center).dot(rim_n)
+            hs = [(App.Vector(*p) - center).dot(rim_n) for p in pts_xyz]
+            if min(hs) >= h_rim - 2e-3 * radius and max(hs) > h_rim + 0.05 * radius:
+                axis_dir = rim_n
+                v_min = math.asin(max(-1.0, min(1.0, h_rim / radius)))
+                v_max = 0.5 * math.pi
+            elif max(hs) <= h_rim + 2e-3 * radius and min(hs) < h_rim - 0.05 * radius:
+                axis_dir = -rim_n
+                v_min = math.asin(max(-1.0, min(1.0, -h_rim / radius)))
+                v_max = 0.5 * math.pi
+            else:
+                return None
+
+    if v_max - v_min <= 1e-4:
+        return None
+    try:
+        sph = Part.Sphere()
+        sph.Center = center
+        sph.Radius = radius
+        sph.Axis = axis_dir
+        face_shape = sph.toShape(0.0, 2.0 * math.pi, v_min, v_max)
+        u_mid = math.pi
+        v_mid = 0.5 * (v_min + v_max)
+        n_built = face_shape.normalAt(u_mid, v_mid)
+        rad_mid = sph.value(u_mid, v_mid) - center
+        if n_built.dot(rad_mid) * facet_sign < 0.0:
+            face_shape.reverse()
+        if not face_shape.isValid() or face_shape.Area <= 0.0:
+            return None
+        if not (0.80 * face_shape.Area <= facet_area_sum <= 1.05 * face_shape.Area):
+            return None
+        return face_shape
+    except Exception:
+        return None
+
+
 def _build_own_geometry(definition, model, stats, inherited_material_id):
     """One definition's OWN faces and loose-edge runs (not its nested
     instances), in its local space: ``(shapes, colors)``, where ``colors``
@@ -1050,11 +1457,19 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
         groups, edge_faces = _group_smooth_faces(definition, model, inherited_material_id)
         for group_faces, group_color in groups:
             fitted = _fit_cylinder_or_cone(definition, group_faces, curve_edge_counts)
+            if fitted is None:
+                sph_face = _fit_sphere(definition, group_faces, curve_edge_counts, edge_faces)
+                if sph_face is not None:
+                    fitted = ("sphere", sph_face)
             if fitted is not None:
                 kind, surf_face = fitted
                 fitted_face_ids.update(f.id for f in group_faces)
                 stats["faces_built"] += len(group_faces)
-                key = "cylinders_built" if kind == "cylinder" else "cones_built"
+                key = {
+                    "cylinder": "cylinders_built",
+                    "cone": "cones_built",
+                    "sphere": "spheres_built",
+                }[kind]
                 stats[key] = stats.get(key, 0) + 1
                 shapes.append(surf_face)
                 colors.append(group_color)
@@ -1534,7 +1949,7 @@ class _HierarchyImport:
                    "make_solids": self.stats.get("make_solids", False),
                    "fit_curved_surfaces": self.stats.get("fit_curved_surfaces", False),
                    "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0,
-                   "curved_groups_unfitted": 0}
+                   "spheres_built": 0, "curved_groups_unfitted": 0}
         buckets = _get_local_shape(child, self.model, scratch, self.merged_cache, frozenset(), None,
                                    child_material, "Layer0")
         shapes, colors = [], []
@@ -1636,10 +2051,11 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
 
     ``curved_surfaces=True`` groups faces joined by soft or smooth edges and
     replaces cylinders and cones/frustums recognised from ``Definition.arcs``
-    with true ``Part.Cylinder`` / ``Part.Cone`` faces (leaving non-fitting
-    groups faceted), and imports circles and circular arcs bounding flat faces
-    as true FreeCAD circle/arc edges (#18). ``curved_surfaces=None`` reads the
-    ``FitCurvedSurfaces`` preference (False unless set).
+    and fitted spheres/domes with true ``Part.Cylinder`` / ``Part.Cone`` /
+    ``Part.Sphere`` faces (leaving non-fitting groups faceted), and imports
+    circles and circular arcs bounding flat faces as true FreeCAD circle/arc
+    edges (#18). ``curved_surfaces=None`` reads the ``FitCurvedSurfaces``
+    preference (False unless set).
 
     Each face's resolved color/opacity (its own paint, or whatever an
     ancestor group/component painted itself with, or a neutral default)
@@ -1688,7 +2104,8 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         "make_solids": bool(solids), "solids_built": 0, "faces_left_open": 0,
         "import_assemblies": bool(assemblies), "assemblies": 0,
         "fit_curved_surfaces": bool(curved_surfaces), "face_arcs_built": 0,
-        "cylinders_built": 0, "cones_built": 0, "curved_groups_unfitted": 0,
+        "cylinders_built": 0, "cones_built": 0, "spheres_built": 0,
+        "curved_groups_unfitted": 0,
     }
     last_import_stats = stats
 
@@ -1732,6 +2149,7 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
     if curved_surfaces:
         common += (
             f"; {stats['cylinders_built']} cylinders, {stats['cones_built']} cones, "
+            f"{stats['spheres_built']} spheres, "
             f"{stats['curved_groups_unfitted']} smoothed groups left faceted, "
             f"{stats['face_arcs_built']} circle/arc face edges"
         )

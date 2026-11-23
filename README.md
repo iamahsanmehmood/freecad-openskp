@@ -91,21 +91,23 @@ import falls back to `App::Part`. Export follows `Assembly::AssemblyObject`
 containers the same way it follows `App::Part` and `App::Link`, skipping
 joint/view/BOM/simulation metadata groups.
 
-**Curved surfaces — circles, cylinders and cones** (`FitCurvedSurfaces`, off by
-default): SketchUp has no curved B-rep surfaces, storing cylinders and cones as
-flat facets joined by soft/smooth edges alongside the analytic `ArcCurve`s on
-their rims. With `FitCurvedSurfaces` set to `true` (Tools > Edit parameters,
-`BaseApp/Preferences/Mod/OpenSKP`, Boolean) or
+**Curved surfaces — circles, cylinders, cones and spheres** (`FitCurvedSurfaces`,
+off by default): SketchUp has no curved B-rep surfaces, storing cylinders, cones
+and spheres as flat facets joined by soft/smooth edges (alongside analytic
+`ArcCurve`s on circular rims). With `FitCurvedSurfaces` set to `true` (Tools >
+Edit parameters, `BaseApp/Preferences/Mod/OpenSKP`, Boolean) or
 `import_skp(path, doc, curved_surfaces=True)`:
 
-- Faces joined by soft or smooth edges are grouped into candidate surfaces;
+- Faces joined by soft or smooth edges are grouped into candidate surfaces:
   cylinders and cones/frustums (including partial revolutions, pointed cones,
   and inward cylindrical hole bores) recognised from `Definition.arcs` become
-  true FreeCAD `Part.Cylinder` / `Part.Cone` faces.
+  true FreeCAD `Part.Cylinder` / `Part.Cone` faces, and full spheres, domes and
+  spherical bands whose vertices fit a single radius within `1e-3 * r` become
+  true `Part.Sphere` faces.
 - Analytic circles and circular arcs bounding planar faces (discs, end caps,
   circular holes in plates, half-discs) become true `Part.Circle` / `Part.Arc`
   edges, matching the fitted curved walls so `MakeSolids` sews them into exact
-  B-rep solids.
+  B-rep solids (and promotes closed `Part.Sphere` faces directly to solids).
 - Smoothed groups that do not fit within tolerance stay faceted (with a count
   in the console report), and any circle shared with a wall that stayed faceted
   keeps its polygon segments so neighbouring faces stay water-tight connected.
@@ -279,16 +281,16 @@ directly:
 | `arcs_2017.skp`, `arcs_2021.skp` | 2 | 1 | The same model saved as SketchUp 2017 and 2021: a disc and a half disc (2 faces) and one loose 90 degree arc, which imports as a single real arc edge (radius 254 mm, length 398.98 mm), not a polyline. Pinned in `tests/test_import.py` (`check_arcs`) |
 | `instance_scale_term_2021.skp`, `instance_scale_term_v6.skp` | 12 | 0 | One 100 in cube placed twice, scaled through the 3x3 and through the matrix's scale term (openskp#444), saved as SketchUp 2021 and 6. Both cubes import 1 in wide, at x = 0 and 20 in, as SketchUp reports. Pinned in `tests/test_import.py` (`check_scale_term`) |
 | `plate_with_hole_2017.skp`, `plate_with_hole_2021.skp` | 30 | 0 | A 20 x 20 x 2 in plate with a radius 4 in circular through-hole, saved via SketchUp's own library as 2017 and 2021. With `FitCurvedSurfaces` + `MakeSolids`, imports as a 7-face closed solid with true `Part.Circle` hole wires and an inward `Part.Cylinder` bore (`tests/test_curved_surfaces.py`) |
-| `cylinder_2017.skp`, `cylinder_2021.skp`, `frustum_2017.skp`, `frustum_2021.skp`, `smoothed_blob_2017.skp`, `smoothed_blob_2021.skp` | 26 / 26 / 168 | 0 | Cylinder (`r = 5`, `h = 12` in), frustum (`r1 = 6`, `r2 = 3`, `h = 4` in), and an asymmetric smoothed blob, saved via SketchUp's library as 2017 and 2021. With `FitCurvedSurfaces`, cylinder and frustum become 3-face `Part.Cylinder` / `Part.Cone` solids while the smoothed blob stays 168 planar facets (`tests/test_curved_surfaces.py`) |
+| `cylinder_2017.skp`, `cylinder_2021.skp`, `frustum_2017.skp`, `frustum_2021.skp`, `sphere_2017.skp`, `sphere_2021.skp`, `smoothed_blob_2017.skp`, `smoothed_blob_2021.skp` | 26 / 26 / 128 / 168 | 0 | Cylinder (`r = 5`, `h = 12` in), frustum (`r1 = 6`, `r2 = 3`, `h = 4` in), sphere (`r = 5` in), and an asymmetric smoothed blob, saved via SketchUp's library as 2017 and 2021. With `FitCurvedSurfaces`, cylinder, frustum and sphere become `Part.Cylinder`, `Part.Cone` and `Part.Sphere` B-rep solids while the smoothed blob stays 168 planar facets (`tests/test_curved_surfaces.py`) |
 | `Untitled.skp` | 1,588 | — | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
 | A real structural-framing file (outside the repo) | 9,652 | 1,077 | All faces and loose edges imported, 0 skipped — 93 of the file's 145 definitions were entirely or partly loose-edge (light-gauge-steel members drawn as construction lines), previously silently invisible |
 
-**Arcs, circles, cylinders and cones.** A loose arc or circle drawn in SketchUp (a run of straight edges
-that SketchUp also stores as one exact arc) imports as a real FreeCAD arc or circle with a centre and a
-radius, not a polygon. Faces stay faceted by default; with `FitCurvedSurfaces` enabled, circles and
-circular arcs bounding flat faces become real circle/arc edges and soft/smooth cylinder and cone/frustum
-groups become real `Part.Cylinder` / `Part.Cone` surfaces (spheres still stay faceted for now). A
-non-uniformly scaled arc (an ellipse) stays a polyline.
+**Arcs, circles, cylinders, cones and spheres.** A loose arc or circle drawn in SketchUp (a run of straight
+edges that SketchUp also stores as one exact arc) imports as a real FreeCAD arc or circle with a centre and
+a radius, not a polygon. Faces stay faceted by default; with `FitCurvedSurfaces` enabled, circles and
+circular arcs bounding flat faces become real circle/arc edges and soft/smooth cylinder, cone/frustum and
+sphere groups become real `Part.Cylinder`, `Part.Cone` and `Part.Sphere` surfaces. A non-uniformly scaled
+arc (an ellipse) stays a polyline.
 
 Materials are cross-checked against `openskp`'s own resolved
 `materials_by_id` for the same fixtures (not just "some color got
