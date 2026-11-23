@@ -100,8 +100,10 @@ production file (see tests/test_export.py and the README).
 from __future__ import annotations
 
 import importlib.util
+import logging
 import math
 import os
+import re
 import sys
 import time
 
@@ -2022,6 +2024,65 @@ class _HierarchyImport:
         return model_part
 
 
+class _CapturedWarnings(logging.Handler):
+    """Collects warnings the openskp library logs while opening or parsing a
+    file (such as a classic .skp whose root entity list stopped early,
+    openskp#552), deduplicated in order so FreeCAD's Report view shows them."""
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages = []
+
+    def emit(self, record):
+        message = record.getMessage()
+        if message not in self.messages:
+            self.messages.append(message)
+
+
+class _capture_library_warnings:
+    def __enter__(self):
+        self.handler = _CapturedWarnings()
+        self._logger = logging.getLogger("openskp")
+        self._saved_level = self._logger.level
+        if self._logger.getEffectiveLevel() > logging.WARNING:
+            self._logger.setLevel(logging.WARNING)
+        self._logger.addHandler(self.handler)
+        return self.handler.messages
+
+    def __exit__(self, *exc_info):
+        self._logger.removeHandler(self.handler)
+        self._logger.setLevel(self._saved_level)
+        return False
+
+
+def _reconcile_partial_read_warnings(model, filepath, library_warnings):
+    """Returns ``unread_root_entities`` (0 with an openskp release older than
+    openskp#552, where ``SkpModel`` has no such attribute) and ensures
+    ``library_warnings`` starts with a clear partial-read message whenever any
+    root entities were dropped."""
+    unread = (
+        int(model.unread_root_entities)
+        if hasattr(model, "unread_root_entities") and model.unread_root_entities
+        else 0
+    )
+    if not unread:
+        for message in library_warnings:
+            if "read only in part" in message:
+                match = re.search(r"\((\d+)\s+unread\)", message)
+                if match:
+                    unread = int(match.group(1))
+                    break
+    if unread > 0 and not any("read only in part" in m for m in library_warnings):
+        library_warnings.insert(
+            0,
+            f"{os.path.basename(filepath)} was read only in part "
+            f"({unread} root entities could not be read and were dropped)",
+        )
+    else:
+        library_warnings.sort(key=lambda m: 0 if "read only in part" in m else 1)
+    return unread
+
+
 def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, curved_surfaces=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
@@ -2092,8 +2153,12 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
     print(f"openskp: parsing {os.path.basename(filepath)} "
           "(can take a while for a large file - this is real work, not a hang)...")
     t0 = time.time()
-    skp = openskp.SkpFile.open(filepath)
-    model = skp.parse()
+    with _capture_library_warnings() as library_warnings:
+        skp = openskp.SkpFile.open(filepath)
+        model = skp.parse()
+    unread_root_entities = _reconcile_partial_read_warnings(model, filepath, library_warnings)
+    for message in library_warnings:
+        App.Console.PrintWarning(f"openskp: {message}\n")
     print(f"openskp: parsed in {time.time() - t0:.1f}s, building geometry...")
 
     t0 = time.time()
@@ -2106,6 +2171,8 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         "fit_curved_surfaces": bool(curved_surfaces), "face_arcs_built": 0,
         "cylinders_built": 0, "cones_built": 0, "spheres_built": 0,
         "curved_groups_unfitted": 0,
+        "unread_root_entities": unread_root_entities,
+        "warnings": list(library_warnings),
     }
     last_import_stats = stats
 
@@ -2153,6 +2220,8 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
             f"{stats['curved_groups_unfitted']} smoothed groups left faceted, "
             f"{stats['face_arcs_built']} circle/arc face edges"
         )
+    if unread_root_entities > 0:
+        common += f"; {unread_root_entities} unread root entities"
     if merge:
         print(
             f"openskp: {built} unique definitions built in {time.time() - t0:.1f}s {common}, "
