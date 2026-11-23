@@ -67,7 +67,10 @@ origin (see
 When `MergeOnImport` is not set, files below 1,000 definitions use the
 component hierarchy and files with **1,000 or more** definitions switch to the
 merged layout automatically, printing a console message with the definition
-count and how to force the hierarchy. Your explicit choice always wins: open
+count and how to force the hierarchy. Requesting assemblies (`ImportAssemblies`
+set to `true` or `assemblies=True`) also keeps the component hierarchy unless
+`MergeOnImport=true` or `merge=True` is set explicitly. Your explicit choice
+always wins: open
 Tools > Edit parameters, go to `BaseApp/Preferences/Mod/OpenSKP`, and add a
 Boolean `MergeOnImport` set to `true` (always merged) or `false` (always keep
 the component hierarchy); from Python, pass `importSKP.import_skp(path, doc,

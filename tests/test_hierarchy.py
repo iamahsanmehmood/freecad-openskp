@@ -466,10 +466,14 @@ def _write_n_definitions(path, count):
 
     b = openskp.create()
     defs = []
-    for i in range(count):
+    for i in range(count - 1):
         with b.add_component_definition(f"D_{i}") as comp:
             comp.add_face([(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)])
         defs.append(comp)
+    with b.add_component_definition(f"D_{count - 1}") as asm:
+        asm.add_face([(0, 0, 0), (4, 0, 0), (4, 4, 0), (0, 4, 0)])
+        asm.add_instance(defs[0], translation=(1.0, 1.0, 0.0))
+    defs.append(asm)
     for i, comp in enumerate(defs):
         b.add_instance(comp, translation=((i % 50) * 3.0, (i // 50) * 3.0, 0.0))
     with open(path, "wb") as f:
@@ -508,7 +512,17 @@ def check_large_hierarchy_warning():
             _write_n_definitions(below_path, threshold - 1)
             _write_n_definitions(at_path, threshold)
 
-            def run_case(skp_path, pref_val, merge_arg, want_layout, want_reason, want_auto_msg, want_warn):
+            def run_case(
+                skp_path,
+                pref_val,
+                merge_arg,
+                want_layout,
+                want_reason,
+                want_auto_msg,
+                want_warn,
+                assemblies_pref=None,
+                assemblies_arg=None,
+            ):
                 if pref_val is None:
                     params.RemBool("MergeOnImport")
                     assert importSKP._merge_on_import_preference() is None
@@ -516,25 +530,34 @@ def check_large_hierarchy_warning():
                     params.SetBool("MergeOnImport", pref_val)
                     assert importSKP._merge_on_import_preference() is pref_val
 
+                if assemblies_pref is None:
+                    params.RemBool("ImportAssemblies")
+                else:
+                    params.SetBool("ImportAssemblies", assemblies_pref)
+
                 messages.clear()
                 warnings.clear()
                 doc = App.newDocument()
                 try:
-                    if merge_arg is None:
-                        importSKP.import_skp(skp_path, doc)
-                    else:
-                        importSKP.import_skp(skp_path, doc, merge=merge_arg)
+                    kwargs = {}
+                    if merge_arg is not None:
+                        kwargs["merge"] = merge_arg
+                    if assemblies_arg is not None:
+                        kwargs["assemblies"] = assemblies_arg
+                    importSKP.import_skp(skp_path, doc, **kwargs)
                     stats = importSKP.last_import_stats
                     want_merged = want_layout == "merged"
-                    tag = (os.path.basename(skp_path), pref_val, merge_arg)
+                    tag = (os.path.basename(skp_path), pref_val, merge_arg, assemblies_pref, assemblies_arg)
                     assert stats["merged"] is want_merged, (tag, stats)
                     assert stats["layout"] == want_layout, (tag, stats)
                     assert stats["layout_reason"] == want_reason, (tag, stats)
                     assert stats["auto_merged"] is want_auto_msg, (tag, stats)
                     assert stats["large_hierarchy_warning"] is want_warn, (tag, stats)
 
-                    parts = [o for o in doc.Objects if o.TypeId == "App::Part"]
+                    parts = [o for o in doc.Objects if o.TypeId in ("App::Part", "Assembly::AssemblyObject")]
                     assert bool(parts) is not want_merged, (tag, len(parts))
+                    if want_reason == "assemblies" and importSKP._assembly_available():
+                        assert stats["assemblies"] == 1, (tag, stats)
 
                     if want_auto_msg:
                         assert any(
@@ -575,13 +598,25 @@ def check_large_hierarchy_warning():
                 run_case(at_path, pref_val, False, "hierarchy", "argument", False, True)
                 run_case(below_path, pref_val, True, "merged", "argument", False, False)
                 run_case(at_path, pref_val, True, "merged", "argument", False, False)
+
+            # 3. Requesting assemblies (ImportAssemblies=True preference or assemblies=True
+            #    argument) keeps the hierarchy at >= 1,000 definitions with the large-hierarchy
+            #    warning when MergeOnImport is unset, while explicit MergeOnImport=True or
+            #    merge=True still wins:
+            run_case(at_path, None, None, "hierarchy", "assemblies", False, True, assemblies_pref=True)
+            run_case(at_path, None, None, "hierarchy", "assemblies", False, True, assemblies_arg=True)
+            run_case(at_path, True, None, "merged", "preference", False, False, assemblies_pref=True)
+            run_case(at_path, True, None, "merged", "preference", False, False, assemblies_arg=True)
+            run_case(at_path, None, True, "merged", "argument", False, False, assemblies_pref=True)
+            run_case(at_path, None, True, "merged", "argument", False, False, assemblies_arg=True)
     finally:
         params.RemBool("MergeOnImport")
+        params.RemBool("ImportAssemblies")
         App.Console.PrintMessage = orig_print_message
         App.Console.PrintWarning = orig_print_warning
     print(
-        f"check_large_hierarchy_warning: OK (6 preference-table cells + 12 explicit-arg overrides "
-        f"verified at {threshold - 1} and {threshold} defs)"
+        f"check_large_hierarchy_warning: OK (6 preference-table cells, 12 explicit-arg overrides, "
+        f"and 6 ImportAssemblies/assemblies=True cells verified at {threshold - 1} and {threshold} defs)"
     )
 
 

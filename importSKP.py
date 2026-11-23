@@ -1723,14 +1723,16 @@ def _merge_on_import_preference():
         return None
 
 
-def _resolve_import_layout(merge_arg, num_definitions):
+def _resolve_import_layout(merge_arg, num_definitions, assemblies_requested=False):
     """Returns ``(merge_bool, layout_reason)`` where ``layout_reason`` is
-    ``'argument'``, ``'preference'`` or ``'automatic'`` (#38)."""
+    ``'argument'``, ``'preference'``, ``'assemblies'`` or ``'automatic'`` (#38)."""
     if merge_arg is not None:
         return bool(merge_arg), "argument"
     pref = _merge_on_import_preference()
     if pref is not None:
         return bool(pref), "preference"
+    if assemblies_requested:
+        return False, "assemblies"
     return num_definitions >= _LARGE_HIERARCHY_DEFINITION_THRESHOLD, "automatic"
 
 
@@ -2138,10 +2140,11 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
 
     ``merge=None`` checks the ``MergeOnImport`` preference (Tools > Edit
     parameters, BaseApp/Preferences/Mod/OpenSKP): an explicit ``true`` or
-    ``false`` always wins; when unset, models below 1,000 definitions use the
-    component hierarchy and models with 1,000 or more definitions switch to
-    the merged layout automatically (#38). An explicit ``merge=True`` or
-    ``merge=False`` argument always wins over both.
+    ``false`` always wins; when unset, models below 1,000 definitions (or when
+    assemblies are requested via ``ImportAssemblies`` or ``assemblies=True``)
+    keep the component hierarchy and models with 1,000 or more definitions
+    switch to the merged layout automatically (#38). An explicit ``merge=True``
+    or ``merge=False`` argument always wins over all of these.
 
     ``solids=True`` sews each component's own faces and turns every closed
     shell into a solid (#21); faces that close no volume stay faces. In
@@ -2194,7 +2197,9 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         App.Console.PrintWarning(f"openskp: {message}\n")
 
     num_definitions = len(model.definitions)
-    merge, layout_reason = _resolve_import_layout(merge, num_definitions)
+    merge, layout_reason = _resolve_import_layout(
+        merge, num_definitions, assemblies_requested=bool(assemblies)
+    )
     layout_name = "merged" if merge else "hierarchy"
     auto_merged = bool(merge and layout_reason == "automatic")
     if auto_merged:
