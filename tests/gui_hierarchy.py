@@ -159,6 +159,21 @@ def main():
         Gui.updateGui()
         lines.append(f"assemblies: the view draws {drawn} mm, AssemblyWorkbench activates Table (5 components)")
 
+        # FitCurvedSurfaces (#18, part 1): circular hole wires on flat plate faces draw
+        # with the exact plate bounds and keep 1:1 per-face DiffuseColor.
+        plate_path = os.path.join(TESTS, "fixtures", "plate_with_hole_2021.skp")
+        plate_doc = App.newDocument("PlateWithHole")
+        importSKP.import_skp(plate_path, plate_doc, merge=False, curved_surfaces=True)
+        stats = importSKP.last_import_stats
+        assert stats["face_arcs_built"] == 2, stats
+        for name in stats["object_face_colors"]:
+            obj = plate_doc.getObject(name)
+            assert len(obj.ViewObject.DiffuseColor) == len(obj.Shape.Faces), name
+        view = _show(plate_doc, "plate_with_hole")
+        plate_drawn = _drawn_bounds(view)
+        _check_bounds("plate_with_hole", plate_drawn, ((-10, 10), (-10, 10), (0, 2)), mm)
+        lines.append(f"plate_with_hole: the view draws {plate_drawn} mm, circular hole wires valid")
+
         _finish("PASS\n" + "\n".join(lines), 0)
     except BaseException:
         _finish("FAIL\n" + traceback.format_exc(), 1)

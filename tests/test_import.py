@@ -54,6 +54,11 @@ EXPECTED = {
     # scale term (openskp#444); see check_scale_term. Saved by SketchUp's own library as 2021 and 6.
     "instance_scale_term_2021.skp": (12, 0, 0, 0, 1, 0),
     "instance_scale_term_v6.skp": (12, 0, 0, 0, 1, 0),
+    # a 20 x 20 x 2 in rectangular plate with an r = 4 in circular through-hole (30 faces: top and
+    # bottom perforated faces, 4 outer sides, 24 smoothed inner bore facets), saved via SketchUp's
+    # own library as 2017 and 2021; see tests/test_curved_surfaces.py.
+    "plate_with_hole_2017.skp": (30, 0, 0, 0, 1, 0),
+    "plate_with_hole_2021.skp": (30, 0, 0, 0, 1, 0),
 }
 
 

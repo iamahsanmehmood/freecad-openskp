@@ -91,6 +91,16 @@ import falls back to `App::Part`. Export follows `Assembly::AssemblyObject`
 containers the same way it follows `App::Part` and `App::Link`, skipping
 joint/view/BOM/simulation metadata groups.
 
+**Circles and arcs on flat faces** (`FitCurvedSurfaces`, off by default):
+SketchUp stores circles and arcs as straight-edge polygons alongside their
+analytic `ArcCurve` parameters. With `FitCurvedSurfaces` set to `true`
+(Tools > Edit parameters, `BaseApp/Preferences/Mod/OpenSKP`, Boolean) or
+`import_skp(path, doc, curved_surfaces=True)`, circles and circular arcs that
+bound planar faces (a circular disc, a circular hole in a plate, a half-disc)
+import as true FreeCAD `Part.Circle` / `Part.Arc` edges instead of straight
+polygon segments. Non-uniformly scaled arcs (ellipses) stay polygonal, and
+export discretises curved face wires back into ordered SketchUp loops.
+
 The two layouts show exactly the same geometry: the tests import every
 fixture both ways and compare faces, areas, vertices and edges
 (`tests/test_hierarchy.py`), and check in FreeCAD's real GUI that the 3D
@@ -259,14 +269,16 @@ directly:
 | `Test_Component.skp` | 124 | 0 | 106 source polygons; 14 non-planar polygons become 32 planar triangles, 0 skipped. All original boundary vertices retained; sews into one valid closed solid and passes the detailed BOP check. See `tests/test_nonplanar.py` |
 | `arcs_2017.skp`, `arcs_2021.skp` | 2 | 1 | The same model saved as SketchUp 2017 and 2021: a disc and a half disc (2 faces) and one loose 90 degree arc, which imports as a single real arc edge (radius 254 mm, length 398.98 mm), not a polyline. Pinned in `tests/test_import.py` (`check_arcs`) |
 | `instance_scale_term_2021.skp`, `instance_scale_term_v6.skp` | 12 | 0 | One 100 in cube placed twice, scaled through the 3x3 and through the matrix's scale term (openskp#444), saved as SketchUp 2021 and 6. Both cubes import 1 in wide, at x = 0 and 20 in, as SketchUp reports. Pinned in `tests/test_import.py` (`check_scale_term`) |
+| `plate_with_hole_2017.skp`, `plate_with_hole_2021.skp` | 30 | 0 | A 20 x 20 x 2 in plate with a radius 4 in circular through-hole, saved via SketchUp's own library as 2017 and 2021. With `FitCurvedSurfaces` enabled, both perforated plate faces get true `Part.Circle` inner hole wires (`r = 101.6` mm, exact area). Pinned in `tests/test_curved_surfaces.py` |
 | `Untitled.skp` | 1,588 | — | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
 | A real structural-framing file (outside the repo) | 9,652 | 1,077 | All faces and loose edges imported, 0 skipped — 93 of the file's 145 definitions were entirely or partly loose-edge (light-gauge-steel members drawn as construction lines), previously silently invisible |
 
 **Arcs and circles.** A loose arc or circle drawn in SketchUp (a run of straight edges that SketchUp
 also stores as one exact arc) imports as a real FreeCAD arc or circle with a centre and a radius, not
-a polygon. Faces are not changed: SketchUp has no curved surfaces, so a disc is still a flat face with
-a polygon boundary, an arc that bounds a face stays part of it, and cylinders and spheres stay faceted.
-A non-uniformly scaled arc (an ellipse) stays a polyline.
+a polygon. Faces keep their polygon boundaries by default; with `FitCurvedSurfaces` enabled, circles and
+circular arcs that bound flat faces (a disc, a circular hole in a plate, a half-disc) also become real
+FreeCAD circle or arc edges, while cylinders, cones and spheres stay faceted for now. A non-uniformly
+scaled arc (an ellipse) stays a polyline.
 
 Materials are cross-checked against `openskp`'s own resolved
 `materials_by_id` for the same fixtures (not just "some color got
