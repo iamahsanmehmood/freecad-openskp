@@ -22,3 +22,19 @@ once through the matrix's scale term (index 12 = 0.01, translation 2000 in;
 openskp#444). SketchUp reports both cubes as 1 x 1 x 1 in, at x = 0 and
 x = 20 in, which `check_scale_term` in `tests/test_import.py` checks. No
 private content.
+
+`plate_with_hole_2017.skp` and `plate_with_hole_2021.skp` were built and saved
+through SketchUp's own C library (`SketchUpAPI.dll`, `SUModelSaveToFileWithVersion`)
+as SketchUp 2017 and SketchUp 2021 files: a 20 x 20 x 2 in rectangular plate
+centred at the origin (`z = 0..2` in) with a radius 4 in, 24-segment circular
+through-hole (`SUArcCurve` full circles on the top and bottom perforated faces,
+24 soft and smooth vertical bore edges, 30 faces total). Verified by
+`tests/test_curved_surfaces.py`. No private content.
+
+`cylinder_2017.skp`, `cylinder_2021.skp`, `frustum_2017.skp`, `frustum_2021.skp`,
+`smoothed_blob_2017.skp` and `smoothed_blob_2021.skp` were likewise built and
+saved through SketchUp's own C library as SketchUp 2017 and 2021 files (#18):
+a radius 5 in, height 12 in cylinder (26 faces), a `r1 = 6` in to `r2 = 3` in,
+height 4 in frustum (26 faces), and a closed asymmetric wavy blob with all 252
+edges marked soft and smooth (168 triangular faces, which must stay faceted).
+No private content.

@@ -59,9 +59,10 @@ edges were silently invisible before this.
 Arcs and circles: a loose-edge run that is exactly one whole arc or circle
 (SketchUp keeps the exact arc beside its run of straight edges: openskp's
 Definition.arcs) is imported as a real FreeCAD arc or circle, with a centre
-and a radius, instead of the polyline (see _make_arc_edge). Faces are not
-changed: SketchUp has no curved surfaces, so a disc is still a flat face with
-a polygon boundary, and an arc that bounds a face stays part of it.
+and a radius, instead of the polyline (see _make_arc_edge). Faces keep their
+polygon boundaries by default; with curved_surfaces=True (or FitCurvedSurfaces),
+analytic circles and circular arcs bounding planar faces become real FreeCAD
+circle/arc edges too (see _make_curved_loop_wire).
 
 Component hierarchy (the default; see _HierarchyImport): one App::Part per
 component definition and one App::Link per placement, the way SketchUp
@@ -208,6 +209,31 @@ def _make_loose_edge_wire(points_mm, closed):
         return None
 
 
+def _circle_arc_params(arc):
+    """Validates an openskp ``ArcCurve`` as a true circular arc (not a
+    non-uniformly scaled ellipse) and returns ``(center, ax, ay, normal,
+    radius)`` in millimetres, with ``normal`` a unit ``App.Vector``, or
+    ``None``."""
+    cx, cy, cz = (c * INCH_TO_MM for c in arc.center)
+    ax = [c * INCH_TO_MM for c in arc.x_axis]
+    ay = [c * INCH_TO_MM for c in arc.y_axis]
+    radius = math.sqrt(sum(c * c for c in ax))
+    if radius <= 0.0:
+        return None
+    dot = sum(a * b for a, b in zip(ax, ay))
+    if abs(math.sqrt(sum(c * c for c in ay)) - radius) > 1e-6 * radius or abs(dot) > 1e-6 * radius * radius:
+        return None  # an ellipse (a non-uniformly scaled arc), not a circle
+    normal = App.Vector(
+        ax[1] * ay[2] - ax[2] * ay[1],
+        ax[2] * ay[0] - ax[0] * ay[2],
+        ax[0] * ay[1] - ax[1] * ay[0],
+    )
+    if normal.Length == 0.0:
+        return None
+    normal.normalize()
+    return App.Vector(cx, cy, cz), ax, ay, normal, radius
+
+
 def _make_arc_edge(definition, edge_ids):
     """Builds a real FreeCAD arc (or circle) for one loose-edge run that is
     exactly one whole arc curve of SketchUp's, in the definition's local
@@ -239,33 +265,21 @@ def _make_arc_edge(definition, edge_ids):
     if sum(1 for e in definition.edges.values() if e.curve_id == curve_id) != len(edge_ids):
         return None
 
-    cx, cy, cz = (c * INCH_TO_MM for c in arc.center)
-    ax = [c * INCH_TO_MM for c in arc.x_axis]
-    ay = [c * INCH_TO_MM for c in arc.y_axis]
-    radius = math.sqrt(sum(c * c for c in ax))
-    if radius <= 0.0:
+    params = _circle_arc_params(arc)
+    if params is None:
         return None
-    dot = sum(a * b for a, b in zip(ax, ay))
-    if abs(math.sqrt(sum(c * c for c in ay)) - radius) > 1e-6 * radius or abs(dot) > 1e-6 * radius * radius:
-        return None  # an ellipse (a non-uniformly scaled arc), not a circle
+    center, ax, ay, normal, radius = params
 
     def point(t):
         return App.Vector(
-            cx + math.cos(t) * ax[0] + math.sin(t) * ay[0],
-            cy + math.cos(t) * ax[1] + math.sin(t) * ay[1],
-            cz + math.cos(t) * ax[2] + math.sin(t) * ay[2],
+            center.x + math.cos(t) * ax[0] + math.sin(t) * ay[0],
+            center.y + math.cos(t) * ax[1] + math.sin(t) * ay[1],
+            center.z + math.cos(t) * ax[2] + math.sin(t) * ay[2],
         )
 
     try:
         if arc.is_full_circle:
-            normal = App.Vector(
-                ax[1] * ay[2] - ax[2] * ay[1],
-                ax[2] * ay[0] - ax[0] * ay[2],
-                ax[0] * ay[1] - ax[1] * ay[0],
-            )
-            if normal.Length == 0.0:
-                return None
-            return Part.Circle(App.Vector(cx, cy, cz), normal, radius).toShape()
+            return Part.Circle(center, normal, radius).toShape()
         t0, t1 = arc.start_angle, arc.end_angle
         return Part.Arc(point(t0), point((t0 + t1) / 2.0), point(t1)).toShape()
     except Exception:
@@ -420,13 +434,166 @@ def _nonplanar_triangles(points):
     return triangles
 
 
-def _make_face_shape(definition, face):
+def _make_curved_loop_wire(definition, loop, pts, curve_edge_counts):
+    """Builds a planar boundary ``Part.Wire`` replacing any complete circular
+    ``ArcCurve`` in ``loop`` with a true ``Part.Circle`` or ``Part.Arc`` edge
+    (#18), returning ``(wire, arc_count)`` or ``None`` when ``loop`` contains
+    no replaceable circular arcs (or if curve/wire construction fails).
+
+    A full-circle loop's axis is oriented to match ``loop``'s own Newell
+    winding rather than ``arc.normal`` directly, so inner hole loops keep
+    their opposite (clockwise) winding when ``Part.Face(wires)`` adds them to
+    the outer wire.
+    """
+    arcs = getattr(definition, "arcs", None)
+    if not arcs or len(loop) < 3:
+        return None
+    directed = []
+    for edge_id, sign in loop:
+        edge = definition.edges.get(edge_id)
+        if edge is None:
+            return None
+        v_start = edge.v1_id if sign >= 0 else edge.v2_id
+        v_end = edge.v2_id if sign >= 0 else edge.v1_id
+        if v_start not in definition.vertices or v_end not in definition.vertices:
+            return None
+        directed.append((edge, v_start, v_end))
+    for i in range(len(directed)):
+        if directed[i][2] != directed[(i + 1) % len(directed)][1]:
+            return None
+
+    vecs = [App.Vector(*p) for p in pts]
+    origin = sum(vecs, App.Vector()) / len(vecs)
+    rel = [p - origin for p in vecs]
+    loop_normal = App.Vector()
+    for a, b in zip(rel, rel[1:] + rel[:1]):
+        loop_normal += a.cross(b)
+    if loop_normal.Length <= 1e-12:
+        return None
+    loop_normal.normalize()
+    if max(abs(p.dot(loop_normal)) for p in rel) > 1e-4:
+        return None
+
+    first_cid = directed[0][0].curve_id
+    if (
+        first_cid is not None
+        and all(e.curve_id == first_cid for e, _, _ in directed)
+        and len(directed) == curve_edge_counts.get(first_cid, 0)
+    ):
+        arc = arcs.get(first_cid)
+        if arc is not None and arc.is_full_circle:
+            params = _circle_arc_params(arc)
+            if params is not None:
+                center, _ax, _ay, normal, radius = params
+                plane_tol = max(1e-4, 1e-3 * radius)
+                if (
+                    abs(abs(normal.dot(loop_normal)) - 1.0) <= 1e-4
+                    and all(
+                        abs((p - center).Length - radius) <= 1e-3 * radius
+                        and abs((p - center).dot(normal)) <= plane_tol
+                        for p in vecs
+                    )
+                ):
+                    axis = normal if normal.dot(loop_normal) >= 0.0 else -normal
+                    try:
+                        wire = Part.Wire([Part.Circle(center, axis, radius).toShape()])
+                        if wire.isClosed() and wire.isValid():
+                            return wire, 1
+                    except Exception:
+                        return None
+        return None
+
+    if directed[0][0].curve_id is not None and directed[0][0].curve_id == directed[-1][0].curve_id:
+        for k in range(1, len(directed)):
+            if directed[k][0].curve_id != directed[0][0].curve_id:
+                directed = directed[k:] + directed[:k]
+                vecs = vecs[k:] + vecs[:k]
+                break
+
+    runs = []
+    for (edge, vs, ve), p_start in zip(directed, vecs):
+        cid = edge.curve_id
+        if cid is not None and runs and runs[-1][0] == cid:
+            runs[-1][1].append((edge, vs, ve, p_start))
+        else:
+            runs.append((cid, [(edge, vs, ve, p_start)]))
+
+    seen_cids = set()
+    repeated_cids = set()
+    for cid, _items in runs:
+        if cid is not None:
+            if cid in seen_cids:
+                repeated_cids.add(cid)
+            seen_cids.add(cid)
+
+    wire_edges = []
+    arc_count = 0
+    try:
+        for cid, items in runs:
+            built_arc = None
+            if (
+                cid is not None
+                and cid not in repeated_cids
+                and len(items) >= 2
+                and len(items) == curve_edge_counts.get(cid, 0)
+            ):
+                arc = arcs.get(cid)
+                if arc is not None and not arc.is_full_circle:
+                    params = _circle_arc_params(arc)
+                    if params is not None:
+                        center, ax, ay, normal, radius = params
+                        end_v = definition.vertices[items[-1][2]]
+                        p_end = App.Vector(end_v.x * INCH_TO_MM, end_v.y * INCH_TO_MM, end_v.z * INCH_TO_MM)
+                        run_pts = [it[3] for it in items] + [p_end]
+                        plane_tol = max(1e-4, 1e-3 * radius)
+                        if (
+                            abs(abs(normal.dot(loop_normal)) - 1.0) <= 1e-4
+                            and all(
+                                abs((p - center).Length - radius) <= 1e-3 * radius
+                                and abs((p - center).dot(normal)) <= plane_tol
+                                for p in run_pts
+                            )
+                        ):
+                            t_mid = 0.5 * (arc.start_angle + arc.end_angle)
+                            p_mid = App.Vector(
+                                center.x + math.cos(t_mid) * ax[0] + math.sin(t_mid) * ay[0],
+                                center.y + math.cos(t_mid) * ax[1] + math.sin(t_mid) * ay[1],
+                                center.z + math.cos(t_mid) * ax[2] + math.sin(t_mid) * ay[2],
+                            )
+                            p_start = items[0][3]
+                            if (
+                                (p_end - p_start).Length > 1e-6
+                                and (p_mid - p_start).Length > 1e-6
+                                and (p_end - p_mid).Length > 1e-6
+                            ):
+                                built_arc = Part.Arc(p_start, p_mid, p_end).toShape()
+            if built_arc is not None:
+                wire_edges.append(built_arc)
+                arc_count += 1
+            else:
+                for _edge, _vs, ve_id, p_s in items:
+                    ve = definition.vertices[ve_id]
+                    p_e = App.Vector(ve.x * INCH_TO_MM, ve.y * INCH_TO_MM, ve.z * INCH_TO_MM)
+                    wire_edges.append(Part.makeLine(p_s, p_e))
+        if arc_count == 0:
+            return None
+        wire = Part.Wire(wire_edges)
+        if wire.isClosed() and wire.isValid():
+            return wire, arc_count
+    except Exception:
+        return None
+    return None
+
+
+def _make_face_shape(definition, face, curve_edge_counts=None, stats=None):
     """Builds one face's shape in the definition's own LOCAL space
     (no world transform applied - that happens once per placement,
     cheaply, via _to_freecad_matrix + transformShape). Returns one Face,
     a compound of planar triangles for a warped simple polygon, or None.
     """
     wires = []
+    curved_wires = []
+    curved_arc_count = 0
     loops = []
     for loop in face.loops:
         pts = _loop_points(definition, loop)
@@ -437,8 +604,24 @@ def _make_face_shape(definition, face):
             return None
         wires.append(wire)
         loops.append(pts)
+        if curve_edge_counts:
+            curved = _make_curved_loop_wire(definition, loop, pts, curve_edge_counts)
+            if curved is not None:
+                curved_wires.append(curved[0])
+                curved_arc_count += curved[1]
+            else:
+                curved_wires.append(wire)
     if not wires:
         return None
+    if curved_arc_count:
+        try:
+            curved_face = Part.Face(curved_wires)
+            if curved_face.isValid() and curved_face.Area > 0:
+                if stats is not None:
+                    stats["face_arcs_built"] = stats.get("face_arcs_built", 0) + curved_arc_count
+                return curved_face
+        except Exception:
+            pass
     try:
         return Part.Face(wires)
     except Exception:
@@ -537,6 +720,311 @@ def _make_solids(faces, colors, stats):
     return out_shapes, out_colors
 
 
+def _arc_point_mm(center, ax, ay, angle):
+    return App.Vector(
+        center.x + math.cos(angle) * ax[0] + math.sin(angle) * ay[0],
+        center.y + math.cos(angle) * ax[1] + math.sin(angle) * ay[1],
+        center.z + math.cos(angle) * ax[2] + math.sin(angle) * ay[2],
+    )
+
+
+def _group_smooth_faces(definition, model, inherited_material_id):
+    """Groups faces joined by soft or smooth edges (and sharing the same
+    resolved display colour, since FreeCAD stores one DiffuseColor per face)
+    into candidate curved-surface components (#18). Returns
+    ``(candidate_groups, edge_faces)`` where each entry of ``candidate_groups``
+    is ``(faces_list, rgba)`` with ``len(faces_list) >= 2``."""
+    faces_by_id = definition.faces
+    if len(faces_by_id) < 2:
+        return [], {}
+    colors_by_id = {
+        fid: _resolve_face_color(face, model, inherited_material_id)
+        for fid, face in faces_by_id.items()
+    }
+    edge_faces: dict = {}
+    for fid, face in faces_by_id.items():
+        for loop in face.loops:
+            for eid, _sign in loop:
+                fids = edge_faces.setdefault(eid, [])
+                if not fids or fids[-1] != fid:
+                    fids.append(fid)
+
+    adj: dict = {fid: [] for fid in faces_by_id}
+    for eid, fids in edge_faces.items():
+        if len(fids) != 2:
+            continue
+        edge = definition.edges.get(eid)
+        if edge is None or not (edge.soft or edge.smooth):
+            continue
+        f1, f2 = fids
+        if f1 != f2 and colors_by_id[f1] == colors_by_id[f2]:
+            adj[f1].append(f2)
+            adj[f2].append(f1)
+
+    visited = set()
+    groups = []
+    for fid in faces_by_id:
+        if fid in visited or not adj[fid]:
+            continue
+        comp = []
+        stack = [fid]
+        visited.add(fid)
+        while stack:
+            cur = stack.pop()
+            comp.append(faces_by_id[cur])
+            for nxt in adj[cur]:
+                if nxt not in visited:
+                    visited.add(nxt)
+                    stack.append(nxt)
+        if len(comp) >= 2:
+            groups.append((comp, colors_by_id[fid]))
+    return groups, edge_faces
+
+
+def _fit_cylinder_or_cone(definition, group_faces, curve_edge_counts):
+    """Tries to recognise ``group_faces`` (a connected soft/smooth facet group)
+    as a cylinder or a cone/frustum from SketchUp's analytic ``Definition.arcs``
+    (#18). Returns ``("cylinder" | "cone", face_shape)`` or ``None``."""
+    arcs = getattr(definition, "arcs", None)
+    if not arcs or not curve_edge_counts:
+        return None
+
+    edge_use_count = {}
+    face_loops_pts = []
+    all_vids = set()
+    for face in group_faces:
+        if len(face.loops) != 1:
+            return None
+        pts = _loop_points(definition, face.loops[0])
+        if pts is None or len(pts) < 3:
+            return None
+        face_loops_pts.append(pts)
+        for eid, _sign in face.loops[0]:
+            edge = definition.edges.get(eid)
+            if edge is None:
+                return None
+            edge_use_count[eid] = edge_use_count.get(eid, 0) + 1
+            all_vids.add(edge.v1_id)
+            all_vids.add(edge.v2_id)
+
+    if any(cnt > 2 for cnt in edge_use_count.values()):
+        return None
+    boundary_eids = [eid for eid, cnt in edge_use_count.items() if cnt == 1]
+    if not boundary_eids:
+        return None
+
+    boundary_by_cid: dict = {}
+    non_arc_eids = []
+    for eid in boundary_eids:
+        cid = definition.edges[eid].curve_id
+        if cid is not None and cid in arcs:
+            boundary_by_cid.setdefault(cid, []).append(eid)
+        else:
+            non_arc_eids.append(eid)
+
+    arc_entries = []
+    for cid, eids in boundary_by_cid.items():
+        if len(eids) != curve_edge_counts.get(cid, 0):
+            return None
+        arc = arcs[cid]
+        params = _circle_arc_params(arc)
+        if params is None:
+            return None
+        arc_entries.append((cid, eids, arc, params))
+
+    if len(arc_entries) == 2:
+        (_cid1, _eids1, arc1, p1), (_cid2, _eids2, arc2, p2) = arc_entries
+        c1, ax1, ay1, n1, r1 = p1
+        c2, ax2, ay2, n2, r2 = p2
+        if abs(abs(n1.dot(n2)) - 1.0) > 1e-4:
+            return None
+        delta = c2 - c1
+        height = delta.Length
+        r_max = max(r1, r2)
+        if height <= 1e-4 or ((delta - n1 * delta.dot(n1)).Length > 1e-3 * r_max):
+            return None
+        axis_dir = App.Vector(delta.x / height, delta.y / height, delta.z / height)
+        if abs(abs(axis_dir.dot(n1)) - 1.0) > 1e-4:
+            return None
+
+        if arc1.is_full_circle and arc2.is_full_circle:
+            if non_arc_eids:
+                return None
+            is_full = True
+            p1_s = p1_m = p1_e = None
+        elif not arc1.is_full_circle and not arc2.is_full_circle:
+            def rad_dir(pt):
+                rv = (pt - c1) - axis_dir * (pt - c1).dot(axis_dir)
+                if rv.Length <= 1e-9:
+                    return None
+                return App.Vector(rv.x / rv.Length, rv.y / rv.Length, rv.z / rv.Length)
+
+            p1_s = _arc_point_mm(c1, ax1, ay1, arc1.start_angle)
+            p1_m = _arc_point_mm(c1, ax1, ay1, 0.5 * (arc1.start_angle + arc1.end_angle))
+            p1_e = _arc_point_mm(c1, ax1, ay1, arc1.end_angle)
+            p2_s = _arc_point_mm(c2, ax2, ay2, arc2.start_angle)
+            p2_m = _arc_point_mm(c2, ax2, ay2, 0.5 * (arc2.start_angle + arc2.end_angle))
+            p2_e = _arc_point_mm(c2, ax2, ay2, arc2.end_angle)
+            d1_s, d1_m, d1_e = rad_dir(p1_s), rad_dir(p1_m), rad_dir(p1_e)
+            d2_s, d2_m, d2_e = rad_dir(p2_s), rad_dir(p2_m), rad_dir(p2_e)
+            if None in (d1_s, d1_m, d1_e, d2_s, d2_m, d2_e):
+                return None
+            if d1_m.dot(d2_m) < 1.0 - 1e-4:
+                return None
+            if d1_s.dot(d2_s) >= 1.0 - 1e-4 and d1_e.dot(d2_e) >= 1.0 - 1e-4:
+                gen_pairs = ((p1_s, p2_s), (p1_e, p2_e))
+            elif d1_s.dot(d2_e) >= 1.0 - 1e-4 and d1_e.dot(d2_s) >= 1.0 - 1e-4:
+                gen_pairs = ((p1_s, p2_e), (p1_e, p2_s))
+            else:
+                return None
+            if not non_arc_eids:
+                return None
+            gen_tol = 1e-3 * max(r_max, height)
+            for eid in non_arc_eids:
+                e = definition.edges[eid]
+                for vid in (e.v1_id, e.v2_id):
+                    vv = definition.vertices[vid]
+                    pt = App.Vector(vv.x * INCH_TO_MM, vv.y * INCH_TO_MM, vv.z * INCH_TO_MM)
+                    on_gen = False
+                    for ga, gb in gen_pairs:
+                        seg = gb - ga
+                        if seg.Length <= 1e-9:
+                            continue
+                        proj = max(0.0, min(1.0, (pt - ga).dot(seg) / (seg.Length ** 2)))
+                        if (pt - (ga + seg * proj)).Length <= gen_tol:
+                            on_gen = True
+                            break
+                    if not on_gen:
+                        return None
+            is_full = False
+        else:
+            return None
+    elif len(arc_entries) == 1 and not non_arc_eids:
+        # A pointed cone: one full circular base arc and a single axial apex.
+        (_cid1, eids1, arc1, p1) = arc_entries[0]
+        if not arc1.is_full_circle:
+            return None
+        c1, _ax1, _ay1, n1, r1 = p1
+        r2 = 0.0
+        r_max = r1
+        base_vids = {definition.edges[eid].v1_id for eid in eids1} | {
+            definition.edges[eid].v2_id for eid in eids1
+        }
+        off_vids = all_vids - base_vids
+        if not off_vids:
+            return None
+        best_vid = max(
+            off_vids,
+            key=lambda vid: abs(
+                (
+                    App.Vector(
+                        definition.vertices[vid].x * INCH_TO_MM,
+                        definition.vertices[vid].y * INCH_TO_MM,
+                        definition.vertices[vid].z * INCH_TO_MM,
+                    )
+                    - c1
+                ).dot(n1)
+            ),
+        )
+        va = definition.vertices[best_vid]
+        c2 = App.Vector(va.x * INCH_TO_MM, va.y * INCH_TO_MM, va.z * INCH_TO_MM)
+        delta = c2 - c1
+        height = delta.Length
+        if height <= 1e-4 or ((delta - n1 * delta.dot(n1)).Length > 1e-3 * r1):
+            return None
+        axis_dir = App.Vector(delta.x / height, delta.y / height, delta.z / height)
+        is_full = True
+        p1_s = p1_m = p1_e = None
+    else:
+        return None
+
+    tol_r = 1e-3 * r_max
+    tol_z = max(1e-4, 1e-3 * max(height, r_max))
+    for vid in all_vids:
+        vv = definition.vertices[vid]
+        pt = App.Vector(vv.x * INCH_TO_MM, vv.y * INCH_TO_MM, vv.z * INCH_TO_MM)
+        t = (pt - c1).dot(axis_dir)
+        if t < -tol_z or t > height + tol_z:
+            return None
+        tc = max(0.0, min(height, t))
+        r_exp = r1 + (r2 - r1) * (tc / height)
+        rad_vec = (pt - c1) - axis_dir * t
+        if abs(rad_vec.Length - r_exp) > tol_r:
+            return None
+
+    radial_dot_sum = 0.0
+    facet_area_sum = 0.0
+    facet_sign = 0
+    for pts in face_loops_pts:
+        vecs = [App.Vector(*p) for p in pts]
+        centroid = sum(vecs, App.Vector()) / len(vecs)
+        rel = [v - centroid for v in vecs]
+        nf = App.Vector()
+        for a, b in zip(rel, rel[1:] + rel[:1]):
+            nf += a.cross(b)
+        area_2 = nf.Length
+        if area_2 <= 1e-12:
+            return None
+        facet_area_sum += 0.5 * area_2
+        tc = max(0.0, min(height, (centroid - c1).dot(axis_dir)))
+        r_exp_c = r1 + (r2 - r1) * (tc / height)
+        rad_c = (centroid - c1) - axis_dir * (centroid - c1).dot(axis_dir)
+        if r_exp_c > 1e-4 and rad_c.Length < 0.45 * r_exp_c:
+            return None
+        if rad_c.Length > 1e-9:
+            dot = nf.dot(rad_c) / rad_c.Length
+            s = 1 if dot > 0.0 else -1
+            if facet_sign and s != facet_sign:
+                return None
+            facet_sign = s
+            radial_dot_sum += dot
+
+    if facet_sign == 0 or abs(radial_dot_sum) <= 1e-9:
+        return None
+
+    try:
+        if r2 > 0.0 and abs(r1 - r2) <= min(1e-6 * r_max, 0.5 * _SEW_TOLERANCE_MM):
+            kind = "cylinder"
+            r = 0.5 * (r1 + r2)
+            surf = Part.Cylinder(Part.Circle(c1, axis_dir, r))
+            v_max = height
+        else:
+            kind = "cone"
+            surf = Part.Cone(c1, c2, r1, r2)
+            v_max = math.hypot(height, r2 - r1)
+
+        if is_full:
+            u_min, u_max = 0.0, 2.0 * math.pi
+        else:
+            two_pi = 2.0 * math.pi
+            u_s, _ = surf.parameter(p1_s)
+            u_m, _ = surf.parameter(p1_m)
+            u_e, _ = surf.parameter(p1_e)
+            du_sm = (u_m - u_s) % two_pi
+            du_se = (u_e - u_s) % two_pi
+            if 0.0 < du_sm < du_se:
+                u_min, u_max = u_s, u_s + du_se
+            else:
+                du_es = (u_s - u_e) % two_pi
+                u_min, u_max = u_e, u_e + du_es
+
+        face_shape = surf.toShape(u_min, u_max, 0.0, v_max)
+        u_mid = 0.5 * (u_min + u_max)
+        v_mid = 0.5 * v_max
+        n_built = face_shape.normalAt(u_mid, v_mid)
+        pt_mid = surf.value(u_mid, v_mid)
+        rad_mid = (pt_mid - c1) - axis_dir * (pt_mid - c1).dot(axis_dir)
+        if n_built.dot(rad_mid) * facet_sign < 0.0:
+            face_shape.reverse()
+        if not face_shape.isValid() or face_shape.Area <= 0.0:
+            return None
+        if not (0.80 * face_shape.Area <= facet_area_sum <= 1.05 * face_shape.Area):
+            return None
+        return kind, face_shape
+    except Exception:
+        return None
+
+
 def _build_own_geometry(definition, model, stats, inherited_material_id):
     """One definition's OWN faces and loose-edge runs (not its nested
     instances), in its local space: ``(shapes, colors)``, where ``colors``
@@ -546,11 +1034,84 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
     component hierarchy (_HierarchyImport)."""
     import openskp
 
+    fit_curved = bool(stats.get("fit_curved_surfaces"))
+    curve_edge_counts = None
+    if fit_curved and getattr(definition, "arcs", None):
+        curve_edge_counts = {}
+        for edge in definition.edges.values():
+            if edge.curve_id is not None:
+                curve_edge_counts[edge.curve_id] = curve_edge_counts.get(edge.curve_id, 0) + 1
+
     shapes = []
     colors = []
+    fitted_face_ids = set()
+    edge_faces = {}
+    if fit_curved:
+        groups, edge_faces = _group_smooth_faces(definition, model, inherited_material_id)
+        for group_faces, group_color in groups:
+            fitted = _fit_cylinder_or_cone(definition, group_faces, curve_edge_counts)
+            if fitted is not None:
+                kind, surf_face = fitted
+                fitted_face_ids.update(f.id for f in group_faces)
+                stats["faces_built"] += len(group_faces)
+                key = "cylinders_built" if kind == "cylinder" else "cones_built"
+                stats[key] = stats.get(key, 0) + 1
+                shapes.append(surf_face)
+                colors.append(group_color)
+            else:
+                stats["curved_groups_unfitted"] = stats.get("curved_groups_unfitted", 0) + 1
+
+    # Keep neighbouring flat faces connected (#18): an arc whose edges also
+    # belong to a non-coplanar face that stayed faceted must keep its polygon
+    # segments on the cap too, rather than opening a crescent gap along the rim.
+    allowed_curve_counts = None
+    if curve_edge_counts:
+        allowed_curve_counts = dict(curve_edge_counts)
+        for cid in list(allowed_curve_counts):
+            arc = definition.arcs.get(cid)
+            params = _circle_arc_params(arc) if arc is not None else None
+            if params is None:
+                allowed_curve_counts.pop(cid, None)
+                continue
+            center, _ax, _ay, normal, radius = params
+            plane_tol = max(1e-4, 1e-3 * radius)
+            blocked = False
+            for eid, edge in definition.edges.items():
+                if edge.curve_id != cid:
+                    continue
+                for fid in edge_faces.get(eid, ()):
+                    if fid in fitted_face_ids:
+                        continue
+                    f_other = definition.faces[fid]
+                    for lp in f_other.loops:
+                        for feid, _fsign in lp:
+                            fe = definition.edges.get(feid)
+                            if fe is None:
+                                continue
+                            for vid in (fe.v1_id, fe.v2_id):
+                                vv = definition.vertices.get(vid)
+                                if vv is None:
+                                    continue
+                                pt = App.Vector(vv.x * INCH_TO_MM, vv.y * INCH_TO_MM, vv.z * INCH_TO_MM)
+                                if abs((pt - center).dot(normal)) > plane_tol:
+                                    blocked = True
+                                    break
+                            if blocked:
+                                break
+                        if blocked:
+                            break
+                    if blocked:
+                        break
+                if blocked:
+                    break
+            if blocked:
+                allowed_curve_counts.pop(cid, None)
+
     for face in definition.faces.values():
+        if face.id in fitted_face_ids:
+            continue
         stats["faces_built"] += 1
-        shape = _make_face_shape(definition, face)
+        shape = _make_face_shape(definition, face, allowed_curve_counts, stats)
         if shape is not None:
             faces = shape.Faces
             # Flatten only this source face's triangles, preserving component
@@ -970,7 +1531,10 @@ class _HierarchyImport:
         built the same way as the merged import."""
         scratch = {"faces_built": 0, "faces_skipped": 0, "placements": 0,
                    "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
-                   "make_solids": self.stats.get("make_solids", False)}
+                   "make_solids": self.stats.get("make_solids", False),
+                   "fit_curved_surfaces": self.stats.get("fit_curved_surfaces", False),
+                   "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0,
+                   "curved_groups_unfitted": 0}
         buckets = _get_local_shape(child, self.model, scratch, self.merged_cache, frozenset(), None,
                                    child_material, "Layer0")
         shapes, colors = [], []
@@ -1043,7 +1607,7 @@ class _HierarchyImport:
         return model_part
 
 
-def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None):
+def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, curved_surfaces=None):
     """Import a .skp file into a FreeCAD document, returning the document.
 
     Two layouts:
@@ -1070,6 +1634,13 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None):
     available. ``assemblies=None`` reads the ``ImportAssemblies`` preference
     (False unless set).
 
+    ``curved_surfaces=True`` groups faces joined by soft or smooth edges and
+    replaces cylinders and cones/frustums recognised from ``Definition.arcs``
+    with true ``Part.Cylinder`` / ``Part.Cone`` faces (leaving non-fitting
+    groups faceted), and imports circles and circular arcs bounding flat faces
+    as true FreeCAD circle/arc edges (#18). ``curved_surfaces=None`` reads the
+    ``FitCurvedSurfaces`` preference (False unless set).
+
     Each face's resolved color/opacity (its own paint, or whatever an
     ancestor group/component painted itself with, or a neutral default)
     is applied as ViewObject.DiffuseColor, one entry per Shape.Faces -
@@ -1089,6 +1660,8 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None):
         solids = _bool_preference("MakeSolids")
     if assemblies is None:
         assemblies = _bool_preference("ImportAssemblies")
+    if curved_surfaces is None:
+        curved_surfaces = _bool_preference("FitCurvedSurfaces")
 
     use_assemblies = False
     if assemblies and not merge:
@@ -1114,6 +1687,8 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None):
         "hidden_layers": 0, "merged": bool(merge),
         "make_solids": bool(solids), "solids_built": 0, "faces_left_open": 0,
         "import_assemblies": bool(assemblies), "assemblies": 0,
+        "fit_curved_surfaces": bool(curved_surfaces), "face_arcs_built": 0,
+        "cylinders_built": 0, "cones_built": 0, "curved_groups_unfitted": 0,
     }
     last_import_stats = stats
 
@@ -1154,6 +1729,12 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None):
     if solids:
         common += (f"; {stats['solids_built']} solids, {stats['faces_left_open']} faces "
                    "closing no volume left as faces")
+    if curved_surfaces:
+        common += (
+            f"; {stats['cylinders_built']} cylinders, {stats['cones_built']} cones, "
+            f"{stats['curved_groups_unfitted']} smoothed groups left faceted, "
+            f"{stats['face_arcs_built']} circle/arc face edges"
+        )
     if merge:
         print(
             f"openskp: {built} unique definitions built in {time.time() - t0:.1f}s {common}, "
@@ -1235,10 +1816,27 @@ def _wire_points_inches(wire, placement):
     App.Matrix or App.Placement, anything with multVec) and converted from FreeCAD's native millimetres
     back to SketchUp's native inches. No closing/repeated final point -
     openskp's add_face expects the polygon open, matching how
-    OrderedVertexes already returns it."""
+    OrderedVertexes already returns it. Curved edges (circles/arcs) are
+    discretised in wire traversal order so circular discs and holes survive
+    export."""
+    edges = wire.OrderedEdges
+    if all(isinstance(e.Curve, Part.Line) for e in edges):
+        raw_pts = [v.Point for v in wire.OrderedVertexes]
+    else:
+        raw_pts = []
+        for e in edges:
+            if isinstance(e.Curve, Part.Line):
+                pts_e = [e.valueAt(e.FirstParameter), e.valueAt(e.LastParameter)]
+            else:
+                sweep = abs(e.LastParameter - e.FirstParameter) if hasattr(e.Curve, "Radius") else 2 * math.pi
+                segs = max(4, round(24 * sweep / (2 * math.pi)))
+                pts_e = list(e.discretize(Number=segs + 1))
+            if e.Orientation == "Reversed":
+                pts_e = pts_e[::-1]
+            raw_pts.extend(pts_e[:-1])
     pts = []
-    for v in wire.OrderedVertexes:
-        p = placement.multVec(v.Point)
+    for pt in raw_pts:
+        p = placement.multVec(pt)
         pts.append((p.x / INCH_TO_MM, p.y / INCH_TO_MM, p.z / INCH_TO_MM))
     return pts
 
@@ -1304,6 +1902,26 @@ def _add_shape_faces(builder, shape, transform, stats, layer, material_handles):
     transform reverses each loop so the face keeps facing outwards."""
     mirrored = transform.determinant() < 0
     for i, face in enumerate(shape.Faces):
+        material = material_handles[i] if material_handles else None
+        if isinstance(face.Surface, (Part.Cylinder, Part.Cone, Part.Sphere, Part.Toroid)):
+            try:
+                tol = max(0.05, 0.01 * face.BoundBox.DiagonalLength)
+                verts_mm, tris = face.tessellate(tol)
+            except Exception:
+                stats["faces_skipped"] += 1
+                continue
+            pts_in = []
+            for v in verts_mm:
+                p = transform.multVec(v)
+                pts_in.append((p.x / INCH_TO_MM, p.y / INCH_TO_MM, p.z / INCH_TO_MM))
+            for a, b, c in tris:
+                tri_pts = [pts_in[a], pts_in[c], pts_in[b]] if mirrored else [pts_in[a], pts_in[b], pts_in[c]]
+                try:
+                    builder.add_face(tri_pts, layer=layer, material=material)
+                    stats["faces_written"] += 1
+                except Exception:
+                    stats["faces_skipped"] += 1
+            continue
         outer = face.OuterWire
         outer_pts = _wire_points_inches(outer, transform)
         if len(outer_pts) < 3:
@@ -1318,7 +1936,6 @@ def _add_shape_faces(builder, shape, transform, stats, layer, material_handles):
                 holes.append(hole_pts[::-1] if mirrored else hole_pts)
         if mirrored:
             outer_pts = outer_pts[::-1]
-        material = material_handles[i] if material_handles else None
         try:
             builder.add_face(outer_pts, holes=holes, layer=layer, material=material)
             stats["faces_written"] += 1

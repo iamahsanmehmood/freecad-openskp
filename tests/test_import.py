@@ -54,6 +54,19 @@ EXPECTED = {
     # scale term (openskp#444); see check_scale_term. Saved by SketchUp's own library as 2021 and 6.
     "instance_scale_term_2021.skp": (12, 0, 0, 0, 1, 0),
     "instance_scale_term_v6.skp": (12, 0, 0, 0, 1, 0),
+    # a 20 x 20 x 2 in rectangular plate with an r = 4 in circular through-hole (30 faces: top and
+    # bottom perforated faces, 4 outer sides, 24 smoothed inner bore facets), saved via SketchUp's
+    # own library as 2017 and 2021; see tests/test_curved_surfaces.py.
+    "plate_with_hole_2017.skp": (30, 0, 0, 0, 1, 0),
+    "plate_with_hole_2021.skp": (30, 0, 0, 0, 1, 0),
+    # curved-surface fixtures (#18) built and saved via SketchUp's own C library as 2017 and 2021:
+    # cylinder (r=5, h=12), frustum (r1=6, r2=3, h=4), and an asymmetric smoothed blob (168 triangles).
+    "cylinder_2017.skp": (26, 0, 0, 0, 1, 0),
+    "cylinder_2021.skp": (26, 0, 0, 0, 1, 0),
+    "frustum_2017.skp": (26, 0, 0, 0, 1, 0),
+    "frustum_2021.skp": (26, 0, 0, 0, 1, 0),
+    "smoothed_blob_2017.skp": (168, 0, 0, 0, 1, 0),
+    "smoothed_blob_2021.skp": (168, 0, 0, 0, 1, 0),
 }
 
 

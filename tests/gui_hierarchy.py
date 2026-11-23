@@ -41,10 +41,10 @@ def _drawn_bounds(view):
     return tuple((lo[i], hi[i]) for i in range(3))
 
 
-def _check_bounds(label, got, want_in, mm):
+def _check_bounds(label, got, want_in, mm, tol=1e-2):
     want = tuple((a * mm, b * mm) for a, b in want_in)
     for axis, (g, w) in zip("xyz", zip(got, want)):
-        if abs(g[0] - w[0]) > 1e-2 or abs(g[1] - w[1]) > 1e-2:
+        if abs(g[0] - w[0]) > tol or abs(g[1] - w[1]) > tol:
             raise AssertionError(f"{label}: the view draws {axis} from {g[0]:.2f} to {g[1]:.2f} mm, "
                                  f"expected {w[0]:.2f} to {w[1]:.2f} (all drawn: {got})")
 
@@ -158,6 +158,32 @@ def main():
         Gui.getDocument(asm_doc.Name).resetEdit()
         Gui.updateGui()
         lines.append(f"assemblies: the view draws {drawn} mm, AssemblyWorkbench activates Table (5 components)")
+
+        # FitCurvedSurfaces (#18, parts 1 & 2): circular holes, cylindrical bores,
+        # cylinders and frustums render with exact bounds and 1:1 DiffuseColor.
+        plate_path = os.path.join(TESTS, "fixtures", "plate_with_hole_2021.skp")
+        plate_doc = App.newDocument("PlateWithHole")
+        importSKP.import_skp(plate_path, plate_doc, merge=False, solids=True, curved_surfaces=True)
+        stats = importSKP.last_import_stats
+        assert stats["cylinders_built"] == 1 and stats["face_arcs_built"] == 2 and stats["solids_built"] == 1, stats
+        for name in stats["object_face_colors"]:
+            obj = plate_doc.getObject(name)
+            assert len(obj.ViewObject.DiffuseColor) == len(obj.Shape.Faces), name
+        view = _show(plate_doc, "plate_with_hole")
+        plate_drawn = _drawn_bounds(view)
+        _check_bounds("plate_with_hole", plate_drawn, ((-10, 10), (-10, 10), (0, 2)), mm)
+        lines.append(f"plate_with_hole: the view draws {plate_drawn} mm, solid with true cylindrical bore")
+
+        frustum_path = os.path.join(TESTS, "fixtures", "frustum_2021.skp")
+        frustum_doc = App.newDocument("Frustum")
+        importSKP.import_skp(frustum_path, frustum_doc, merge=False, solids=True, curved_surfaces=True)
+        stats = importSKP.last_import_stats
+        assert stats["cones_built"] == 1 and stats["solids_built"] == 1, stats
+        view = _show(frustum_doc, "frustum")
+        frustum_drawn = _drawn_bounds(view)
+        # Coin3D tessellates a curved outer rim into display chords (~0.1 mm sagitta).
+        _check_bounds("frustum", frustum_drawn, ((-6, 6), (-6, 6), (0, 4)), mm, tol=0.5)
+        lines.append(f"frustum: the view draws {frustum_drawn} mm, 3-face conical solid")
 
         _finish("PASS\n" + "\n".join(lines), 0)
     except BaseException:
