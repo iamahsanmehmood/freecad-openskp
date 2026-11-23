@@ -36,6 +36,7 @@ freecadcmd tests/test_import.py
 freecadcmd tests/test_export.py
 freecadcmd tests/test_nonplanar.py
 freecadcmd tests/test_hierarchy.py
+freecadcmd tests/test_solids.py
 ```
 
 `tests/gui_hierarchy.py` checks the component hierarchy in FreeCAD's real
