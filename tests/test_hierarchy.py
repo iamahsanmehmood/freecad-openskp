@@ -429,104 +429,160 @@ def check_fixture_component_round_trip():
 
 
 def check_merge_preference(path):
-    """merge=None follows the MergeOnImport preference; unset means hierarchy."""
+    """merge=None follows MergeOnImport when set, and automatic below threshold."""
     params = App.ParamGet(importSKP._PARAM_PATH)
     try:
-        for value, merged in ((None, False), (True, True), (False, False)):
+        for value, merged, want_layout, want_reason in (
+            (None, False, "hierarchy", "automatic"),
+            (True, True, "merged", "preference"),
+            (False, False, "hierarchy", "preference"),
+        ):
             if value is None:
                 params.RemBool("MergeOnImport")
+                assert importSKP._merge_on_import_preference() is None
             else:
                 params.SetBool("MergeOnImport", value)
+                assert importSKP._merge_on_import_preference() is value
             doc = App.newDocument()
             try:
                 importSKP.import_skp(path, doc)
-                assert importSKP.last_import_stats["merged"] is merged, (value, importSKP.last_import_stats["merged"])
+                stats = importSKP.last_import_stats
+                assert stats["merged"] is merged, (value, stats)
+                assert stats["layout"] == want_layout, (value, stats)
+                assert stats["layout_reason"] == want_reason, (value, stats)
+                assert stats["auto_merged"] is False, (value, stats)
                 parts = [o for o in doc.Objects if o.TypeId == "App::Part"]
                 assert bool(parts) is not merged, (value, [o.TypeId for o in doc.Objects])
             finally:
                 App.closeDocument(doc.Name)
-        print("check_merge_preference: OK (unset -> hierarchy, True -> merged, False -> hierarchy)")
+        print("check_merge_preference: OK (unset -> automatic hierarchy, True -> preference merged, "
+              "False -> preference hierarchy)")
     finally:
         params.RemBool("MergeOnImport")
 
 
-def check_large_hierarchy_warning():
-    """Models at or above _LARGE_HIERARCHY_DEFINITION_THRESHOLD (1,000
-    definitions, #31) print a console warning suggesting MergeOnImport when
-    imported in the hierarchy layout, and stay quiet below the threshold or
-    when merge=True."""
-    import tempfile
-
+def _write_n_definitions(path, count):
     import openskp
+
+    b = openskp.create()
+    defs = []
+    for i in range(count):
+        with b.add_component_definition(f"D_{i}") as comp:
+            comp.add_face([(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)])
+        defs.append(comp)
+    for i, comp in enumerate(defs):
+        b.add_instance(comp, translation=((i % 50) * 3.0, (i // 50) * 3.0, 0.0))
+    with open(path, "wb") as f:
+        f.write(b.to_bytes())
+
+
+def check_large_hierarchy_warning():
+    """Verifies every cell of the #38 layout decision table on synthetic models
+    just below (999) and at (1,000) _LARGE_HIERARCHY_DEFINITION_THRESHOLD, plus
+    explicit merge=True/False arguments overriding every preference setting."""
+    import tempfile
 
     threshold = importSKP._LARGE_HIERARCHY_DEFINITION_THRESHOLD
     assert threshold == 1000, threshold
 
+    params = App.ParamGet(importSKP._PARAM_PATH)
+    orig_print_message = App.Console.PrintMessage
     orig_print_warning = App.Console.PrintWarning
-    printed = []
+    messages = []
+    warnings = []
+
+    def record_message(msg):
+        messages.append(msg)
+        orig_print_message(msg)
 
     def record_warning(msg):
-        printed.append(msg)
+        warnings.append(msg)
         orig_print_warning(msg)
 
+    App.Console.PrintMessage = record_message
     App.Console.PrintWarning = record_warning
     try:
         with tempfile.TemporaryDirectory() as tmp:
-            small_path = os.path.join(tmp, "small.skp")
-            b_small = openskp.create()
-            small_defs = []
-            for i in range(10):
-                with b_small.add_component_definition(f"P_{i}") as comp:
-                    comp.add_face([(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)])
-                small_defs.append(comp)
-            for i, comp in enumerate(small_defs):
-                b_small.add_instance(comp, translation=(i * 3.0, 0.0, 0.0))
-            with open(small_path, "wb") as f:
-                f.write(b_small.to_bytes())
+            below_path = os.path.join(tmp, "below_threshold_999.skp")
+            at_path = os.path.join(tmp, "at_threshold_1000.skp")
+            _write_n_definitions(below_path, threshold - 1)
+            _write_n_definitions(at_path, threshold)
 
-            doc = App.newDocument()
-            try:
-                printed.clear()
-                importSKP.import_skp(small_path, doc, merge=False)
-                assert importSKP.last_import_stats["large_hierarchy_warning"] is False
-                assert not any("MergeOnImport" in m for m in printed), printed
-            finally:
-                App.closeDocument(doc.Name)
+            def run_case(skp_path, pref_val, merge_arg, want_layout, want_reason, want_auto_msg, want_warn):
+                if pref_val is None:
+                    params.RemBool("MergeOnImport")
+                    assert importSKP._merge_on_import_preference() is None
+                else:
+                    params.SetBool("MergeOnImport", pref_val)
+                    assert importSKP._merge_on_import_preference() is pref_val
 
-            big_path = os.path.join(tmp, "thousand.skp")
-            b_big = openskp.create()
-            big_defs = []
-            for i in range(threshold):
-                with b_big.add_component_definition(f"D_{i}") as comp:
-                    comp.add_face([(0, 0, 0), (2, 0, 0), (2, 2, 0), (0, 2, 0)])
-                big_defs.append(comp)
-            for i, comp in enumerate(big_defs):
-                b_big.add_instance(comp, translation=((i % 50) * 3.0, (i // 50) * 3.0, 0.0))
-            with open(big_path, "wb") as f:
-                f.write(b_big.to_bytes())
+                messages.clear()
+                warnings.clear()
+                doc = App.newDocument()
+                try:
+                    if merge_arg is None:
+                        importSKP.import_skp(skp_path, doc)
+                    else:
+                        importSKP.import_skp(skp_path, doc, merge=merge_arg)
+                    stats = importSKP.last_import_stats
+                    want_merged = want_layout == "merged"
+                    tag = (os.path.basename(skp_path), pref_val, merge_arg)
+                    assert stats["merged"] is want_merged, (tag, stats)
+                    assert stats["layout"] == want_layout, (tag, stats)
+                    assert stats["layout_reason"] == want_reason, (tag, stats)
+                    assert stats["auto_merged"] is want_auto_msg, (tag, stats)
+                    assert stats["large_hierarchy_warning"] is want_warn, (tag, stats)
 
-            # Hierarchy layout at threshold -> warns and suggests MergeOnImport.
-            doc = App.newDocument()
-            try:
-                printed.clear()
-                importSKP.import_skp(big_path, doc, merge=False)
-                assert importSKP.last_import_stats["large_hierarchy_warning"] is True
-                assert any(str(threshold) in m and "MergeOnImport" in m for m in printed), printed
-            finally:
-                App.closeDocument(doc.Name)
+                    parts = [o for o in doc.Objects if o.TypeId == "App::Part"]
+                    assert bool(parts) is not want_merged, (tag, len(parts))
 
-            # Merged layout on the same model -> no warning.
-            doc = App.newDocument()
-            try:
-                printed.clear()
-                importSKP.import_skp(big_path, doc, merge=True)
-                assert importSKP.last_import_stats["large_hierarchy_warning"] is False
-                assert not any("MergeOnImport" in m for m in printed), printed
-            finally:
-                App.closeDocument(doc.Name)
+                    if want_auto_msg:
+                        assert any(
+                            str(threshold) in m
+                            and "merged" in m
+                            and "speed" in m
+                            and "MergeOnImport" in m
+                            and "merge=False" in m
+                            for m in messages
+                        ), (tag, messages)
+                    else:
+                        assert not any("imported in the merged layout automatically" in m for m in messages), (
+                            tag,
+                            messages,
+                        )
+
+                    if want_warn:
+                        assert any(str(threshold) in w and "MergeOnImport" in w for w in warnings), (tag, warnings)
+                    else:
+                        assert not any("MergeOnImport" in w for w in warnings), (tag, warnings)
+                finally:
+                    App.closeDocument(doc.Name)
+
+            # 1. All 6 cells of the MergeOnImport preference table (merge=None):
+            #    - not set: < 1,000 -> hierarchy; >= 1,000 -> merged automatically with message
+            run_case(below_path, None, None, "hierarchy", "automatic", False, False)
+            run_case(at_path, None, None, "merged", "automatic", True, False)
+            #    - set to False: < 1,000 -> hierarchy; >= 1,000 -> hierarchy with warning
+            run_case(below_path, False, None, "hierarchy", "preference", False, False)
+            run_case(at_path, False, None, "hierarchy", "preference", False, True)
+            #    - set to True: < 1,000 -> merged; >= 1,000 -> merged
+            run_case(below_path, True, None, "merged", "preference", False, False)
+            run_case(at_path, True, None, "merged", "preference", False, False)
+
+            # 2. Explicit merge=True / merge=False argument always wins over both:
+            for pref_val in (None, False, True):
+                run_case(below_path, pref_val, False, "hierarchy", "argument", False, False)
+                run_case(at_path, pref_val, False, "hierarchy", "argument", False, True)
+                run_case(below_path, pref_val, True, "merged", "argument", False, False)
+                run_case(at_path, pref_val, True, "merged", "argument", False, False)
     finally:
+        params.RemBool("MergeOnImport")
+        App.Console.PrintMessage = orig_print_message
         App.Console.PrintWarning = orig_print_warning
-    print(f"check_large_hierarchy_warning: OK (warns at >= {threshold} defs in hierarchy, quiet when merged)")
+    print(
+        f"check_large_hierarchy_warning: OK (6 preference-table cells + 12 explicit-arg overrides "
+        f"verified at {threshold - 1} and {threshold} defs)"
+    )
 
 
 def _main():

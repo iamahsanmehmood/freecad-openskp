@@ -34,9 +34,9 @@ not a triangulated mesh) and rebuilds it as native FreeCAD `Part.Face` /
 transforms, so a component placed 50 times ends up in the right 50
 places, not just modeled once.
 
-**Component hierarchy** (the default): the model tree follows SketchUp's
-own structure, so each part can be inspected, measured or rebuilt on its
-own.
+**Component hierarchy** (the default below 1,000 definitions): the model tree
+follows SketchUp's own structure, so each part can be inspected, measured or
+rebuilt on its own.
 
 - Every component definition becomes an `App::Part`, kept in a hidden
   **SketchUp components** group, holding its own faces and loose edges as
@@ -59,13 +59,20 @@ own.
   placed copy of the component's geometry instead, labelled "(sheared
   copy)", and reported in the console.
 
-**Merged** (the previous layout): one compound per SketchUp tag, with no
-component objects. It is lighter for a very large model, where thousands of
-definitions would each become an object (see
+**Merged** (automatic at 1,000+ definitions, or on demand): one compound per
+SketchUp tag, with no component objects. It is much lighter for a large model,
+where thousands of definitions would each become an `App::Part` with its own
+origin (see
 [Performance](#performance-on-large-files--read-this-before-importing-a-big-model)).
-To use it, open Tools > Edit parameters, go to
-`BaseApp/Preferences/Mod/OpenSKP` and add a Boolean `MergeOnImport` set to
-`true`; from Python, `importSKP.import_skp(path, doc, merge=True)`.
+When `MergeOnImport` is not set, files below 1,000 definitions use the
+component hierarchy and files with **1,000 or more** definitions switch to the
+merged layout automatically, printing a console message with the definition
+count and how to force the hierarchy. Your explicit choice always wins: open
+Tools > Edit parameters, go to `BaseApp/Preferences/Mod/OpenSKP`, and add a
+Boolean `MergeOnImport` set to `true` (always merged) or `false` (always keep
+the component hierarchy); from Python, pass `importSKP.import_skp(path, doc,
+merge=True)` or `merge=False` to override both the preference and the automatic
+threshold.
 
 **Solids** (an option, off by default): SketchUp stores only faces, so a
 board or a leg arrives as a hollow set of faces. With `MakeSolids` set to
@@ -231,10 +238,10 @@ unique component/group definitions, 358,188 faces in the final compound:
 | **Total** | **~297s (~5 min)** |
 
 Those numbers are for the merged layout. In the component hierarchy the
-same file becomes one `App::Part` per definition and one `App::Link` per
+same file would become one `App::Part` per definition and one `App::Link` per
 placement (thousands of objects, each `App::Part` with its own origin), so
-for a model of that size set `MergeOnImport` (see
-[What it does](#what-it-does)).
+models with 1,000 or more definitions switch to the merged layout automatically
+unless you explicitly choose the hierarchy (see [What it does](#what-it-does)).
 
 **Hierarchy vs. merged layout (`tests/bench_large_hierarchy.py`)** — measured on
 FreeCAD 1.1.3 (Linux x86_64) across three nested synthetic `.skp` models written
@@ -255,10 +262,15 @@ Headless `freecadcmd` stays fast at every size because no Coin3D view providers
 or Qt model-tree items exist, whereas in the real GUI every `App::Part` brings 7
 origin objects (8 view providers per part before its geometry and links), pushing
 1,000 definitions past +1.5 GB / 23 s and 5,000 definitions past +7.1 GB / 2m 48s
-(over 9x the time and 5x the memory of `merge=True`). Importing a file with
-**1,000 or more** definitions in the hierarchy layout therefore prints a console
-warning suggesting `MergeOnImport` (`Tools > Edit parameters >
-BaseApp/Preferences/Mod/OpenSKP`, or `merge=True` from Python).
+(over 9x the time and 5x the memory of `merge=True`). When `MergeOnImport` is not
+set, files with **1,000 or more** definitions therefore import in the merged
+layout automatically and print a console message stating how many definitions
+the file has and how to keep the component hierarchy (`MergeOnImport` set to
+`false` under `Tools > Edit parameters > BaseApp/Preferences/Mod/OpenSKP`, or
+`merge=False` from Python). An explicit `MergeOnImport` preference (`true` or
+`false`) or `merge=True/False` argument always wins; when the hierarchy layout
+is forced on a file with 1,000 or more definitions, the importer prints a
+console warning suggesting `MergeOnImport`.
 
 Progress is visible throughout — FreeCAD's native progress bar
 (`Base.ProgressIndicator`) in the GUI, periodic console output under
