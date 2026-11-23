@@ -72,7 +72,7 @@ def run():
     # Layer export: obj1 ("FaceWithHole", 1 face) and obj2 ("Box", 6
     # faces) have different Labels, so must land in 2 distinct Face.layer
     # groups of the right size - not just "some layer got written."
-    layer_names = sorted(l.name for l in model.layers)
+    layer_names = sorted(layer.name for layer in model.layers)
     assert layer_names == ["Box", "FaceWithHole", "Layer0"], layer_names
     by_layer = {}
     for f in model.root.faces.values():
@@ -189,9 +189,69 @@ def test_material_export():
         App.GuiUp = orig_gui_up
 
 
+def test_component_and_flat_mixed_export():
+    """App::Link instances export as SketchUp components/instances while plain
+    Part::Features stay loose root faces in the same file (#28)."""
+    doc = App.newDocument()
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_mixed_export_test.skp")
+    try:
+        part = doc.addObject("App::Part", "Post")
+        part.Label = "Post"
+        post_feat = doc.addObject("Part::Feature", "PostGeom")
+        post_feat.Shape = Part.makeBox(25.4, 50.8, 254.0)
+        part.addObject(post_feat)
+        part.Visibility = False
+
+        link_a = doc.addObject("App::Link", "LinkA")
+        link_a.Label = "Post A"
+        link_a.LinkedObject = part
+        link_a.addProperty("App::PropertyString", "SketchUpLayer", "SketchUp", "")
+        link_a.SketchUpLayer = "Posts"
+
+        link_b = doc.addObject("App::Link", "LinkB")
+        link_b.Label = "Post B"
+        link_b.LinkedObject = part
+        link_b.Placement = App.Placement(App.Vector(508.0, 0.0, 0.0), App.Rotation())
+        link_b.ScaleVector = App.Vector(-1.0, 2.0, 1.0)
+        link_b.addProperty("App::PropertyString", "SketchUpLayer", "SketchUp", "")
+        link_b.SketchUpLayer = "Posts"
+
+        slab = doc.addObject("Part::Feature", "Slab")
+        slab.Label = "Slabs"
+        slab.Shape = Part.makeBox(100.0, 100.0, 10.0)
+        doc.recompute()
+
+        importSKP.export([link_a, link_b, slab], out_path)
+        stats = importSKP.last_export_stats
+        assert stats["definitions_written"] == 1 and stats["instances_written"] == 2, stats
+
+        import openskp
+
+        model = openskp.SkpFile.open(out_path).parse()
+        defs = [d for d in model.definitions.values() if d is not model.root]
+        assert len(defs) == 1 and defs[0].name == "Post" and len(defs[0].faces) == 6
+        assert len(model.root.faces) == 6, len(model.root.faces)
+        insts = {i.name: i for i in model.root.instances}
+        assert sorted(insts) == ["Post A", "Post B"]
+        assert insts["Post A"].layer == "Posts" and insts["Post B"].layer == "Posts"
+        assert tuple(round(v, 5) for v in insts["Post B"].matrix[:12]) == (
+            -1.0, 0.0, 0.0,
+            0.0, 2.0, 0.0,
+            0.0, 0.0, 1.0,
+            20.0, 0.0, 0.0,
+        ), insts["Post B"].matrix
+        assert sorted(layer.name for layer in model.layers) == ["Layer0", "Posts", "Slabs"]
+        print("test_component_and_flat_mixed_export: OK (1 Post definition, 2 instances incl. mirror+scale, 6 loose Slab faces)")
+    finally:
+        App.closeDocument(doc.Name)
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+
 def _main():
     run()
     test_material_export()
+    test_component_and_flat_mixed_export()
 
 
 # Note: freecadcmd runs a script file as a module named after the file,

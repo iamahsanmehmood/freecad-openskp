@@ -1774,6 +1774,18 @@ def _set_layer_property(obj, layer_name):
     obj.SketchUpLayer = layer_name
 
 
+def _set_instance_name_property(obj, instance_name):
+    """Records the SketchUp instance name of a placed link (including ``""``
+    when the instance was unnamed in SketchUp and ``obj.Label`` fell back to
+    the definition's name) so export can write it back faithfully."""
+    if instance_name is None:
+        return
+    if "SketchUpInstanceName" not in obj.PropertiesList:
+        obj.addProperty("App::PropertyString", "SketchUpInstanceName", "SketchUp",
+                        "The SketchUp instance name of this link; export writes it back")
+    obj.SketchUpInstanceName = instance_name
+
+
 class _HierarchyImport:
     """Builds the document the way SketchUp organises the model (#5).
 
@@ -1938,6 +1950,7 @@ class _HierarchyImport:
             obj.Placement = placement
             if any(abs(v - 1.0) > 1e-12 for v in scale):
                 obj.ScaleVector = scale
+            _set_instance_name_property(obj, inst.name)
             self.stats["links"] += 1
         _set_layer_property(obj, inst.layer)
         return obj
@@ -2311,6 +2324,15 @@ def insert(filename, docname):
     return import_skp(filename, doc)
 
 
+def _is_straight_edge(edge):
+    if isinstance(edge.Curve, Part.Line):
+        return True
+    p0 = edge.valueAt(edge.FirstParameter)
+    p1 = edge.valueAt(edge.LastParameter)
+    chord = p0.distanceToPoint(p1)
+    return chord > 0.0 and abs(edge.Length - chord) <= 1e-7 * max(1.0, edge.Length)
+
+
 def _wire_points_inches(wire, placement):
     """A wire's ordered vertex points, in world space (``placement`` is an
     App.Matrix or App.Placement, anything with multVec) and converted from FreeCAD's native millimetres
@@ -2318,14 +2340,15 @@ def _wire_points_inches(wire, placement):
     openskp's add_face expects the polygon open, matching how
     OrderedVertexes already returns it. Curved edges (circles/arcs) are
     discretised in wire traversal order so circular discs and holes survive
-    export."""
+    export, while straight BSpline edges produced by OCCT's GTransform on
+    sheared/scaled faces stay two-point segments."""
     edges = wire.OrderedEdges
-    if all(isinstance(e.Curve, Part.Line) for e in edges):
+    if all(_is_straight_edge(e) for e in edges):
         raw_pts = [v.Point for v in wire.OrderedVertexes]
     else:
         raw_pts = []
         for e in edges:
-            if isinstance(e.Curve, Part.Line):
+            if _is_straight_edge(e):
                 pts_e = [e.valueAt(e.FirstParameter), e.valueAt(e.LastParameter)]
             else:
                 sweep = abs(e.LastParameter - e.FirstParameter) if hasattr(e.Curve, "Radius") else 2 * math.pi
@@ -2579,77 +2602,387 @@ def _export_leaves(exportList):
         yield from walk(obj, base, getattr(obj, "Label", ""), False)
 
 
+last_export_stats = None
+
+
+def _polygon_coplanar_and_valid(points, holes=()):
+    """True when ``points`` (and any ``holes``) form a non-degenerate planar
+    polygon within openskp.create's tolerance, so add_face() will accept it."""
+    n = len(points)
+    if n < 3:
+        return False
+    nx = ny = nz = 0.0
+    for i in range(n):
+        x0, y0, z0 = points[i]
+        x1, y1, z1 = points[(i + 1) % n]
+        nx += (y0 - y1) * (z0 + z1)
+        ny += (z0 - z1) * (x0 + x1)
+        nz += (x0 - x1) * (y0 + y1)
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length < 1e-9:
+        return False
+    nx, ny, nz = nx / length, ny / length, nz / length
+    cx = sum(p[0] for p in points) / n
+    cy = sum(p[1] for p in points) / n
+    cz = sum(p[2] for p in points) / n
+    d = nx * cx + ny * cy + nz * cz
+    span = max(max(p[i] for p in points) - min(p[i] for p in points) for i in range(3))
+    tol = max(span, 1.0) * 1e-6
+    for p in points:
+        if abs(nx * p[0] + ny * p[1] + nz * p[2] - d) > tol:
+            return False
+    for hole in holes:
+        if len(hole) < 3:
+            return False
+        for p in hole:
+            if abs(nx * p[0] + ny * p[1] + nz * p[2] - d) > tol:
+                return False
+    return True
+
+
+def _extract_shape_faces(shape, transform, stats):
+    """Returns ``[(outer_pts, holes, face_idx), ...]`` in inches for every
+    valid face of ``shape`` mapped through ``transform`` (mm), incrementing
+    ``stats['faces_skipped']`` for degenerate or non-planar faces."""
+    mirrored = transform.determinant() < 0
+    extracted = []
+    for i, face in enumerate(shape.Faces):
+        if isinstance(face.Surface, (Part.Cylinder, Part.Cone, Part.Sphere, Part.Toroid)):
+            try:
+                tol = max(0.05, 0.01 * face.BoundBox.DiagonalLength)
+                verts_mm, tris = face.tessellate(tol)
+            except Exception:
+                stats["faces_skipped"] += 1
+                continue
+            pts_in = []
+            for v in verts_mm:
+                p = transform.multVec(v)
+                pts_in.append((p.x / INCH_TO_MM, p.y / INCH_TO_MM, p.z / INCH_TO_MM))
+            for a, b, c in tris:
+                tri_pts = [pts_in[a], pts_in[c], pts_in[b]] if mirrored else [pts_in[a], pts_in[b], pts_in[c]]
+                if _polygon_coplanar_and_valid(tri_pts):
+                    extracted.append((tri_pts, [], i))
+                else:
+                    stats["faces_skipped"] += 1
+            continue
+        outer = face.OuterWire
+        outer_pts = _wire_points_inches(outer, transform)
+        if len(outer_pts) < 3:
+            stats["faces_skipped"] += 1
+            continue
+        holes = []
+        for w in face.Wires:
+            if w.isSame(outer):
+                continue
+            hole_pts = _wire_points_inches(w, transform)
+            if len(hole_pts) >= 3:
+                holes.append(hole_pts[::-1] if mirrored else hole_pts)
+        if mirrored:
+            outer_pts = outer_pts[::-1]
+        if _polygon_coplanar_and_valid(outer_pts, holes):
+            extracted.append((outer_pts, holes, i))
+        else:
+            stats["faces_skipped"] += 1
+    return extracted
+
+
+def _link_local_matrix(link, target):
+    link_matrix = link.Placement.toMatrix()
+    scale = getattr(link, "ScaleVector", None)
+    if scale is not None and (scale.x, scale.y, scale.z) != (1.0, 1.0, 1.0):
+        s = App.Matrix()
+        s.scale(scale)
+        link_matrix = link_matrix * s
+    if getattr(link, "LinkTransform", False) and hasattr(target, "Placement"):
+        link_matrix = link_matrix * target.Placement.toMatrix()
+    return link_matrix
+
+
+def _matrix_to_skp_instance(matrix):
+    """App.Matrix (row-major 4x4, translation in mm) -> (matrix3x3, translation_in)."""
+    m3 = (
+        matrix.A11, matrix.A12, matrix.A13,
+        matrix.A21, matrix.A22, matrix.A23,
+        matrix.A31, matrix.A32, matrix.A33,
+    )
+    if all(abs(a - b) <= 1e-12 for a, b in zip(m3, (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))):
+        m3 = None
+    translation = (
+        matrix.A14 / INCH_TO_MM,
+        matrix.A24 / INCH_TO_MM,
+        matrix.A34 / INCH_TO_MM,
+    )
+    return m3, translation
+
+
+def _resolve_link_instance_name(link, target):
+    label = getattr(link, "Label", "") or ""
+    target_label = getattr(target, "Label", "") or ""
+    props = getattr(link, "PropertiesList", ())
+    if "SketchUpInstanceName" in props:
+        stored = getattr(link, "SketchUpInstanceName", "") or ""
+        expected_base = stored or target_label
+        if (
+            label == expected_base
+            or (
+                expected_base
+                and re.sub(r"\d+$", "", label) == re.sub(r"\d+$", "", expected_base)
+            )
+            or (stored == "" and label in ("Component", "Group"))
+        ):
+            return stored
+        return label
+    if (
+        label == target_label
+        or (target_label and re.fullmatch(re.escape(target_label) + r"\d+", label))
+        or re.fullmatch(r"Link\d*", label)
+    ):
+        return ""
+    return label
+
+
+def _unique_definition_name(base_name, used_names):
+    base = (base_name or "Component").strip() or "Component"
+    if base not in used_names:
+        used_names.add(base)
+        return base
+    idx = 1
+    while f"{base}#{idx}" in used_names:
+        idx += 1
+    cand = f"{base}#{idx}"
+    used_names.add(cand)
+    return cand
+
+
+def _collect_export_plan(exportList, stats):
+    """Collects component definitions reached via App::Link in bottom-up
+    topological order alongside top-level instances and loose geometry (#28)."""
+    selected = {o.Name for o in exportList if hasattr(o, "Name")}
+    definitions_by_key = {}
+    ordered_definitions = []
+    used_def_names = set()
+    root_leaves = []
+    root_instances = []
+
+    def collect_definition(target, visiting):
+        key = getattr(target, "Name", None) or str(id(target))
+        if key in definitions_by_key:
+            return definitions_by_key[key]
+        if key in visiting:
+            return None
+        own_leaves = []
+        child_instances = []
+
+        def def_walk(obj, matrix, def_layer, is_root_target):
+            if _is_skipped_export_group(obj):
+                return
+            def_layer = getattr(obj, "SketchUpLayer", "") or def_layer
+            if _is_type(obj, "App::Link"):
+                sub_target = obj.LinkedObject
+                if sub_target is None:
+                    return
+                sub_plan = collect_definition(sub_target, visiting | {key})
+                if sub_plan is None:
+                    return
+                inst_mat = matrix * _link_local_matrix(obj, sub_target)
+                m3, trans = _matrix_to_skp_instance(inst_mat)
+                child_instances.append(
+                    (_resolve_link_instance_name(obj, sub_target), sub_plan["key"], m3, trans, def_layer)
+                )
+                return
+            if _is_part_or_assembly(obj):
+                inner = matrix if is_root_target else matrix * obj.Placement.toMatrix()
+                for child in _direct_children(obj):
+                    def_walk(child, inner, def_layer, False)
+                return
+            if _is_type(obj, "App::DocumentObjectGroup"):
+                for child in _direct_children(obj):
+                    def_walk(child, matrix, def_layer, False)
+                return
+            shape = getattr(obj, "Shape", None)
+            if shape is None or shape.isNull():
+                return
+            leaf = matrix * obj.Placement.toMatrix().inverse() if is_root_target else matrix
+            extracted = _extract_shape_faces(shape, leaf, stats)
+            if extracted:
+                own_leaves.append((obj, extracted, def_layer))
+
+        def_walk(target, App.Matrix(), "", True)
+        if not own_leaves and not child_instances:
+            definitions_by_key[key] = None
+            return None
+        skp_name = _unique_definition_name(getattr(target, "Label", "") or "Component", used_def_names)
+        plan = {
+            "key": key,
+            "name": skp_name,
+            "leaves": own_leaves,
+            "instances": child_instances,
+        }
+        definitions_by_key[key] = plan
+        ordered_definitions.append(plan)
+        return plan
+
+    def root_walk(obj, matrix, layer):
+        if _is_skipped_export_group(obj):
+            return
+        layer = getattr(obj, "SketchUpLayer", "") or layer
+        if _is_type(obj, "App::Link"):
+            target = obj.LinkedObject
+            if target is None:
+                return
+            def_plan = collect_definition(target, frozenset())
+            if def_plan is None:
+                return
+            inst_mat = matrix * _link_local_matrix(obj, target)
+            m3, trans = _matrix_to_skp_instance(inst_mat)
+            root_instances.append((_resolve_link_instance_name(obj, target), def_plan["key"], m3, trans, layer))
+            return
+        if _is_part_or_assembly(obj):
+            inner = matrix * obj.Placement.toMatrix()
+            for child in _direct_children(obj):
+                root_walk(child, inner, layer)
+            return
+        if _is_type(obj, "App::DocumentObjectGroup"):
+            for child in _direct_children(obj):
+                root_walk(child, matrix, layer)
+            return
+        shape = getattr(obj, "Shape", None)
+        if shape is None or shape.isNull():
+            return
+        extracted = _extract_shape_faces(shape, matrix, stats)
+        if extracted:
+            root_leaves.append((obj, extracted, layer))
+
+    for obj in exportList:
+        if any(a.Name in selected or _is_skipped_export_group(a) for a in _ancestors(obj)):
+            continue
+        parent_group = getattr(obj, "getParentGeoFeatureGroup", lambda: None)()
+        base = parent_group.getGlobalPlacement().toMatrix() if parent_group is not None else App.Matrix()
+        inherited_tag = getattr(obj, "SketchUpLayer", "") or next(
+            (getattr(a, "SketchUpLayer", "") for a in _ancestors(obj) if getattr(a, "SketchUpLayer", "")),
+            "",
+        )
+        if inherited_tag:
+            initial_layer = inherited_tag
+        elif _is_type(obj, "App::Link"):
+            initial_layer = ""
+        else:
+            initial_layer = getattr(obj, "Label", "")
+        root_walk(obj, base, initial_layer)
+
+    return ordered_definitions, root_leaves, root_instances
+
+
+def _write_extracted_faces(target_builder, extracted, stats, layer_handle, material_handles):
+    for outer_pts, holes, face_idx in extracted:
+        material = material_handles[face_idx] if material_handles and face_idx < len(material_handles) else None
+        try:
+            target_builder.add_face(outer_pts, holes=holes, layer=layer_handle, material=material)
+            stats["faces_written"] += 1
+        except Exception:
+            stats["faces_skipped"] += 1
+
+
 def export(exportList, filename):
     """Called by FreeCAD when exporting to .skp (File > Export).
 
-    Everything the selection shows (see _export_leaves: plain shapes, and
-    the parts, tag groups and links of an imported hierarchy) is flattened
-    into a flat set of faces at the root of a new .skp file, each in its
-    world position. No component/group structure is written (yet), so an
-    imported hierarchy exports as its geometry.
+    Preserves component hierarchy (#28): each definition (App::Part,
+    Assembly::AssemblyObject, or linked shape) reached through ``App::Link``
+    becomes one SketchUp component definition via
+    ``builder.add_component_definition(...)`` in bottom-up order, and each
+    ``App::Link`` becomes an instance via ``add_instance(...)`` carrying its
+    placement, non-uniform scale and mirroring (``matrix3x3``) and its
+    ``SketchUpLayer`` tag. Plain objects outside links (such as merged-import
+    compounds, sheared copies, or standalone FreeCAD shapes) stay loose
+    geometry at the file's root, keeping the flat export as a fallback.
 
-    Each object's own Label becomes its SketchUp layer/tag - unlike
-    Blender's exporter (which has to fall back to Collection membership,
-    since one Blender object has no per-object "layer" slot), this is an
-    exact match for what the merged import produces: one object per
-    layer, Label set to the real layer name - so re-exporting an
-    unmodified, just-imported set of layer objects reproduces the same
-    tags exactly, not an approximation. In an imported hierarchy the tags
-    come from the ``SketchUpLayer`` property the import set on tag groups
-    and links. For freshly modelled FreeCAD content that was never
-    imported, this just means each object's own Label doubles as its
-    exported tag - a predictable, if occasionally literal (a "Box" exports
-    to a layer named "Box"), rule rather than trying to guess which
-    Labels look "meaningful."
-
-    Each object's own ViewObject.DiffuseColor (one RGBA entry per
-    Shape.Faces, the same property materials-import applies) becomes a
-    SketchUp material per distinct color - solid colors and opacity
-    only, matching import's own scope; no texture export. Only available
-    under the real GUI (ViewObject doesn't exist under headless
-    freecadcmd, so a headless export carries geometry/layers but no
-    colors - matching how headless import can't apply colors either). An
-    object with no per-face color data (or running headless) exports
-    unpainted, same as before this existed.
+    Tags come from ``SketchUpLayer`` on imported tag groups and links; for
+    plain objects that were never part of an imported hierarchy, each
+    object's ``Label`` becomes its SketchUp tag. Per-face ``DiffuseColor``
+    materials are deduplicated across all component definitions and loose
+    objects when running under the GUI.
     """
     from openskp import create
 
-    builder = create()
-    leaves = list(_export_leaves(exportList))
+    global last_export_stats
 
-    # openskp's writer requires materials, then layers, then faces, in
-    # that order - add_material must precede add_layer (both depend on
-    # the final material count for their own slot numbering), and both
-    # must precede the first add_face call. So materials are resolved
-    # and registered first here, then layers - two dedup passes over
-    # the leaves, not two export passes, and the same ordering the
-    # Blender exporter's own export_skp() uses.
+    builder = create()
+    stats = {
+        "faces_written": 0, "faces_skipped": 0, "objects_skipped": 0,
+        "definitions_written": 0, "instances_written": 0,
+        "materials_written": 0, "layers_written": 0,
+    }
+    stats["objects_skipped"] = sum(1 for o in exportList if not _can_export(o))
+    ordered_definitions, root_leaves, root_instances = _collect_export_plan(exportList, stats)
+
+    # openskp's writer requires materials, then layers, then component
+    # definitions, then root-level faces and instances, in that exact order.
     material_handle_by_key = {}
     object_material_handles = {}
-    for obj, _shape, _transform, _layer in leaves:
+    all_leaf_objs = [obj for plan in ordered_definitions for obj, _, _ in plan["leaves"]] + [
+        obj for obj, _, _ in root_leaves
+    ]
+    for obj in all_leaf_objs:
         if id(obj) not in object_material_handles:
             object_material_handles[id(obj)] = _register_face_materials(obj, builder, material_handle_by_key)
 
+    layer_names = []
+    for plan in ordered_definitions:
+        layer_names.extend(layer for _, _, layer in plan["leaves"])
+        layer_names.extend(layer for _, _, _, _, layer in plan["instances"])
+    layer_names.extend(layer for _, _, layer in root_leaves)
+    layer_names.extend(layer for _, _, _, _, layer in root_instances)
+
     layer_handle_by_label = {}
-    for _obj, _shape, _transform, layer in leaves:
-        if layer and layer not in layer_handle_by_label:
+    for layer in layer_names:
+        if layer and layer != "Layer0" and layer not in layer_handle_by_label:
             layer_handle_by_label[layer] = builder.add_layer(layer)
 
-    stats = {
-        "faces_written": 0, "faces_skipped": 0, "objects_skipped": 0,
-        "materials_written": len(material_handle_by_key), "layers_written": len(layer_handle_by_label),
-    }
-    stats["objects_skipped"] = sum(1 for o in exportList if not _can_export(o))
+    def_handles = {}
+    for plan in ordered_definitions:
+        with builder.add_component_definition(plan["name"]) as db:
+            for obj, extracted, layer in plan["leaves"]:
+                _write_extracted_faces(
+                    db, extracted, stats, layer_handle_by_label.get(layer),
+                    object_material_handles.get(id(obj)),
+                )
+            for inst_name, child_key, m3, trans, layer in plan["instances"]:
+                db.add_instance(
+                    def_handles[child_key],
+                    name=inst_name,
+                    translation=trans,
+                    matrix3x3=m3,
+                    layer=layer_handle_by_label.get(layer),
+                )
+                stats["instances_written"] += 1
+        def_handles[plan["key"]] = db
+        stats["definitions_written"] += 1
 
-    for obj, shape, transform, layer in leaves:
-        _add_shape_faces(builder, shape, transform, stats, layer_handle_by_label.get(layer),
-                         object_material_handles.get(id(obj)))
+    for obj, extracted, layer in root_leaves:
+        _write_extracted_faces(
+            builder, extracted, stats, layer_handle_by_label.get(layer),
+            object_material_handles.get(id(obj)),
+        )
+    for inst_name, def_key, m3, trans, layer in root_instances:
+        builder.add_instance(
+            def_handles[def_key],
+            name=inst_name,
+            translation=trans,
+            matrix3x3=m3,
+            layer=layer_handle_by_label.get(layer),
+        )
+        stats["instances_written"] += 1
+
+    stats["materials_written"] = len(material_handle_by_key)
+    stats["layers_written"] = len(layer_handle_by_label)
+    last_export_stats = stats
 
     with _real_open(filename, "wb") as f:
         f.write(builder.to_bytes())
 
     print(
-        f"openskp export: {stats['faces_written']} faces written, "
+        f"openskp export: {stats['definitions_written']} definitions, "
+        f"{stats['instances_written']} instances, {stats['faces_written']} faces written, "
         f"{stats['faces_skipped']} skipped, {stats['objects_skipped']} objects skipped, "
         f"{stats['materials_written']} materials, {stats['layers_written']} layers"
     )
