@@ -97,6 +97,108 @@ def _coin_node_types(node, out=None):
     return out
 
 
+def _extract_coin_texture_state(node):
+    """Walks ``node`` and extracts ``(tex_digests, uv_lists)`` from Coin3D's live
+    ``SoTexture2`` and ``SoTextureCoordinate2`` fields so persistence across
+    ``.FCStd`` save/reopen is asserted directly on Coin3D's scene-graph state."""
+    import hashlib
+
+    tex_digests = []
+    uv_lists = []
+
+    def walk(n):
+        if n is None:
+            return
+        sb_name = n.getTypeId().getName()
+        tname = sb_name.getString() if hasattr(sb_name, "getString") else str(sb_name)
+        if tname == "Texture2":
+            try:
+                val = n.image.getValue()
+                raw_bytes = None
+                dims = None
+                nc = None
+                if isinstance(val, tuple):
+                    for item in val:
+                        if isinstance(item, (bytes, bytearray)):
+                            raw_bytes = bytes(item)
+                        elif isinstance(item, str):
+                            raw_bytes = item.encode("latin1")
+                        elif hasattr(item, "getValue"):
+                            dims = tuple(int(x) for x in item.getValue())
+                        elif isinstance(item, int):
+                            nc = item
+                if raw_bytes is not None:
+                    tex_digests.append((dims, nc, len(raw_bytes), hashlib.sha256(raw_bytes).hexdigest()))
+                else:
+                    tex_digests.append(("non_bytes", repr(val)[:80]))
+            except Exception as exc:
+                tex_digests.append(("err", repr(exc)))
+        elif tname == "TextureCoordinate2":
+            cnt = n.point.getNum()
+            pts = []
+            for idx in range(cnt):
+                v = n.point[idx]
+                xy = v.getValue() if hasattr(v, "getValue") else tuple(v)
+                pts.append((round(float(xy[0]), 6), round(float(xy[1]), 6)))
+            uv_lists.append(pts)
+        if hasattr(n, "getNumChildren"):
+            try:
+                for i in range(n.getNumChildren()):
+                    walk(n.getChild(i))
+            except Exception:
+                pass
+
+    walk(node)
+    return tex_digests, uv_lists
+
+
+def _sample_distinct_saturated_hues(png_path):
+    """Scans the central 3D viewport area of a saved window grab with ``QImage``
+    and classifies saturated rendered pixels into colour buckets (magenta,
+    yellow, cyan/blue, green) so tests assert what actually rendered on screen."""
+    from PySide import QtGui
+
+    img = QtGui.QImage(png_path)
+    if img.isNull():
+        return set()
+    img = img.convertToFormat(QtGui.QImage.Format_RGB888)
+    w, h = img.width(), img.height()
+    buckets = set()
+    # Central MDI 3D viewport region (avoiding left tree dock and toolbars)
+    for y in range(int(h * 0.20), int(h * 0.85), 4):
+        for x in range(int(w * 0.30), int(w * 0.92), 4):
+            c = QtGui.QColor(img.pixel(x, y))
+            r, g, b = c.red(), c.green(), c.blue()
+            if max(r, g, b) - min(r, g, b) < 45:
+                continue
+            if r > 125 and b > 85 and g < 95:
+                buckets.add("magenta")
+            elif r > 135 and g > 115 and b < 95:
+                buckets.add("yellow")
+            elif b > 95 and r < 85:
+                buckets.add("cyan_or_navy")
+            elif g > 95 and r < 85 and b < 95:
+                buckets.add("green")
+    return sorted(buckets)
+
+
+def _drawn_box_and_empty_flag(view):
+    """Returns ``(is_empty, ((xmin, xmax), (ymin, ymax), (zmin, zmax)))`` for the
+    active 3D viewer's Coin3D scene graph via ``SoGetBoundingBoxAction``."""
+    from pivy import coin
+
+    sg = view.getViewer().getSceneGraph()
+    region = view.getViewer().getSoRenderManager().getViewportRegion()
+    bba = coin.SoGetBoundingBoxAction(region)
+    bba.apply(sg)
+    box = bba.getBoundingBox()
+    if box.isEmpty():
+        return True, ((0.0, 0.0), (0.0, 0.0), (0.0, 0.0))
+    lo, hi = box.getMin().getValue(), box.getMax().getValue()
+    bounds = tuple((float(lo[i]), float(hi[i])) for i in range(3))
+    return False, bounds
+
+
 class _TexturedObjectProxy:
     """Minimal Part::FeaturePython object proxy preserving exact B-rep Shape."""
 
@@ -420,31 +522,57 @@ def probe_gui(out_dir, show_fn):
     gui_findings["viewprovider_display_modes"] = list(vo.listDisplayModes())
     gui_findings["default_root_coin_nodes"] = _coin_node_types(vo.RootNode)
 
-    # Check if assigning a textured Materials.Material via ShapeAppearance adds any SoTexture2
+    default_tex_nodes = [n for n in _coin_node_types(vo.RootNode) if "Texture" in n]
+
+    # Check what Materials workbench's textured materials produce on ViewProviderPartExt
     shape_app_tex_nodes = []
+    shape_mat_tex_data_bytes = []
+    materials_wb_hues = []
     shape_app_error = None
     try:
         import Materials
 
         mgr = Materials.MaterialManager()
-        textured_uuid = None
+        textured_uuids = []
         for uuid_key, m_obj in mgr.Materials.items():
             app_props = getattr(m_obj, "AppearanceProperties", {})
             if any("tex" in k.lower() or "image" in k.lower() for k in app_props):
-                textured_uuid = uuid_key
-                break
+                textured_uuids.append(uuid_key)
+                if len(textured_uuids) >= 2:
+                    break
         m0 = App.Material()
         m0.DiffuseColor = (0.9, 0.2, 0.2, 0.0)
-        if textured_uuid and hasattr(mgr.getMaterial(textured_uuid), "getMaterialAppearance"):
-            m0 = mgr.getMaterial(textured_uuid).getMaterialAppearance()
         m1 = App.Material()
         m1.DiffuseColor = (0.2, 0.8, 0.3, 0.0)
+        if len(textured_uuids) >= 1 and hasattr(mgr.getMaterial(textured_uuids[0]), "getMaterialAppearance"):
+            m0 = mgr.getMaterial(textured_uuids[0]).getMaterialAppearance()
+        if len(textured_uuids) >= 2 and hasattr(mgr.getMaterial(textured_uuids[1]), "getMaterialAppearance"):
+            m1 = mgr.getMaterial(textured_uuids[1]).getMaterialAppearance()
         vo.ShapeAppearance = [m0, m1]
+        if textured_uuids and hasattr(pf, "ShapeMaterial"):
+            pf.ShapeMaterial = mgr.getMaterial(textured_uuids[0])
+        doc_ab.recompute()
         Gui.updateGui()
+        show_fn(doc_ab, "tex_probe_materials_wb")
+        materials_wb_hues = _sample_distinct_saturated_hues(os.path.join(out_dir, "tex_probe_materials_wb.png"))
         shape_app_tex_nodes = [n for n in _coin_node_types(vo.RootNode) if "Texture" in n]
+        shape_mat_tex_data_bytes, shape_mat_uvs = _extract_coin_texture_state(vo.RootNode)
+        # Programmatic assertions on Materials workbench + ViewProviderPartExt:
+        # 1) Zero SoTextureCoordinate2 nodes exist on ViewProviderPartExt (cannot hold per-face uv_transform).
+        # 2) Assigning two distinct textured Materials entries adds zero new Texture2 nodes beyond
+        #    ViewProviderPartExt's built-in single Texture2/Texture3 placeholder per display mode
+        #    ('Flat Lines' and 'Shaded') above the single BrepFaceSet.
+        assert shape_app_tex_nodes.count("TextureCoordinate2") == 0, shape_app_tex_nodes
+        assert shape_mat_uvs == [], shape_mat_uvs
+        assert shape_app_tex_nodes == default_tex_nodes, (shape_app_tex_nodes, default_tex_nodes)
+    except AssertionError:
+        raise
     except Exception as exc:
         shape_app_error = repr(exc)
+    gui_findings["default_texture_coin_nodes"] = default_tex_nodes
     gui_findings["shape_appearance_texture_coin_nodes"] = shape_app_tex_nodes
+    gui_findings["shape_appearance_coin_texture_state"] = shape_mat_tex_data_bytes
+    gui_findings["materials_wb_rendered_hues"] = materials_wb_hues
     gui_findings["shape_appearance_error"] = shape_app_error
 
     # --- Experiment C: Direct Coin3D injection on C++ Part::Feature + save/reopen ---
@@ -478,6 +606,7 @@ def probe_gui(out_dir, show_fn):
         "texture_nodes_after_reopen": after_types_c,
         "survives_save_reopen": len(after_types_c) >= len(before_types_c),
     }
+    assert not gui_findings["raw_coin_on_part_feature"]["survives_save_reopen"], gui_findings["raw_coin_on_part_feature"]
 
     # --- Experiment D: Part::FeaturePython + Python ViewProvider + App::Link + save/reopen ---
     doc_d = App.newDocument("TexProbeFeaturePython")
@@ -553,7 +682,9 @@ def probe_gui(out_dir, show_fn):
     doc_d.recompute()
     Gui.updateGui()
     before_d_nodes = [n for n in _coin_node_types(fp_obj.ViewObject.RootNode) if "Texture" in n]
-    show_fn(doc_d, "tex_probe_featurepython_before_save")
+    before_tex_digests, before_uv_lists = _extract_coin_texture_state(fp_obj.ViewObject.Proxy.tex_root)
+    view_d_before = show_fn(doc_d, "tex_probe_featurepython_before_save")
+    empty_before, bounds_before = _drawn_box_and_empty_flag(view_d_before)
 
     fcstd_d = os.path.join(out_dir, "probe_featurepython.FCStd")
     doc_d.saveAs(fcstd_d)
@@ -570,12 +701,32 @@ def probe_gui(out_dir, show_fn):
     doc_d2 = App.openDocument(fcstd_d)
     Gui.updateGui()
     fp_obj2 = doc_d2.getObject("TexturedGeom")
+    def_part2 = doc_d2.getObject("DefPart")
     after_d_nodes = [n for n in _coin_node_types(fp_obj2.ViewObject.RootNode) if "Texture" in n]
+    after_tex_digests, after_uv_lists = _extract_coin_texture_state(fp_obj2.ViewObject.Proxy.tex_root)
     after_d_mode = fp_obj2.ViewObject.DisplayMode
     after_d_faces = len(fp_obj2.Shape.Faces)
     reopened_inc_file = getattr(fp_obj2, "EmbeddedSampleTex", "")
     reopened_inc_exists = bool(reopened_inc_file and os.path.isfile(reopened_inc_file))
-    show_fn(doc_d2, "tex_probe_featurepython_after_reopen")
+    view_d_after = show_fn(doc_d2, "tex_probe_featurepython_after_reopen")
+    empty_after, bounds_after = _drawn_box_and_empty_flag(view_d_after)
+
+    hues_before = _sample_distinct_saturated_hues(os.path.join(out_dir, "tex_probe_featurepython_before_save.png"))
+    hues_after = _sample_distinct_saturated_hues(os.path.join(out_dir, "tex_probe_featurepython_after_reopen.png"))
+
+    # Programmatic assertions on App::Link Coin rendering, bounds, rendered hues, and SoSFImage/UV persistence
+    # (fp_obj carries default grey DiffuseColor, so saturated magenta/yellow/cyan/green pixels can only come
+    # from OpenSKPTexturedRoot rendered through the two visible App::Link instances while DefPart is hidden):
+    assert not def_part2.ViewObject.Visibility, "Definition App::Part should remain hidden"
+    assert not empty_before and not empty_after, (empty_before, empty_after)
+    assert bounds_after[0][1] >= 325.0 and bounds_after[1][0] <= 1.0 and bounds_after[1][1] >= 220.0, bounds_after
+    assert len(before_tex_digests) == 2 and before_tex_digests == after_tex_digests, (
+        before_tex_digests, after_tex_digests
+    )
+    assert len(before_uv_lists) == 2 and before_uv_lists == after_uv_lists, (
+        before_uv_lists, after_uv_lists
+    )
+    assert hues_before == hues_after and len(hues_after) >= 3, (hues_before, hues_after)
 
     gui_findings["feature_python_viewprovider"] = {
         "display_modes": list(fp_obj2.ViewObject.listDisplayModes()),
@@ -587,11 +738,21 @@ def probe_gui(out_dir, show_fn):
         "fcstd_zip_entries": fcstd_entries,
         "texture_nodes_before_save": before_d_nodes,
         "texture_nodes_after_reopen": after_d_nodes,
+        "coin_texture_digests_match_after_reopen": before_tex_digests == after_tex_digests,
+        "coin_uv_lists_match_after_reopen": before_uv_lists == after_uv_lists,
+        "rendered_viewport_hue_buckets_before_save": hues_before,
+        "rendered_viewport_hue_buckets_after_reopen": hues_after,
+        "drawn_bounds_mm_before_save": bounds_before,
+        "drawn_bounds_mm_after_reopen": bounds_after,
         "fcstd_bytes": fcstd_d_size,
         "survives_save_reopen": (
             after_d_mode == "Textured"
             and after_d_faces == 3
             and reopened_inc_exists
+            and len(hues_after) >= 3
+            and hues_before == hues_after
+            and before_tex_digests == after_tex_digests
+            and before_uv_lists == after_uv_lists
             and before_d_nodes.count("TextureCoordinate2") == 2
             and after_d_nodes.count("TextureCoordinate2") == 2
             and before_d_nodes.count("Texture2") == after_d_nodes.count("Texture2")
