@@ -198,6 +198,12 @@ def main():
         _check_bounds("sphere", sphere_drawn, ((-5, 5), (-5, 5), (-5, 5)), mm, tol=0.5)
         lines.append(f"sphere: the view draws {sphere_drawn} mm, 1-face spherical solid")
 
+        import json
+        import test_texture_feasibility
+
+        tex_report = test_texture_feasibility.probe_gui(OUT, _show)
+        lines.append("texture_feasibility_json: " + json.dumps(tex_report))
+
         _finish("PASS\n" + "\n".join(lines), 0)
     except BaseException:
         _finish("FAIL\n" + traceback.format_exc(), 1)
