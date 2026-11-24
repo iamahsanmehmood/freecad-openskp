@@ -1698,12 +1698,12 @@ _PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/OpenSKP"
 last_import_stats: dict = {}
 
 
-def _bool_preference(name):
-    """A Boolean preference of BaseApp/Preferences/Mod/OpenSKP, False when unset."""
+def _bool_preference(name, default=False):
+    """A Boolean preference of BaseApp/Preferences/Mod/OpenSKP, ``default`` when unset."""
     try:
-        return App.ParamGet(_PARAM_PATH).GetBool(name, False)
+        return App.ParamGet(_PARAM_PATH).GetBool(name, bool(default))
     except Exception:
-        return False
+        return bool(default)
 
 
 def _merge_on_import_preference():
@@ -1747,6 +1747,782 @@ def _assembly_available():
         return True
     except Exception:
         return False
+
+
+def _draft_available():
+    """Whether FreeCAD's built-in Draft module is available for annotations."""
+    try:
+        import Draft  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _tlv_headers_in_range(buf, start, end):
+    import struct
+
+    out = []
+    pos = start
+    while pos + 6 <= end:
+        ln = struct.unpack_from("<I", buf, pos + 2)[0]
+        if ln > end - pos - 6:
+            break
+        out.append((pos, ln))
+        pos += 6 + ln
+    return out
+
+
+_MAX_IMPORTED_ANNOTATIONS = 2000
+
+
+def _inspect_vff_annotations_tlv(filepath, model, include_components=False):
+    """Inspects ``model.dat`` inside a 2021+ VFF ``.skp`` ZIP container (#29):
+    - Classifies ``5BCC`` dimension records into component/nested-path vs root,
+      detects tag ``0x5BD1 != 0`` axis-constrained dimensions, and counts ``5BCC``
+      records whose endpoints did not resolve into ``model.dimensions``.
+    - Counts ``55F0`` VFF text records when ``openskp <= 1.6.0`` has not yet
+      parsed them.
+    """
+    import struct
+    import zipfile
+    from openskp import _core
+
+    model_dims = [d for d in (getattr(model, "dimensions", None) or ()) if d.a is not None and d.b is not None]
+    if not filepath or not os.path.isfile(filepath):
+        return [], (0 if include_components else len(model_dims)), 0, 0, 0
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            md = zf.read("model.dat")
+    except Exception:
+        return [], (0 if include_components else len(model_dims)), 0, 0, 0
+
+    def_spans = []
+    hs = _tlv_headers_in_range(md, 0, len(md))
+    if len(hs) == 1 and md[hs[0][0]] == 0xF4 and md[hs[0][0] + 1] == 0x01:
+        hs = _tlv_headers_in_range(md, hs[0][0] + 6, hs[0][0] + 6 + hs[0][1])
+    for h_off, h_sz in hs:
+        if md[h_off] == 0xF9 and md[h_off + 1] == 0x01:
+            lvl = _tlv_headers_in_range(md, h_off + 6, h_off + 6 + h_sz)
+            for tag_lo, tag_hi in ((0x70, 0x17), (0x71, 0x17)):
+                nxt = next(((o, s) for o, s in lvl if md[o] == tag_lo and md[o + 1] == tag_hi), None)
+                lvl = _tlv_headers_in_range(md, nxt[0] + 6, nxt[0] + 6 + nxt[1]) if nxt else []
+            for r_off, r_sz in lvl:
+                if md[r_off] == 0x7C and md[r_off + 1] == 0x15:
+                    def_spans.append((r_off, r_off + 6 + r_sz))
+
+    def _has_multi_instance_path(conn_payload):
+        if not conn_payload:
+            return False
+        blk = _core._tlv_find(_core._tlv_items(conn_payload) or [], 0x5208)
+        sub = _core._tlv_items(blk) or [] if blk else []
+        ref = _core._tlv_find(sub, 0x520B)
+        f53fc = _core._tlv_find(_core._tlv_items(ref) or [], 0x53FC) if ref else None
+        fi = _core._tlv_items(f53fc) or [] if f53fc else []
+        iid = _core._tlv_find(fi, 0x53FE)
+        if not iid or len(iid) == 0:
+            return False
+        return 1 + iid[0] < len(iid)
+
+    view = memoryview(md)
+    raw_5bcc = []
+    pos = 0
+    n = len(md)
+    while True:
+        j = md.find(b"\xcc\x5b", pos)
+        if j < 0:
+            break
+        pos = j + 1
+        if j + 6 > n:
+            continue
+        ln = struct.unpack_from("<I", md, j + 2)[0]
+        if ln < 40 or j + 6 + ln > n:
+            continue
+        body = _core._tlv_items(view[j + 6 : j + 6 + ln])
+        if not body:
+            continue
+        tags = [t for t, _ in body]
+        if 0x5BCD not in tags or 0x5BCE not in tags:
+            continue
+        in_def = any(s <= j < e for s, e in def_spans)
+        multi = _has_multi_instance_path(_core._tlv_find(body, 0x5BCD)) or _has_multi_instance_path(
+            _core._tlv_find(body, 0x5BCE)
+        )
+        xaxis = _core._tlv_find(body, 0x5BCF)
+        normal = _core._tlv_find(body, 0x5BD0)
+        axis_bytes = _core._tlv_find(body, 0x5BD1)
+        off_bytes = _core._tlv_find(body, 0x5BD2)
+        px_val = struct.unpack("<3d", xaxis) if xaxis and len(xaxis) == 24 else None
+        nm_val = struct.unpack("<3d", normal) if normal and len(normal) == 24 else None
+        off_val = struct.unpack("<d", off_bytes)[0] if off_bytes and len(off_bytes) == 8 else 0.0
+        axis_val = struct.unpack("<I", axis_bytes)[0] if axis_bytes and len(axis_bytes) == 4 else 0
+        raw_5bcc.append((in_def, multi, axis_val, (px_val, nm_val, off_val)))
+
+    vff_texts = 0
+    pos = 0
+    while True:
+        j = md.find(b"\xf0\x55", pos)
+        if j < 0:
+            break
+        pos = j + 1
+        if j + 6 > n:
+            continue
+        ln = struct.unpack_from("<I", md, j + 2)[0]
+        if ln < 10 or j + 6 + ln > n:
+            continue
+        body = _core._tlv_items(view[j + 6 : j + 6 + ln])
+        if not body:
+            continue
+        tags = [t for t, _ in body]
+        if 0x55F1 in tags and 0x55F4 in tags:
+            vff_texts += 1
+
+    matched = []
+    unresolved_count = 0
+    r_idx = 0
+    for d in model_dims:
+        sig = (
+            tuple(d.plane_x) if d.plane_x is not None else None,
+            tuple(d.normal) if d.normal is not None else None,
+            float(d.offset or 0.0),
+        )
+        found = None
+        scan = r_idx
+        while scan < len(raw_5bcc):
+            if raw_5bcc[scan][3] == sig:
+                found = scan
+                break
+            scan += 1
+        if found is None and r_idx < len(raw_5bcc):
+            found = r_idx
+        if found is not None:
+            for skipped_idx in range(r_idx, found):
+                s_in_def, s_multi, _, _ = raw_5bcc[skipped_idx]
+                if include_components or (not s_in_def and not s_multi):
+                    unresolved_count += 1
+            matched.append((d, raw_5bcc[found]))
+            r_idx = found + 1
+        else:
+            matched.append((d, (False, False, 0, sig)))
+    for skipped_idx in range(r_idx, len(raw_5bcc)):
+        s_in_def, s_multi, _, _ = raw_5bcc[skipped_idx]
+        if include_components or (not s_in_def and not s_multi):
+            unresolved_count += 1
+
+    kept_dims = []
+    skipped_comp = 0
+    skipped_constrained = 0
+    for d, (in_def, multi, axis_val, _) in matched:
+        if not include_components and (in_def or multi):
+            skipped_comp += 1
+            continue
+        if (
+            axis_val != 0
+            and not hasattr(d, "measured_direction")
+            and _is_vff_axis_misaligned(d.a, d.b, axis_val, d.plane_x, d.normal)
+        ):
+            skipped_constrained += 1
+            continue
+        kept_dims.append(d)
+
+    return kept_dims, skipped_comp, skipped_constrained, unresolved_count, vff_texts
+
+
+def _is_unpositioned_text(t) -> bool:
+    if getattr(t, "leader_type", None) == 0:
+        return True
+    return getattr(t, "point", None) is None and getattr(t, "label_point", None) is None
+
+
+def _is_vff_axis_misaligned(a, b, axis_val, p_norm, p_x) -> bool:
+    """Returns True when a 2021+ dimension has an axis constraint (5BD1 == 1 for
+    plane X axis ``5BD0``, 5BD1 == 2 for plane Y axis ``5BCF x 5BD0``) and
+    ``b - a`` is not parallel to that constraint axis."""
+    if axis_val == 0:
+        return False
+    if a is None or b is None or p_norm is None or p_x is None:
+        return True
+    if axis_val == 1:
+        cx, cy, cz = float(p_x[0]), float(p_x[1]), float(p_x[2])
+    elif axis_val == 2:
+        nx, ny, nz = float(p_norm[0]), float(p_norm[1]), float(p_norm[2])
+        xx, xy, xz = float(p_x[0]), float(p_x[1]), float(p_x[2])
+        cx = ny * xz - nz * xy
+        cy = nz * xx - nx * xz
+        cz = nx * xy - ny * xx
+    else:
+        return True
+    dx = float(b[0]) - float(a[0])
+    dy = float(b[1]) - float(a[1])
+    dz = float(b[2]) - float(a[2])
+    seg_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    c_len = math.sqrt(cx * cx + cy * cy + cz * cz)
+    if seg_len <= 1e-9 or c_len <= 1e-9:
+        return False
+    cos_ang = abs(dx * cx + dy * cy + dz * cz) / (seg_len * c_len)
+    return (1.0 - cos_ang) > 1e-4
+
+
+def _is_misaligned_constrained_dim(dim, is_vff=False) -> bool:
+    if hasattr(dim, "measured_direction"):
+        return False
+    ov = getattr(dim, "offset_vector", None)
+    if ov is None or dim.a is None or dim.b is None:
+        return False
+    dx = float(dim.b[0]) - float(dim.a[0])
+    dy = float(dim.b[1]) - float(dim.a[1])
+    dz = float(dim.b[2]) - float(dim.a[2])
+    seg_len = math.sqrt(dx * dx + dy * dy + dz * dz)
+    ox, oy, oz = float(ov[0]), float(ov[1]), float(ov[2])
+    ov_len = math.sqrt(ox * ox + oy * oy + oz * oz)
+    if seg_len <= 1e-9 or ov_len <= 1e-9:
+        return False
+    p_norm = getattr(dim, "plane_x", None) if is_vff else getattr(dim, "normal", None)
+    if p_norm is not None:
+        nx, ny, nz = float(p_norm[0]), float(p_norm[1]), float(p_norm[2])
+        cx = ny * oz - nz * oy
+        cy = nz * ox - nx * oz
+        cz = nx * oy - ny * ox
+        c_len = math.sqrt(cx * cx + cy * cy + cz * cz)
+        if c_len > 1e-9:
+            cos_ang = abs(dx * cx + dy * cy + dz * cz) / (seg_len * c_len)
+            return (1.0 - cos_ang) > 1e-4
+    dot = abs(dx * ox + dy * oy + dz * oz)
+    return dot > 1e-4 * seg_len * ov_len
+
+
+def _tag_dimension(dim, is_vff, extra=None):
+    """Copies ``dim`` with ``_is_vff`` (and optional builder fields) attached so
+    plane/normal conventions never collide between classic and VFF dimensions."""
+    from openskp.model import Dimension
+
+    kwargs = {
+        "text": getattr(dim, "text", "") or "",
+        "hidden": bool(getattr(dim, "hidden", False)),
+        "a": tuple(dim.a) if getattr(dim, "a", None) is not None else None,
+        "b": tuple(dim.b) if getattr(dim, "b", None) is not None else None,
+        "offset": float(getattr(dim, "offset", 0.0) or 0.0),
+        "plane_x": tuple(dim.plane_x) if getattr(dim, "plane_x", None) is not None else None,
+        "normal": tuple(dim.normal) if getattr(dim, "normal", None) is not None else None,
+    }
+    fields = getattr(Dimension, "__dataclass_fields__", {})
+    if "offset_vector" in fields:
+        ov = getattr(dim, "offset_vector", None)
+        kwargs["offset_vector"] = tuple(ov) if ov is not None else None
+    if "layer" in fields:
+        kwargs["layer"] = getattr(dim, "layer", "") or ""
+    wrapped = Dimension(**kwargs)
+    wrapped._is_vff = bool(is_vff)
+    if extra:
+        for k, v in extra.items():
+            if v is not None and not hasattr(wrapped, k):
+                setattr(wrapped, k, v)
+    return wrapped
+
+
+def _extract_model_annotations(model, skp_parsed, filepath=None, stats=None):
+    """Collects positioned texts and linear dimensions per definition (including
+    ``model.root``), plus verified root-only VFF ``model.dimensions`` when
+    running against an ``openskp`` release older than ``openskp#623`` (#29).
+    """
+    import zipfile
+    from openskp.model import Dimension
+
+    is_vff = bool(filepath and os.path.isfile(filepath) and zipfile.is_zipfile(filepath))
+    defs_dict = (skp_parsed or {}).get("defs_dict") or {}
+    layer_id_to_name = (skp_parsed or {}).get("layer_id_to_name") or {}
+
+    dim_fields = getattr(Dimension, "__dataclass_fields__", {})
+    has_vff_owner_annotations = "layer" in dim_fields
+    has_model_def_dims = (
+        has_vff_owner_annotations
+        or "offset_vector" in dim_fields
+        or any(
+            d.a is not None and d.b is not None
+            for defn in [model.root, *model.definitions.values()]
+            for d in (getattr(defn, "dimensions", None) or ())
+        )
+    )
+
+    by_def_id = {}
+    all_entries = [("ROOT", model.root), *list(model.definitions.items())]
+    for raw_key, defn in all_entries:
+        texts = []
+        for t in getattr(defn, "texts", None) or ():
+            if not (t.text or "").strip():
+                continue
+            if _is_unpositioned_text(t):
+                if stats is not None:
+                    stats["texts_skipped_no_position"] = stats.get("texts_skipped_no_position", 0) + 1
+                continue
+            texts.append(t)
+
+        dims = []
+        if has_model_def_dims and (not is_vff or has_vff_owner_annotations):
+            for d in getattr(defn, "dimensions", None) or ():
+                if d.a is None or d.b is None:
+                    if stats is not None:
+                        stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+                    continue
+                if _is_misaligned_constrained_dim(d, is_vff=is_vff):
+                    if stats is not None:
+                        stats["constrained_dimensions_skipped"] = stats.get("constrained_dimensions_skipped", 0) + 1
+                    continue
+                dims.append(_tag_dimension(d, is_vff))
+        elif not is_vff:
+            raw_entry = defs_dict.get(raw_key)
+            builder = raw_entry.get("builder") if isinstance(raw_entry, dict) else None
+            b_dims = getattr(builder, "dimensions", None) or ()
+            if b_dims:
+                for bd in b_dims:
+                    if not isinstance(bd, dict):
+                        continue
+                    if bd.get("a") is None or bd.get("b") is None:
+                        if stats is not None:
+                            stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+                        continue
+                    raw_lid = bd.get("layer_id", bd.get("layer"))
+                    resolved_layer = ""
+                    if isinstance(raw_lid, int) and raw_lid != 0:
+                        resolved_layer = layer_id_to_name.get(raw_lid, "")
+                    elif isinstance(raw_lid, str):
+                        resolved_layer = raw_lid
+                    base_d = Dimension(
+                        text=bd.get("text", ""),
+                        hidden=bool(bd.get("hidden", False)),
+                        a=tuple(bd["a"]),
+                        b=tuple(bd["b"]),
+                        offset=float(bd.get("offset", 0.0)),
+                        plane_x=tuple(bd["plane_x"]) if bd.get("plane_x") is not None else None,
+                        normal=tuple(bd["normal"]) if bd.get("normal") is not None else None,
+                    )
+                    ov = tuple(bd["offset_vector"]) if bd.get("offset_vector") is not None else None
+                    tagged = _tag_dimension(base_d, False, {"offset_vector": ov, "layer": resolved_layer})
+                    if _is_misaligned_constrained_dim(tagged):
+                        if stats is not None:
+                            stats["constrained_dimensions_skipped"] = stats.get("constrained_dimensions_skipped", 0) + 1
+                        continue
+                    dims.append(tagged)
+            else:
+                for d in getattr(defn, "dimensions", None) or ():
+                    if d.a is None or d.b is None:
+                        if stats is not None:
+                            stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+        by_def_id[id(defn)] = (texts, dims)
+
+    vff_world_dims = []
+    if is_vff and not has_vff_owner_annotations:
+        root_vff, skipped_comp_dims, skipped_constrained, skipped_unres, skipped_vff_txts = (
+            _inspect_vff_annotations_tlv(filepath, model, include_components=False)
+        )
+        if stats is not None:
+            stats["vff_component_dimensions_skipped"] = (
+                stats.get("vff_component_dimensions_skipped", 0) + skipped_comp_dims
+            )
+            stats["constrained_dimensions_skipped"] = (
+                stats.get("constrained_dimensions_skipped", 0) + skipped_constrained
+            )
+            stats["dimensions_skipped_unresolved"] = (
+                stats.get("dimensions_skipped_unresolved", 0) + skipped_unres
+            )
+            stats["vff_texts_skipped"] = stats.get("vff_texts_skipped", 0) + skipped_vff_txts
+        vff_world_dims = [_tag_dimension(d, True) for d in root_vff]
+
+    return by_def_id, vff_world_dims
+
+
+def _transform_inch_point(pt, m13):
+    if m13 is None:
+        return (float(pt[0]), float(pt[1]), float(pt[2]))
+    from openskp._core import transform_point
+
+    return transform_point(pt, m13)
+
+
+def _transform_inch_vec(vec, m13):
+    if m13 is None:
+        return App.Vector(float(vec[0]), float(vec[1]), float(vec[2]))
+    s = m13[12] if len(m13) > 12 else 1.0
+    vx, vy, vz = vec
+    return App.Vector(
+        (m13[0] * vx + m13[1] * vy + m13[2] * vz) * s,
+        (m13[3] * vx + m13[4] * vy + m13[5] * vz) * s,
+        (m13[6] * vx + m13[7] * vy + m13[8] * vz) * s,
+    )
+
+
+def _fallback_perp_normal(unit_dir):
+    """Returns a unit vector strictly perpendicular to ``unit_dir`` (never
+    parallel to ``a - b``, including for vertical dimensions)."""
+    ref = App.Vector(0.0, 0.0, 1.0) if abs(unit_dir.z) < 0.9 else App.Vector(0.0, -1.0, 0.0)
+    proj = ref - unit_dir * ref.dot(unit_dir)
+    if proj.Length <= 1e-9:
+        ref = App.Vector(1.0, 0.0, 0.0)
+        proj = ref - unit_dir * ref.dot(unit_dir)
+    return proj.normalize()
+
+
+def _dimension_geometry_mm(dim, world_m13):
+    """Computes ``(p1_mm, p2_mm, dimline_mm, plane_normal)`` in world space (#29):
+    - Applies an offset only when ``openskp`` provides ``Dimension.offset_vector``
+      (#621/#623); with ``openskp`` 1.6.0 (or when ``offset_vector`` is ``None``),
+      draws the dimension line directly on ``a``-``b`` (``dimline_mm = mid``).
+    - Guarantees ``plane_normal`` is unit-length and strictly orthogonal to
+      ``p2_mm - p1_mm`` (including vertical dimensions).
+    """
+    from openskp.model import Dimension
+
+    if dim.a is None or dim.b is None:
+        return None
+    p1_mm = App.Vector(*(c * INCH_TO_MM for c in _transform_inch_point(dim.a, world_m13)))
+    p2_mm = App.Vector(*(c * INCH_TO_MM for c in _transform_inch_point(dim.b, world_m13)))
+    seg = p2_mm - p1_mm
+    if seg.Length <= 1e-6:
+        return None
+    seg_dir = App.Vector(seg).normalize()
+    mid = (p1_mm + p2_mm) * 0.5
+
+    plane_n = None
+    offset_vec = getattr(dim, "offset_vector", None)
+    if offset_vec is not None:
+        off_mm = _transform_inch_vec(offset_vec, world_m13) * INCH_TO_MM
+        dimline_mm = mid + off_mm
+        cn = seg_dir.cross(off_mm)
+        if cn.Length > 1e-9:
+            plane_n = cn.normalize()
+    else:
+        dimline_mm = mid
+
+    if plane_n is None:
+        is_vff = bool(getattr(dim, "_is_vff", False))
+        has_classic_plane = "offset_vector" in getattr(Dimension, "__dataclass_fields__", {})
+        raw_n = getattr(dim, "plane_x", None) if is_vff else (
+            getattr(dim, "normal", None) if has_classic_plane else None
+        )
+        raw_x = getattr(dim, "normal", None) if is_vff else (
+            getattr(dim, "plane_x", None) if has_classic_plane else None
+        )
+        if raw_n is not None:
+            local_a = App.Vector(float(dim.a[0]), float(dim.a[1]), float(dim.a[2]))
+            local_b = App.Vector(float(dim.b[0]), float(dim.b[1]), float(dim.b[2]))
+            local_seg = local_b - local_a
+            local_dir = App.Vector(local_seg).normalize() if local_seg.Length > 1e-9 else seg_dir
+            cand = App.Vector(float(raw_n[0]), float(raw_n[1]), float(raw_n[2]))
+            cand = cand - local_dir * cand.dot(local_dir)
+            if cand.Length > 1e-9:
+                local_n = cand.normalize()
+                u0 = None
+                if raw_x is not None:
+                    ux = App.Vector(float(raw_x[0]), float(raw_x[1]), float(raw_x[2]))
+                    ux = ux - local_n * ux.dot(local_n)
+                    if ux.Length > 1e-9:
+                        u0 = ux.normalize()
+                if u0 is None:
+                    u0 = local_dir
+                v0 = local_n.cross(u0).normalize()
+                uw = _transform_inch_vec((u0.x, u0.y, u0.z), world_m13)
+                vw = _transform_inch_vec((v0.x, v0.y, v0.z), world_m13)
+                nw = uw.cross(vw)
+                nw = nw - seg_dir * nw.dot(seg_dir)
+                if nw.Length > 1e-9:
+                    plane_n = nw.normalize()
+
+    if plane_n is None:
+        plane_n = _fallback_perp_normal(seg_dir)
+
+    return p1_mm, p2_mm, dimline_mm, plane_n
+
+
+def _make_annotations_group(doc, label="Annotations", layer_name=""):
+    grp = doc.addObject("App::DocumentObjectGroup", "Annotations")
+    grp.Label = label
+    grp.addProperty(
+        "App::PropertyBool",
+        "SketchUpAnnotations",
+        "SketchUp",
+        "Holds imported SketchUp text and dimension annotations",
+    )
+    grp.SketchUpAnnotations = True
+    if layer_name:
+        _set_layer_property(grp, layer_name)
+    return grp
+
+
+def _hide_annotation_obj(obj):
+    obj.Visibility = False
+    if App.GuiUp and hasattr(obj, "ViewObject") and obj.ViewObject is not None:
+        obj.ViewObject.Visibility = False
+
+
+def _record_annotation_failure(stats, exc):
+    stats["annotation_failures"] = stats.get("annotation_failures", 0) + 1
+    if not stats.get("_first_annotation_error"):
+        stats["_first_annotation_error"] = f"{type(exc).__name__}: {exc}"
+
+
+def _switch_active_doc(doc):
+    prev_doc = App.activeDocument()
+    prev_name = prev_doc.Name if prev_doc is not None else None
+    switched = prev_name != doc.Name
+    if switched:
+        App.setActiveDocument(doc.Name)
+    return switched, prev_name
+
+
+def _restore_active_doc(switched, prev_name):
+    if switched and prev_name and prev_name in App.listDocuments():
+        App.setActiveDocument(prev_name)
+
+
+def _draft_dimension_override(raw_text):
+    """Maps SketchUp's ``<>`` measured-value token onto FreeCAD Draft's ``$dim``
+    override placeholder; returns ``""`` when no override is needed."""
+    stripped = (raw_text or "").strip()
+    if not stripped or stripped == "<>":
+        return ""
+    return raw_text.replace("<>", "$dim")
+
+
+def _draft_dimension_label(raw_text, dist_mm):
+    formatted = f"{dist_mm:.1f} mm"
+    stripped = (raw_text or "").strip()
+    if not stripped:
+        return f"Dimension ({formatted})"
+    if "<>" in raw_text:
+        return raw_text.replace("<>", formatted).strip() or f"Dimension ({formatted})"
+    return stripped
+
+
+def _cleanup_new_orphans(doc, before_names):
+    for orphan in list(doc.Objects):
+        if orphan.Name not in before_names:
+            try:
+                doc.removeObject(orphan.Name)
+            except Exception:
+                pass
+
+
+def _attach_annotation_obj(doc, group_fn, obj, stats, count_key):
+    if obj is None:
+        return
+    try:
+        group_fn().addObject(obj)
+    except Exception as exc:
+        try:
+            doc.removeObject(obj.Name)
+        except Exception:
+            pass
+        stats[count_key] = max(0, stats.get(count_key, 0) - 1)
+        _record_annotation_failure(stats, exc)
+
+
+def _create_draft_text_obj(doc, txt, world_m13, stats, force_hidden=False):
+    if _is_unpositioned_text(txt):
+        stats["texts_skipped_no_position"] = stats.get("texts_skipped_no_position", 0) + 1
+        return None
+    before_names = {o.Name for o in doc.Objects}
+    switched = False
+    prev_name = None
+    try:
+        switched, prev_name = _switch_active_doc(doc)
+        import Draft
+
+        lines = (txt.text or "").splitlines() or [txt.text]
+        pos_in = txt.label_point if txt.label_point is not None else txt.point
+        anchor_in = txt.point if txt.point is not None else pos_in
+        pos_mm = App.Vector(*(c * INCH_TO_MM for c in _transform_inch_point(pos_in, world_m13)))
+        anchor_mm = App.Vector(*(c * INCH_TO_MM for c in _transform_inch_point(anchor_in, world_m13)))
+        kind = "leader_text" if (txt.point is not None and txt.label_point is not None) else "point_text"
+
+        placement = App.Placement(pos_mm, App.Rotation())
+        try:
+            obj = Draft.make_text(lines, placement=placement, screen=False)
+        except TypeError:
+            obj = Draft.make_text(lines, placement=placement)
+        if obj is None:
+            _cleanup_new_orphans(doc, before_names)
+            return None
+        obj.Label = lines[0][:60] or "Text"
+        obj.addProperty("App::PropertyString", "SketchUpAnnotationKind", "SketchUp", "SketchUp text kind")
+        obj.SketchUpAnnotationKind = kind
+        obj.addProperty("App::PropertyVector", "SketchUpAnchorPoint", "SketchUp", "SketchUp leader anchor (mm)")
+        obj.SketchUpAnchorPoint = anchor_mm
+        if App.GuiUp and hasattr(obj, "ViewObject") and obj.ViewObject is not None:
+            vo = obj.ViewObject
+            if hasattr(vo, "FontSize"):
+                try:
+                    if float(vo.FontSize) < 10.0:
+                        vo.FontSize = 35.0
+                except Exception:
+                    pass
+        if txt.hidden or force_hidden:
+            _hide_annotation_obj(obj)
+        stats["texts_built"] += 1
+        return obj
+    except Exception as exc:
+        _cleanup_new_orphans(doc, before_names)
+        _record_annotation_failure(stats, exc)
+        return None
+    finally:
+        try:
+            _restore_active_doc(switched, prev_name)
+        except Exception:
+            pass
+
+
+def _create_draft_dimension_obj(doc, dim, world_m13, stats, force_hidden=False):
+    before_names = {o.Name for o in doc.Objects}
+    switched = False
+    prev_name = None
+    try:
+        geom = _dimension_geometry_mm(dim, world_m13)
+        if geom is None:
+            return None
+        p1_mm, p2_mm, dimline_mm, plane_n = geom
+        switched, prev_name = _switch_active_doc(doc)
+        import Draft
+
+        if hasattr(Draft, "make_linear_dimension"):
+            obj = Draft.make_linear_dimension(p1_mm, p2_mm, dim_line=dimline_mm)
+        else:
+            obj = Draft.make_dimension(p1_mm, p2_mm, dimline_mm)
+        if obj is None:
+            _cleanup_new_orphans(doc, before_names)
+            return None
+        if hasattr(obj, "Normal"):
+            obj.Normal = plane_n
+        dist_mm = (p2_mm - p1_mm).Length
+        if hasattr(obj, "Distance"):
+            try:
+                obj.Distance = dist_mm
+            except Exception:
+                pass
+        draft_override = _draft_dimension_override(dim.text)
+        obj.Label = _draft_dimension_label(dim.text, dist_mm)
+        obj.addProperty("App::PropertyString", "SketchUpAnnotationKind", "SketchUp", "SketchUp dimension kind")
+        obj.SketchUpAnnotationKind = "linear_dimension"
+        obj.addProperty("App::PropertyString", "SketchUpTextOverride", "SketchUp", "SketchUp custom dimension text")
+        obj.SketchUpTextOverride = dim.text or ""
+        obj.addProperty("App::PropertyString", "SketchUpDraftOverride", "SketchUp", "Draft Override string ($dim)")
+        obj.SketchUpDraftOverride = draft_override
+        if App.GuiUp and hasattr(obj, "ViewObject") and obj.ViewObject is not None:
+            vo = obj.ViewObject
+            if draft_override and hasattr(vo, "Override"):
+                try:
+                    vo.Override = draft_override
+                except Exception:
+                    pass
+            if hasattr(vo, "FontSize"):
+                try:
+                    if float(vo.FontSize) < 10.0:
+                        vo.FontSize = 35.0
+                except Exception:
+                    pass
+        if dim.hidden or force_hidden:
+            _hide_annotation_obj(obj)
+        stats["dimensions_built"] += 1
+        return obj
+    except Exception as exc:
+        _cleanup_new_orphans(doc, before_names)
+        _record_annotation_failure(stats, exc)
+        return None
+    finally:
+        try:
+            _restore_active_doc(switched, prev_name)
+        except Exception:
+            pass
+
+
+def _build_subtree_has_annots(model, annots_by_def):
+    """Returns the set of ``id(definition)`` whose own annotations or placed
+    descendant definitions contain at least one text or dimension, in
+    ``O(|definitions| + |instances|)``."""
+    memo = {}
+
+    def check(defn, visiting=frozenset()):
+        did = id(defn)
+        if did in memo:
+            return memo[did]
+        if did in visiting:
+            return False
+        texts, dims = annots_by_def.get(did, ((), ()))
+        if texts or dims:
+            memo[did] = True
+            return True
+        nxt = visiting | {did}
+        for inst in defn.instances:
+            child = model.definitions.get(inst.ref_idx)
+            if child is not None and check(child, nxt):
+                memo[did] = True
+                return True
+        memo[did] = False
+        return False
+
+    check(model.root)
+    for d in model.definitions.values():
+        check(d)
+    return {did for did, has in memo.items() if has}
+
+
+def _collect_world_annotations(
+    definition,
+    model,
+    annots_by_def,
+    world_m13,
+    layer_name,
+    buckets,
+    visiting,
+    defs_with_annots=None,
+    counter=None,
+    stats=None,
+):
+    """Walks ``definition``'s placed scene graph, accumulating ``(texts, dims)``
+    in world space per SketchUp tag ``layer_name``, pruning subtrees without
+    annotations and capping at ``_MAX_IMPORTED_ANNOTATIONS`` (#29)."""
+    from openskp._core import multiply_matrices
+
+    if defs_with_annots is None:
+        defs_with_annots = _build_subtree_has_annots(model, annots_by_def)
+    if counter is None:
+        counter = [0]
+    if id(definition) in visiting or id(definition) not in defs_with_annots:
+        return
+
+    texts, dims = annots_by_def.get(id(definition), ((), ()))
+    for txt in texts:
+        if counter[0] >= _MAX_IMPORTED_ANNOTATIONS:
+            if stats is not None:
+                stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
+            continue
+        t_layer = getattr(txt, "layer", "") or layer_name or "Layer0"
+        buckets.setdefault(t_layer, ([], []))[0].append((txt, world_m13))
+        counter[0] += 1
+    for dim in dims:
+        if counter[0] >= _MAX_IMPORTED_ANNOTATIONS:
+            if stats is not None:
+                stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
+            continue
+        d_layer = getattr(dim, "layer", "") or layer_name or "Layer0"
+        buckets.setdefault(d_layer, ([], []))[1].append((dim, world_m13))
+        counter[0] += 1
+
+    if counter[0] >= _MAX_IMPORTED_ANNOTATIONS:
+        return
+
+    next_visiting = visiting | {id(definition)}
+    for inst in definition.instances:
+        child = model.definitions.get(inst.ref_idx)
+        if child is None or id(child) not in defs_with_annots:
+            continue
+        if counter[0] >= _MAX_IMPORTED_ANNOTATIONS:
+            if stats is not None:
+                stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
+            break
+        child_layer = inst.layer or layer_name or "Layer0"
+        child_m = multiply_matrices(world_m13, inst.matrix) if world_m13 is not None else list(inst.matrix)
+        _collect_world_annotations(
+            child, model, annots_by_def, child_m, child_layer, buckets, next_visiting, defs_with_annots, counter, stats
+        )
 
 
 def _link_transform(m13):
@@ -1843,19 +2619,42 @@ class _HierarchyImport:
     that cut across the hierarchy the way SketchUp's tags do.
     """
 
-    def __init__(self, doc, model, stats, progress, title, assemblies=False):
+    def __init__(
+        self,
+        doc,
+        model,
+        stats,
+        progress,
+        title,
+        assemblies=False,
+        annotations=False,
+        skp_parsed=None,
+        filepath=None,
+    ):
         self.doc = doc
         self.model = model
         self.stats = stats
         self.progress = progress
         self.title = title
         self.assemblies = bool(assemblies)
+        self.annotations = bool(annotations)
         self.layer_hidden = {layer.name: layer.hidden for layer in model.layers}
         self.parts = {}  # (id(definition), effective inherited material) -> App::Part / AssemblyObject
         self.built_definitions = set()  # id(definition)
         self.paint_memo = {}
         self.merged_cache = {}  # for sheared placements, see _place
         self.components = None
+        if self.annotations:
+            try:
+                self.annots_by_def, self.vff_world_dims = _extract_model_annotations(
+                    model, skp_parsed, filepath=filepath, stats=stats
+                )
+                self.defs_with_annots = _build_subtree_has_annots(model, self.annots_by_def)
+            except Exception as exc:
+                _record_annotation_failure(stats, exc)
+                self.annots_by_def, self.vff_world_dims, self.defs_with_annots = {}, [], set()
+        else:
+            self.annots_by_def, self.vff_world_dims, self.defs_with_annots = {}, [], set()
 
     # -- helpers ---------------------------------------------------------
 
@@ -1943,12 +2742,66 @@ class _HierarchyImport:
         geometry = self._geometry(definition, material_key, f"{label} geometry")
         if geometry is not None:
             part.addObject(geometry)
+        annot_group = None
+
+        def ensure_part_annot_group():
+            nonlocal annot_group
+            if annot_group is None:
+                annot_group = _make_annotations_group(self.doc, "Annotations")
+                part.addObject(annot_group)
+            return annot_group
+
+        if self.annotations:
+            try:
+                def_texts, def_dims = self.annots_by_def.get(id(definition), ((), ()))
+                for txt in def_texts:
+                    if self.stats["texts_built"] + self.stats["dimensions_built"] >= _MAX_IMPORTED_ANNOTATIONS:
+                        self.stats["annotations_capped"] = self.stats.get("annotations_capped", 0) + 1
+                        continue
+                    tobj = _create_draft_text_obj(self.doc, txt, None, self.stats)
+                    _attach_annotation_obj(self.doc, ensure_part_annot_group, tobj, self.stats, "texts_built")
+                for dim in def_dims:
+                    if self.stats["texts_built"] + self.stats["dimensions_built"] >= _MAX_IMPORTED_ANNOTATIONS:
+                        self.stats["annotations_capped"] = self.stats.get("annotations_capped", 0) + 1
+                        continue
+                    dobj = _create_draft_dimension_obj(self.doc, dim, None, self.stats)
+                    _attach_annotation_obj(self.doc, ensure_part_annot_group, dobj, self.stats, "dimensions_built")
+            except Exception as exc:
+                _record_annotation_failure(self.stats, exc)
         for inst in definition.instances:
             placed = self._place(inst, material_key, visiting | {key})
             if placed is not None:
                 part.addObject(placed)
                 if inst.layer and self.layer_hidden.get(inst.layer, False):
                     self._hide(placed)
+                if self.annotations and _link_transform(inst.matrix) is None:
+                    try:
+                        child = self.model.definitions.get(inst.ref_idx)
+                        if child is not None and id(child) in self.defs_with_annots:
+                            sheared_buckets = {}
+                            counter = [self.stats["texts_built"] + self.stats["dimensions_built"]]
+                            _collect_world_annotations(
+                                child,
+                                self.model,
+                                self.annots_by_def,
+                                list(inst.matrix),
+                                inst.layer or "Layer0",
+                                sheared_buckets,
+                                visiting | {key},
+                                self.defs_with_annots,
+                                counter,
+                                self.stats,
+                            )
+                            for s_layer, (s_texts, s_dims) in sheared_buckets.items():
+                                hide = bool(inst.hidden) or self.layer_hidden.get(s_layer, False)
+                                for txt, wm in s_texts:
+                                    tobj = _create_draft_text_obj(self.doc, txt, wm, self.stats, force_hidden=hide)
+                                    _attach_annotation_obj(self.doc, ensure_part_annot_group, tobj, self.stats, "texts_built")
+                                for dim, wm in s_dims:
+                                    dobj = _create_draft_dimension_obj(self.doc, dim, wm, self.stats, force_hidden=hide)
+                                    _attach_annotation_obj(self.doc, ensure_part_annot_group, dobj, self.stats, "dimensions_built")
+                    except Exception as exc:
+                        _record_annotation_failure(self.stats, exc)
 
         if self.progress is not None:
             self.progress.next()
@@ -2019,6 +2872,7 @@ class _HierarchyImport:
 
         model_part = self._add("App::Part", "SketchUpModel", self.title)
         groups = {}
+        annot_groups = {}
 
         def layer_group(layer_name):
             if layer_name not in groups:
@@ -2031,10 +2885,41 @@ class _HierarchyImport:
                 groups[layer_name] = group
             return groups[layer_name]
 
+        def tag_annotations_group(layer_name):
+            if layer_name not in annot_groups:
+                parent_tag = layer_group(layer_name)
+                agrp = _make_annotations_group(self.doc, "Annotations", layer_name=layer_name)
+                parent_tag.addObject(agrp)
+                if self.layer_hidden.get(layer_name, False):
+                    self._hide(agrp)
+                annot_groups[layer_name] = agrp
+            return annot_groups[layer_name]
+
         root = self.model.root
         geometry = self._geometry(root, None, f"{self.title} geometry")
         if geometry is not None:
             layer_group("Layer0").addObject(geometry)
+        if self.annotations:
+            try:
+                root_texts, root_dims = self.annots_by_def.get(id(root), ((), ()))
+                for txt in root_texts:
+                    if self.stats["texts_built"] + self.stats["dimensions_built"] >= _MAX_IMPORTED_ANNOTATIONS:
+                        self.stats["annotations_capped"] = self.stats.get("annotations_capped", 0) + 1
+                        continue
+                    t_layer = getattr(txt, "layer", "") or "Layer0"
+                    hide = self.layer_hidden.get(t_layer, False)
+                    tobj = _create_draft_text_obj(self.doc, txt, None, self.stats, force_hidden=hide)
+                    _attach_annotation_obj(self.doc, lambda l=t_layer: tag_annotations_group(l), tobj, self.stats, "texts_built")
+                for dim in [*root_dims, *self.vff_world_dims]:
+                    if self.stats["texts_built"] + self.stats["dimensions_built"] >= _MAX_IMPORTED_ANNOTATIONS:
+                        self.stats["annotations_capped"] = self.stats.get("annotations_capped", 0) + 1
+                        continue
+                    d_layer = getattr(dim, "layer", "") or "Layer0"
+                    hide = self.layer_hidden.get(d_layer, False)
+                    dobj = _create_draft_dimension_obj(self.doc, dim, None, self.stats, force_hidden=hide)
+                    _attach_annotation_obj(self.doc, lambda l=d_layer: tag_annotations_group(l), dobj, self.stats, "dimensions_built")
+            except Exception as exc:
+                _record_annotation_failure(self.stats, exc)
         for inst in root.instances:
             placed = self._place(inst, None, frozenset())
             if placed is None:
@@ -2043,6 +2928,34 @@ class _HierarchyImport:
             layer_group(layer).addObject(placed)
             if self.layer_hidden.get(layer, False):
                 self._hide(placed)
+            if self.annotations and _link_transform(inst.matrix) is None:
+                try:
+                    child = self.model.definitions.get(inst.ref_idx)
+                    if child is not None and id(child) in self.defs_with_annots:
+                        sheared_buckets = {}
+                        counter = [self.stats["texts_built"] + self.stats["dimensions_built"]]
+                        _collect_world_annotations(
+                            child,
+                            self.model,
+                            self.annots_by_def,
+                            list(inst.matrix),
+                            layer,
+                            sheared_buckets,
+                            frozenset(),
+                            self.defs_with_annots,
+                            counter,
+                            self.stats,
+                        )
+                        for s_layer, (s_texts, s_dims) in sheared_buckets.items():
+                            hide = self.layer_hidden.get(s_layer, False)
+                            for txt, wm in s_texts:
+                                tobj = _create_draft_text_obj(self.doc, txt, wm, self.stats, force_hidden=hide)
+                                _attach_annotation_obj(self.doc, lambda l=s_layer: tag_annotations_group(l), tobj, self.stats, "texts_built")
+                            for dim, wm in s_dims:
+                                dobj = _create_draft_dimension_obj(self.doc, dim, wm, self.stats, force_hidden=hide)
+                                _attach_annotation_obj(self.doc, lambda l=s_layer: tag_annotations_group(l), dobj, self.stats, "dimensions_built")
+                except Exception as exc:
+                    _record_annotation_failure(self.stats, exc)
 
         # Components that are defined in the file but not placed anywhere
         # (#5: "this would also allow recovering any Components that are not
@@ -2052,7 +2965,14 @@ class _HierarchyImport:
                 continue
             if definition.is_group or getattr(definition, "is_image", False):
                 continue
-            if not definition.faces and not definition.instances and not getattr(definition, "edges", None):
+            def_texts, def_dims = self.annots_by_def.get(id(definition), ((), ()))
+            if (
+                not definition.faces
+                and not definition.instances
+                and not getattr(definition, "edges", None)
+                and not def_texts
+                and not def_dims
+            ):
                 continue
             self.component(definition, None)
             self.stats["unplaced_components"] += 1
@@ -2125,7 +3045,15 @@ def _reconcile_partial_read_warnings(model, filepath, library_warnings):
 _LARGE_HIERARCHY_DEFINITION_THRESHOLD = 1000
 
 
-def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, curved_surfaces=None):
+def import_skp(
+    filepath,
+    doc=None,
+    merge=None,
+    solids=None,
+    assemblies=None,
+    curved_surfaces=None,
+    annotations=None,
+):
     """Import a .skp file into a FreeCAD document, returning the document.
 
     Two layouts:
@@ -2166,6 +3094,12 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
     edges (#18). ``curved_surfaces=None`` reads the ``FitCurvedSurfaces``
     preference (False unless set).
 
+    ``annotations=True`` imports SketchUp leader texts, screen texts, and
+    linear dimensions as Draft ``Text`` and ``LinearDimension`` objects inside
+    an ``Annotations`` group per tag (and inside each component's part in the
+    hierarchy layout, #29). ``annotations=None`` reads the ``ImportAnnotations``
+    preference (True unless set to ``false``).
+
     Each face's resolved color/opacity (its own paint, or whatever an
     ancestor group/component painted itself with, or a neutral default)
     is applied as ViewObject.DiffuseColor, one entry per Shape.Faces -
@@ -2185,6 +3119,8 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         assemblies = _bool_preference("ImportAssemblies")
     if curved_surfaces is None:
         curved_surfaces = _bool_preference("FitCurvedSurfaces")
+    if annotations is None:
+        annotations = _bool_preference("ImportAnnotations", default=True)
 
     print(f"openskp: parsing {os.path.basename(filepath)} "
           "(can take a while for a large file - this is real work, not a hang)...")
@@ -2220,6 +3156,15 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
                 "importing components as App::Part instead\n"
             )
 
+    use_annotations = False
+    if annotations:
+        if _draft_available():
+            use_annotations = True
+        else:
+            App.Console.PrintWarning(
+                "openskp: FreeCAD Draft module is not available; skipping text and dimension annotations\n"
+            )
+
     large_hierarchy = not merge and num_definitions >= _LARGE_HIERARCHY_DEFINITION_THRESHOLD
     if large_hierarchy:
         App.Console.PrintWarning(
@@ -2243,6 +3188,15 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         "fit_curved_surfaces": bool(curved_surfaces), "face_arcs_built": 0,
         "cylinders_built": 0, "cones_built": 0, "spheres_built": 0,
         "curved_groups_unfitted": 0,
+        "import_annotations": bool(annotations),
+        "texts_built": 0, "dimensions_built": 0,
+        "texts_skipped_no_position": 0,
+        "vff_component_dimensions_skipped": 0,
+        "vff_texts_skipped": 0,
+        "constrained_dimensions_skipped": 0,
+        "dimensions_skipped_unresolved": 0,
+        "annotations_capped": 0,
+        "annotation_failures": 0,
         "unread_root_entities": unread_root_entities,
         "warnings": list(library_warnings),
         "large_hierarchy_warning": large_hierarchy,
@@ -2263,18 +3217,104 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
         progress = App.Base.ProgressIndicator()
         progress.start("Building SketchUp geometry...", max(1, len(model.definitions) + 1))
 
+    saved_gui_selection = None
+    if App.GuiUp and use_annotations:
+        try:
+            import FreeCADGui as Gui
+
+            saved_gui_selection = []
+            for dname in list(App.listDocuments()):
+                for sel_obj in Gui.Selection.getSelectionEx(dname):
+                    subs = tuple(getattr(sel_obj, "SubElementNames", None) or ())
+                    saved_gui_selection.append((dname, sel_obj.ObjectName, subs))
+        except Exception:
+            saved_gui_selection = None
+
+    skp_parsed = getattr(skp, "_parsed", None)
     try:
         if merge:
-            built = _import_merged(doc, model, stats, progress)
+            built = _import_merged(
+                doc,
+                model,
+                stats,
+                progress,
+                annotations=use_annotations,
+                skp_parsed=skp_parsed,
+                filepath=filepath,
+            )
         else:
             stats.update({"components": 0, "links": 0, "sheared_copies": 0,
                           "unplaced_components": 0, "object_face_colors": {}})
             title = os.path.splitext(os.path.basename(filepath))[0] or "SketchUp model"
-            _HierarchyImport(doc, model, stats, progress, title, assemblies=use_assemblies).run()
+            _HierarchyImport(
+                doc,
+                model,
+                stats,
+                progress,
+                title,
+                assemblies=use_assemblies,
+                annotations=use_annotations,
+                skp_parsed=skp_parsed,
+                filepath=filepath,
+            ).run()
             built = stats["components"]
     finally:
         if progress is not None:
             progress.stop()
+        if App.GuiUp and use_annotations:
+            try:
+                import FreeCADGui as Gui
+
+                Gui.Selection.clearSelection()
+                for dname, oname, subs in saved_gui_selection or ():
+                    if dname in App.listDocuments() and App.getDocument(dname).getObject(oname) is not None:
+                        if subs:
+                            for sub in subs:
+                                Gui.Selection.addSelection(dname, oname, sub)
+                        else:
+                            Gui.Selection.addSelection(dname, oname)
+            except Exception:
+                pass
+
+    base_file = os.path.basename(filepath)
+    vff_skipped_parts = []
+    if stats["vff_texts_skipped"]:
+        vff_skipped_parts.append(f"{stats['vff_texts_skipped']} 2021+ text(s)")
+    if stats["vff_component_dimensions_skipped"]:
+        vff_skipped_parts.append(f"{stats['vff_component_dimensions_skipped']} 2021+ component dimension(s)")
+    if vff_skipped_parts:
+        msg = (
+            f"{base_file}: skipped {', '.join(vff_skipped_parts)} "
+            "(requires a newer openskp release with 2021+ owner-local annotations)"
+        )
+        stats["warnings"].append(msg)
+        App.Console.PrintWarning(f"openskp: {msg}\n")
+    if stats["constrained_dimensions_skipped"]:
+        msg = f"{base_file}: skipped {stats['constrained_dimensions_skipped']} axis-constrained dimension(s)"
+        stats["warnings"].append(msg)
+        App.Console.PrintWarning(f"openskp: {msg}\n")
+    if stats["dimensions_skipped_unresolved"]:
+        msg = f"{base_file}: skipped {stats['dimensions_skipped_unresolved']} dimension(s) with unresolved endpoints"
+        stats["warnings"].append(msg)
+        App.Console.PrintWarning(f"openskp: {msg}\n")
+    if stats["texts_skipped_no_position"]:
+        msg = f"{base_file}: skipped {stats['texts_skipped_no_position']} text(s) without a 3D position"
+        stats["warnings"].append(msg)
+        App.Console.PrintWarning(f"openskp: {msg}\n")
+    if stats["annotations_capped"]:
+        msg = (
+            f"{base_file}: capped imported annotations at {_MAX_IMPORTED_ANNOTATIONS} "
+            f"(skipped {stats['annotations_capped']} additional placement(s))"
+        )
+        stats["warnings"].append(msg)
+        App.Console.PrintWarning(f"openskp: {msg}\n")
+    if stats["annotation_failures"]:
+        err_detail = stats.pop("_first_annotation_error", "error")
+        msg = f"{base_file}: failed to create {stats['annotation_failures']} annotation(s) ({err_detail})"
+        stats["warnings"].append(msg)
+        App.Console.PrintWarning(f"openskp: {msg}\n")
+    else:
+        stats.pop("_first_annotation_error", None)
 
     doc.recompute()
     common = (
@@ -2293,6 +3333,20 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
             f"{stats['curved_groups_unfitted']} smoothed groups left faceted, "
             f"{stats['face_arcs_built']} circle/arc face edges"
         )
+    annot_skipped_total = (
+        stats["texts_skipped_no_position"]
+        + stats["vff_component_dimensions_skipped"]
+        + stats["vff_texts_skipped"]
+        + stats["constrained_dimensions_skipped"]
+        + stats["dimensions_skipped_unresolved"]
+        + stats["annotations_capped"]
+    )
+    if stats["texts_built"] or stats["dimensions_built"] or annot_skipped_total or stats["annotation_failures"]:
+        common += f"; {stats['texts_built']} texts, {stats['dimensions_built']} dimensions"
+        if annot_skipped_total:
+            common += f" ({annot_skipped_total} annotations skipped)"
+        if stats["annotation_failures"]:
+            common += f" ({stats['annotation_failures']} annotation failures)"
     if unread_root_entities > 0:
         common += f"; {unread_root_entities} unread root entities"
     if merge:
@@ -2316,7 +3370,7 @@ def import_skp(filepath, doc=None, merge=None, solids=None, assemblies=None, cur
     return doc
 
 
-def _import_merged(doc, model, stats, progress):
+def _import_merged(doc, model, stats, progress, annotations=False, skp_parsed=None, filepath=None):
     """One Part::Feature compound per distinct SketchUp layer/tag actually
     used by the file (walked through the full scene graph, definitions
     resolved and cached, each unique (definition, layer, paint) context
@@ -2348,6 +3402,58 @@ def _import_merged(doc, model, stats, progress):
             if layer_hidden.get(layer_name, False):
                 obj.ViewObject.Visibility = False
                 stats["hidden_layers"] += 1
+
+    if annotations:
+        try:
+            annots_by_def, vff_world_dims = _extract_model_annotations(
+                model, skp_parsed, filepath=filepath, stats=stats
+            )
+            defs_with_annots = _build_subtree_has_annots(model, annots_by_def)
+            annot_buckets: dict = {}
+            counter = [0]
+            _collect_world_annotations(
+                model.root,
+                model,
+                annots_by_def,
+                None,
+                "Layer0",
+                annot_buckets,
+                frozenset(),
+                defs_with_annots,
+                counter,
+                stats,
+            )
+            for dim in vff_world_dims:
+                if counter[0] >= _MAX_IMPORTED_ANNOTATIONS:
+                    stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
+                    continue
+                d_layer = getattr(dim, "layer", "") or "Layer0"
+                annot_buckets.setdefault(d_layer, ([], []))[1].append((dim, None))
+                counter[0] += 1
+            for layer_name, (t_items, d_items) in annot_buckets.items():
+                if not t_items and not d_items:
+                    continue
+                hide = layer_hidden.get(layer_name, False)
+                agrp = None
+
+                def ensure_agrp():
+                    nonlocal agrp
+                    if agrp is None:
+                        grp_label = "Annotations" if layer_name == "Layer0" else f"Annotations ({layer_name})"
+                        agrp = _make_annotations_group(doc, grp_label, layer_name=layer_name)
+                        if hide:
+                            _hide_annotation_obj(agrp)
+                    return agrp
+
+                for txt, wm in t_items:
+                    tobj = _create_draft_text_obj(doc, txt, wm, stats, force_hidden=hide)
+                    _attach_annotation_obj(doc, ensure_agrp, tobj, stats, "texts_built")
+                for dim, wm in d_items:
+                    dobj = _create_draft_dimension_obj(doc, dim, wm, stats, force_hidden=hide)
+                    _attach_annotation_obj(doc, ensure_agrp, dobj, stats, "dimensions_built")
+        except Exception as exc:
+            _record_annotation_failure(stats, exc)
+
     stats["layers"] = len(root_buckets)
     return len(shape_cache)
 
@@ -2582,7 +3688,11 @@ _ASSEMBLY_META_GROUPS = (
 
 
 def _is_skipped_export_group(obj):
-    return _is_definitions_group(obj) or any(_is_type(obj, t) for t in _ASSEMBLY_META_GROUPS)
+    return (
+        _is_definitions_group(obj)
+        or bool(getattr(obj, "SketchUpAnnotations", False))
+        or any(_is_type(obj, t) for t in _ASSEMBLY_META_GROUPS)
+    )
 
 
 def _export_leaves(exportList):

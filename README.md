@@ -122,6 +122,41 @@ Edit parameters, `BaseApp/Preferences/Mod/OpenSKP`, Boolean) or
   in the console report), and any circle shared with a wall that stayed faceted
   keeps its polygon segments so neighbouring faces stay water-tight connected.
 
+**Annotations — texts and dimensions** (`ImportAnnotations`, on by default):
+SketchUp positioned texts (`Definition.texts`) and linear dimensions
+(`Definition.dimensions` in classic files; root `SkpModel.dimensions` or
+owner-local `Definition.dimensions` in 2021+ VFF files) import as FreeCAD Draft
+`Text` and `LinearDimension` objects (#29):
+
+- In the component hierarchy, root annotations sit in an **Annotations** group
+  inside their tag's group, and annotations owned by a component or group
+  definition belong to an **Annotations** group inside that component's
+  `App::Part` (so every `App::Link` places them with the component, and sheared
+  placements transform nested annotations into their enclosing scope).
+- In the merged layout, annotations are transformed into world space and
+  grouped per SketchUp tag (`Annotations` / `Annotations (<tag>)`).
+- With OpenSKP 1.6.0, dimension lines sit directly on `a`–`b` without an offset;
+  when the library provides `Dimension.offset_vector` (openskp#621/#623), the
+  offset vector and plane normal are applied, with a guaranteed non-parallel
+  fallback `Normal` for vertical and unplaned dimensions, and `"<>"` in custom
+  dimension text maps to Draft's `"$dim"` measured-value token.
+- **What is skipped and reported:** screen texts (`leader_type == 0`), texts
+  with no 3D position (such as classic leader texts anchored to geometry whose
+  coordinates OpenSKP 1.6.0 leaves `None`), 2021+ VFF axis-constrained
+  dimensions (`5BD1`) whose `a`–`b` segment is not parallel to the constraint
+  axis, dimensions with unresolved endpoints, 2021+ VFF texts, and 2021+
+  dimensions inside components (until openskp#623 is vendored) are skipped
+  rather than misplaced and counted in the console report (with OpenSKP 1.6.0,
+  an axis-constrained dimension in a classic pre-2021 file shows the `a`–`b`
+  distance because the library does not give the constraint axis), and leader
+  texts are placed at `label_point` without drawing a separate leader arrow line
+  (`SketchUpAnchorPoint` records the anchor). Errors anywhere in the annotation
+  pass are caught without leaving orphan Draft objects behind and reported once
+  without aborting geometry import.
+- To skip annotations, set Boolean `ImportAnnotations` to `false` under
+  `Tools > Edit parameters > BaseApp/Preferences/Mod/OpenSKP` or pass
+  `import_skp(path, doc, annotations=False)`.
+
 The two layouts show exactly the same geometry: the tests import every
 fixture both ways and compare faces, areas, vertices and edges
 (`tests/test_hierarchy.py`), and check in FreeCAD's real GUI that the 3D
@@ -323,6 +358,7 @@ directly:
 | `instance_scale_term_2021.skp`, `instance_scale_term_v6.skp` | 12 | 0 | One 100 in cube placed twice, scaled through the 3x3 and through the matrix's scale term (openskp#444), saved as SketchUp 2021 and 6. Both cubes import 1 in wide, at x = 0 and 20 in, as SketchUp reports. Pinned in `tests/test_import.py` (`check_scale_term`) |
 | `plate_with_hole_2017.skp`, `plate_with_hole_2021.skp` | 30 | 0 | A 20 x 20 x 2 in plate with a radius 4 in circular through-hole, saved via SketchUp's own library as 2017 and 2021. With `FitCurvedSurfaces` + `MakeSolids`, imports as a 7-face closed solid with true `Part.Circle` hole wires and an inward `Part.Cylinder` bore (`tests/test_curved_surfaces.py`) |
 | `cylinder_2017.skp`, `cylinder_2021.skp`, `frustum_2017.skp`, `frustum_2021.skp`, `sphere_2017.skp`, `sphere_2021.skp`, `smoothed_blob_2017.skp`, `smoothed_blob_2021.skp` | 26 / 26 / 128 / 168 | 0 | Cylinder (`r = 5`, `h = 12` in), frustum (`r1 = 6`, `r2 = 3`, `h = 4` in), sphere (`r = 5` in), and an asymmetric smoothed blob, saved via SketchUp's library as 2017 and 2021. With `FitCurvedSurfaces`, cylinder, frustum and sphere become `Part.Cylinder`, `Part.Cone` and `Part.Sphere` B-rep solids while the smoothed blob stays 168 planar facets (`tests/test_curved_surfaces.py`) |
+| `annotations_2017.skp`, `annotations_2021.skp` | 2 | 0 | SDK-saved model in SketchUp 2017 and 2021 formats: a root slab (`Layer0`), a `Beam` component placed on `Framing`, 1 leader text (`Apex label`), 1 screen text (`Title block note`, skipped with no 3D position), and 2 linear dimensions (36 in at root, 24 in inside `Beam`), verified headlessly and in the GUI (`tests/test_annotations.py`, `tests/gui_hierarchy.py`) |
 | `Untitled.skp` | 1,588 | — | 1,554 imported, 34 skipped, 6 invalid — all traced to the same known overlapping-hole geometry documented in [openskp#285](https://github.com/iamahsanmehmood/openskp/issues/285); the importer falls back to the face's outer boundary alone rather than dropping it, and still fails only on the genuinely degenerate cases |
 | A real structural-framing file (outside the repo) | 9,652 | 1,077 | All faces and loose edges imported, 0 skipped — 93 of the file's 145 definitions were entirely or partly loose-edge (light-gauge-steel members drawn as construction lines), previously silently invisible |
 
