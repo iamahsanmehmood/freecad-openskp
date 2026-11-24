@@ -69,7 +69,34 @@ EXPECTED = {
     "smoothed_blob_2021.skp": (168, 0, 0, 0, 1, 0),
     "sphere_2017.skp": (128, 0, 0, 0, 1, 0),
     "sphere_2021.skp": (128, 0, 0, 0, 1, 0),
+    # SDK-written annotations fixtures (#29, saved as 2017 and 2021): 1 root slab on Layer0 +
+    # 1 Beam component on Framing, carrying a leader text, a screen text, and two linear dimensions.
+    "annotations_2017.skp": (2, 0, 0, 0, 2, 0),
+    "annotations_2021.skp": (2, 0, 0, 0, 2, 0),
 }
+
+
+def _expected_warnings(fixture_name):
+    import openskp
+
+    if fixture_name == "annotations_2017.skp":
+        return ["annotations_2017.skp: skipped 1 text(s) without a 3D position"]
+    if fixture_name == "annotations_2021.skp":
+        if "layer" in getattr(openskp.model.Dimension, "__dataclass_fields__", {}):
+            return ["annotations_2021.skp: skipped 1 text(s) without a 3D position"]
+        return [
+            "annotations_2021.skp: skipped 2 2021+ text(s), 1 2021+ component dimension(s) "
+            "(requires a newer openskp release with 2021+ owner-local annotations)"
+        ]
+    if fixture_name == "capilla_quiroz_v17.skp":
+        out = []
+        unres = importSKP.last_import_stats.get("dimensions_skipped_unresolved", 0)
+        if unres:
+            out.append(f"capilla_quiroz_v17.skp: skipped {unres} dimension(s) with unresolved endpoints")
+        if importSKP.last_import_stats.get("texts_skipped_no_position"):
+            out.append("capilla_quiroz_v17.skp: skipped 1 text(s) without a 3D position")
+        return out
+    return []
 
 
 def check(fixture_name):
@@ -104,8 +131,9 @@ def check(fixture_name):
                 f"(faces, invalid, nan_area, loose_edges, layers, hidden_layers), got {got}"
             )
         assert importSKP.last_import_stats["unread_root_entities"] == 0, fixture_name
-        assert importSKP.last_import_stats["warnings"] == [], (
-            fixture_name, importSKP.last_import_stats["warnings"]
+        want_warnings = _expected_warnings(fixture_name)
+        assert importSKP.last_import_stats["warnings"] == want_warnings, (
+            fixture_name, importSKP.last_import_stats["warnings"], want_warnings
         )
         check_face_colors(fixture_name, len(faces))
         return got

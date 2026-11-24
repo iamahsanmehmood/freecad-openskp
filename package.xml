@@ -21,6 +21,7 @@
 
     <depend type="internal">part</depend>
     <depend type="internal" optional="true">assembly</depend>
+    <depend type="internal" optional="true">draft</depend>
     <depend type="python">defusedxml</depend>
     <depend type="python">numpy</depend>
 

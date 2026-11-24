@@ -198,6 +198,81 @@ def main():
         _check_bounds("sphere", sphere_drawn, ((-5, 5), (-5, 5), (-5, 5)), mm, tol=0.5)
         lines.append(f"sphere: the view draws {sphere_drawn} mm, 1-face spherical solid")
 
+        # ImportAnnotations (#29): positioned leader text, root dimension (36 in = 914.4 mm),
+        # and component dimension inside Beam (24 in = 609.6 mm) in FreeCAD's real GUI,
+        # skipping the positionless screen text, preserving selection in other open documents,
+        # and leaving zero orphan objects when no 3D view is active.
+        annot_path = os.path.join(TESTS, "fixtures", "annotations_2017.skp")
+        sel_keep_obj = sphere_doc.Objects[0]
+        Gui.Selection.clearSelection()
+        Gui.Selection.addSelection(sphere_doc.Name, sel_keep_obj.Name)
+        assert [o.Name for o in Gui.Selection.getSelection(sphere_doc.Name)] == [sel_keep_obj.Name]
+
+        for label_mode, merge_mode in (("annotations_hierarchy", False), ("annotations_merged", True)):
+            annot_doc = App.newDocument(label_mode)
+            importSKP.import_skp(annot_path, annot_doc, merge=merge_mode)
+            stats = importSKP.last_import_stats
+            assert stats["texts_built"] == 1 and stats["dimensions_built"] == 2, (label_mode, stats)
+            assert stats["texts_skipped_no_position"] == 1, (label_mode, stats)
+            assert not Gui.Selection.getSelection(annot_doc.Name), (label_mode, "selection not cleared")
+            assert [o.Name for o in Gui.Selection.getSelection(sphere_doc.Name)] == [sel_keep_obj.Name], (
+                label_mode, "other document selection not preserved"
+            )
+            txts = [
+                o for o in annot_doc.Objects
+                if getattr(o, "SketchUpAnnotationKind", "").endswith("text")
+            ]
+            assert len(txts) == 1 and list(txts[0].Text) == ["Apex label"]
+            assert txts[0].ViewObject.Visibility
+            dim_objs = [
+                o for o in annot_doc.Objects
+                if getattr(o, "SketchUpAnnotationKind", "") == "linear_dimension"
+            ]
+            for dobj in dim_objs:
+                seg_u = (dobj.End - dobj.Start).normalize()
+                assert abs(dobj.Normal.Length - 1.0) <= 1e-5 and abs(dobj.Normal.dot(seg_u)) <= 1e-5
+            dims = sorted((o.End - o.Start).Length for o in dim_objs)
+            assert len(dims) == 2, dims
+            assert abs(dims[0] - 24.0 * mm) <= 1e-2 and abs(dims[1] - 36.0 * mm) <= 1e-2, dims
+            _show(annot_doc, label_mode)
+
+        # Import with a Spreadsheet tab in front (non-3D active view; FreeCAD 1.1.3 raises
+        # AttributeError on getViewDirection after Draft adds its object) AND into a hidden
+        # document with no MDI view: geometry must import cleanly and zero orphan Draft
+        # objects may remain.
+        sp_doc = App.newDocument("annotations_spreadsheet_front")
+        sheet = sp_doc.addObject("Spreadsheet::Sheet", "Sheet")
+        sheet.ViewObject.doubleClicked()
+        Gui.updateGui()
+        importSKP.import_skp(annot_path, sp_doc, merge=False)
+        sp_stats = importSKP.last_import_stats
+        assert sp_stats["faces_built"] == 2, sp_stats
+        sp_roots = {
+            sheet.Name,
+            sp_doc.getObject(sp_stats["model_part"]).Name,
+            sp_doc.getObject(sp_stats["components_group"]).Name,
+        }
+        sp_orphans = [o.Name for o in sp_doc.Objects if not o.InList and o.Name not in sp_roots]
+        assert not sp_orphans, f"orphan objects left behind with Spreadsheet in front: {sp_orphans}"
+        if sp_stats["dimensions_built"] == 0:
+            assert sp_stats["annotation_failures"] == 2, sp_stats
+            assert not [o.Name for o in sp_doc.Objects if "Dimension" in o.Name], [o.Name for o in sp_doc.Objects]
+
+        noview_doc = App.newDocument("annotations_no_3d_view", hidden=True)
+        importSKP.import_skp(annot_path, noview_doc, merge=False)
+        nv_stats = importSKP.last_import_stats
+        assert nv_stats["faces_built"] == 2, nv_stats
+        top_roots = {
+            noview_doc.getObject(nv_stats["model_part"]).Name,
+            noview_doc.getObject(nv_stats["components_group"]).Name,
+        }
+        orphans = [o.Name for o in noview_doc.Objects if not o.InList and o.Name not in top_roots]
+        assert not orphans, f"orphan objects left behind in hidden document: {orphans}"
+        lines.append(
+            "annotations: 1 Draft leader text + 2 Draft linear dimensions (609.6 mm, 914.4 mm) shown in GUI; "
+            "other-doc selection preserved; Spreadsheet-in-front and hidden-doc imports clean (0 orphans)"
+        )
+
         _finish("PASS\n" + "\n".join(lines), 0)
     except BaseException:
         _finish("FAIL\n" + traceback.format_exc(), 1)
