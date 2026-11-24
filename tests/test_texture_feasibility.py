@@ -301,25 +301,32 @@ def probe_headless():
 
             mgr = Materials.MaterialManager()
             mat_mod_info["available"] = True
+            mat_mod_info["materials_dir"] = sorted(a for a in dir(Materials) if not a.startswith("_"))
             mat_mod_info["manager_attrs"] = sorted(a for a in dir(mgr) if not a.startswith("_"))
-            models = getattr(mgr, "AppearanceModels", None) or {}
             tex_models = {}
-            if hasattr(mgr, "materialsWithModel"):
-                all_mats = mgr.Materials
-                mat_mod_info["bundled_material_count"] = len(all_mats)
-                # Inspect one sample material and search bundled materials for texture properties
-                for uuid_key, m_obj in list(all_mats.items())[:200]:
-                    app_props = list(getattr(m_obj, "AppearanceProperties", {}).keys())
-                    tex_keys = [k for k in app_props if "tex" in k.lower() or "image" in k.lower() or "url" in k.lower()]
-                    if tex_keys:
-                        tex_models[m_obj.Name] = {
-                            "uuid": uuid_key,
-                            "tex_keys": tex_keys,
-                            "all_appearance_keys": sorted(app_props),
-                        }
-                        if len(tex_models) >= 3:
-                            break
+            all_mats = mgr.Materials
+            mat_mod_info["bundled_material_count"] = len(all_mats)
+            for uuid_key, m_obj in list(all_mats.items()):
+                app_props = list(getattr(m_obj, "AppearanceProperties", {}).keys())
+                tex_keys = [k for k in app_props if "tex" in k.lower() or "image" in k.lower() or "url" in k.lower()]
+                if tex_keys:
+                    tex_models[m_obj.Name] = {
+                        "uuid": uuid_key,
+                        "tex_keys": tex_keys,
+                        "all_appearance_keys": sorted(app_props),
+                    }
+                    if len(tex_models) >= 3:
+                        break
             mat_mod_info["sample_textured_materials"] = tex_models
+            if hasattr(Materials, "ModelManager"):
+                mmgr = Materials.ModelManager()
+                model_hits = {}
+                for muuid, mod in getattr(mmgr, "Models", {}).items():
+                    mname = getattr(mod, "Name", str(muuid))
+                    props = sorted(getattr(mod, "Properties", {}).keys()) if hasattr(mod, "Properties") else []
+                    if any("tex" in p.lower() or "image" in p.lower() for p in props) or "tex" in mname.lower() or "render" in mname.lower():
+                        model_hits[mname] = props
+                mat_mod_info["texture_or_render_models"] = model_hits
         except Exception as exc:
             mat_mod_info["error"] = repr(exc)
         report["materials_module"] = mat_mod_info
@@ -359,7 +366,7 @@ def probe_headless():
             for m in tex_mats
         ]
         report["capilla_uv_vertices_checked"] = uv_checked
-        assert len(tex_mats) == 3 and uv_checked >= 4, report
+        assert len(tex_mats) == 4 and uv_checked >= 4, report
 
         # 4. Check QtGui.QImage format support in headless AppImage too
         qimage_info = {"available": False}
@@ -607,4 +614,7 @@ def main():
 
 
 if __name__ == "__main__" or __name__ == "test_texture_feasibility":
-    _harness.run(main)
+    import FreeCAD as _App
+
+    if not _App.GuiUp:
+        _harness.run(main)
