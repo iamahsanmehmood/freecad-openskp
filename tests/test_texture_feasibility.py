@@ -79,12 +79,13 @@ def _stripes_png_b():
 
 
 def _coin_node_types(node, out=None):
-    """Collects all Coin3D node type names reachable under ``node``."""
+    """Collects all Coin3D node type names reachable under ``node`` as Python strings."""
     if out is None:
         out = []
     if node is None:
         return out
-    tname = node.getTypeId().getName()
+    sb_name = node.getTypeId().getName()
+    tname = sb_name.getString() if hasattr(sb_name, "getString") else str(sb_name)
     out.append(tname)
     if hasattr(node, "getNumChildren"):
         try:
@@ -320,13 +321,14 @@ def probe_headless():
             mat_mod_info["sample_textured_materials"] = tex_models
             if hasattr(Materials, "ModelManager"):
                 mmgr = Materials.ModelManager()
-                model_hits = {}
-                for muuid, mod in getattr(mmgr, "Models", {}).items():
+                mat_mod_info["model_manager_attrs"] = sorted(a for a in dir(mmgr) if not a.startswith("_"))
+                app_models = {}
+                src_models = getattr(mmgr, "AppearanceModels", None) or getattr(mmgr, "Models", {})
+                for muuid, mod in src_models.items():
                     mname = getattr(mod, "Name", str(muuid))
                     props = sorted(getattr(mod, "Properties", {}).keys()) if hasattr(mod, "Properties") else []
-                    if any("tex" in p.lower() or "image" in p.lower() for p in props) or "tex" in mname.lower() or "render" in mname.lower():
-                        model_hits[mname] = props
-                mat_mod_info["texture_or_render_models"] = model_hits
+                    app_models[mname] = props
+                mat_mod_info["appearance_models"] = app_models
         except Exception as exc:
             mat_mod_info["error"] = repr(exc)
         report["materials_module"] = mat_mod_info
