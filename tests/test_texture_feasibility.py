@@ -240,8 +240,19 @@ class _TexturedViewProviderProxy:
         if untex:
             sep = coin.SoSeparator()
             mat = coin.SoMaterial()
-            colors = [u["rgba"][:3] for u in untex]
-            transp = [1.0 - u["rgba"][3] for u in untex]
+            colors = []
+            transp = []
+            all_pts = []
+            flat_idx = []
+            for u in untex:
+                base = len(all_pts)
+                all_pts.extend(u["positions"])
+                rgb = u["rgba"][:3]
+                tr = 1.0 - u["rgba"][3]
+                for tri in u["triangles"]:
+                    colors.append(rgb)
+                    transp.append(tr)
+                    flat_idx.extend([base + tri[0], base + tri[1], base + tri[2], -1])
             mat.diffuseColor.setValues(0, len(colors), colors)
             mat.transparency.setValues(0, len(transp), transp)
             sep.addChild(mat)
@@ -249,14 +260,6 @@ class _TexturedViewProviderProxy:
             mbind = coin.SoMaterialBinding()
             mbind.value = coin.SoMaterialBinding.PER_FACE
             sep.addChild(mbind)
-
-            all_pts = []
-            flat_idx = []
-            for u in untex:
-                base = len(all_pts)
-                all_pts.extend(u["positions"])
-                for tri in u["triangles"]:
-                    flat_idx.extend([base + tri[0], base + tri[1], base + tri[2], -1])
 
             coords = coin.SoCoordinate3()
             coords.point.setValues(0, len(all_pts), all_pts)
@@ -473,7 +476,7 @@ def probe_gui(out_dir, show_fn):
     gui_findings["raw_coin_on_part_feature"] = {
         "texture_nodes_before_save": before_types_c,
         "texture_nodes_after_reopen": after_types_c,
-        "survives_save_reopen": bool(after_types_c),
+        "survives_save_reopen": len(after_types_c) >= len(before_types_c),
     }
 
     # --- Experiment D: Part::FeaturePython + Python ViewProvider + App::Link + save/reopen ---
@@ -589,8 +592,10 @@ def probe_gui(out_dir, show_fn):
             after_d_mode == "Textured"
             and after_d_faces == 3
             and reopened_inc_exists
-            and before_d_nodes.count("SoTexture2") == 2
-            and after_d_nodes.count("SoTexture2") == 2
+            and before_d_nodes.count("TextureCoordinate2") == 2
+            and after_d_nodes.count("TextureCoordinate2") == 2
+            and before_d_nodes.count("Texture2") == after_d_nodes.count("Texture2")
+            and after_d_nodes.count("Texture2") >= 2
         ),
     }
 
