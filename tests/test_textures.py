@@ -647,9 +647,10 @@ def check_deduplication_uvs_formats_and_colorize():
         col_src = os.path.join(FIXTURES_DIR, "legacy_textured_colorize_2017.skp")
         orig_col = openskp.SkpFile.open(col_src).parse()
         b = openskp.open_existing(col_src)[0]
-        # open_existing replays textured materials via add_texture_material (plain defaults);
-        # restore the source fixture's exact colorize flags, paint colours, and transparency!
-        pat_head = bytes([255, 255, 255, 254, 0, 255, 255, 255, 254]) + b"\xff\xfe\xff\x00" + struct.pack("<II", 1, 0)
+        # open_existing replays textured materials via add_texture_material (plain defaults,
+        # writing alpha 255 since openskp#628); restore the source fixture's exact colorize
+        # flags, paint colours, and transparency!
+        pat_head = bytes([255, 255, 255, 255, 0, 255, 255, 255, 255]) + b"\xff\xfe\xff\x00" + struct.pack("<II", 1, 0)
         mbuf = bytes(b._material_writer.buf)
         assert mbuf.count(pat_head) == 4
         pos = 0

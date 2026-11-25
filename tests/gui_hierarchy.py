@@ -860,7 +860,7 @@ def main():
         col_fixture = os.path.join(TESTS, "fixtures", "legacy_textured_colorize_2017.skp")
         orig_col = openskp.SkpFile.open(col_fixture).parse()
         cb = openskp.open_existing(col_fixture)[0]
-        pat_head = bytes([255, 255, 255, 254, 0, 255, 255, 255, 254]) + b"\xff\xfe\xff\x00" + struct.pack("<II", 1, 0)
+        pat_head = bytes([255, 255, 255, 255, 0, 255, 255, 255, 255]) + b"\xff\xfe\xff\x00" + struct.pack("<II", 1, 0)
         mbuf = bytes(cb._material_writer.buf)
         pos = 0
         patched = bytearray()
