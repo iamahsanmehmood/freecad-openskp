@@ -157,6 +157,43 @@ owner-local `Definition.dimensions` in 2021+ VFF files) import as FreeCAD Draft
   `Tools > Edit parameters > BaseApp/Preferences/Mod/OpenSKP` or pass
   `import_skp(path, doc, annotations=False)`.
 
+**Textured materials** (`ImportTextures`, off by default): setting Boolean
+`ImportTextures` to `true` under `Tools > Edit parameters >
+BaseApp/Preferences/Mod/OpenSKP` or passing `import_skp(path, doc,
+textures=True)` imports SketchUp image textures alongside the B-rep geometry
+(#30):
+
+- When off (the default), the imported document has no Python proxy objects and
+  no extra properties. When on, **only** geometry objects with at least one
+  textured face become `Part::FeaturePython` (rendering textures and crisp B-rep
+  edges in a Coin3D `"Textured"` display mode, while `"Flat Lines"` and `"Shaded"`
+  remain available for solid colours; mirrored placements of textured components
+  import as placed copies so backface culling stays accurate on two-sided faces);
+  every untextured object stays a plain C++ `Part::Feature`. Editing a face's
+  `DiffuseColor`, `LineColor`, `LineWidth`, or `Transparency` later updates
+  `"Textured"` mode as well (replacing a recoloured face's texture with the chosen
+  solid colour).
+- Each unique image is stored **once per document** (`OpenSKPTextures`, written
+  once per import) and shared as a single Coin3D `SoTexture2` node per material
+  even across many component definitions and `App::Link` placements, decoded with
+  FreeCAD's built-in Qt `QImageReader` (`PNG`, `JPEG`, `BMP`, `GIF`, `TGA`, `TIFF`,
+  `WebP`), with per-vertex UVs from `openskp`'s `face_uv_basis` and
+  `compute_face_uv` covering inherited component paint, distinct front and back
+  faces, positioned (`uv_transform`) and projected (`uv_projected`) textures,
+  fitted curved surfaces (`FitCurvedSurfaces`), material/cutout opacity, and
+  SketchUp HLS colourized (`shift` and `tint`) textures. A corrupt texture or a
+  format Qt cannot read never stops the import: its faces fall back to solid
+  colours, and the failure count is reported once.
+- **Opening a saved `.FCStd` without the add-on**: every textured
+  `Part::FeaturePython` saves its full B-rep `Shape`, per-face solid
+  `ViewObject.DiffuseColor`, and `"Flat Lines"` fallback display mode in the
+  `.FCStd` archive (restoring `"Textured"` automatically when reopened with the
+  add-on, while preserving any other display mode chosen before saving). Opening
+  a saved `.FCStd` file on a machine without `freecad-openskp` installed
+  immediately shows all shapes and solid face colours (FreeCAD logs a standard
+  missing-proxy warning and displays `"Flat Lines"` solid colours in place of the
+  textures).
+
 The two layouts show exactly the same geometry: the tests import every
 fixture both ways and compare faces, areas, vertices and edges
 (`tests/test_hierarchy.py`), and check in FreeCAD's real GUI that the 3D
@@ -212,30 +249,28 @@ independent re-parse. For freshly modelled FreeCAD content that was
 never imported, each object's own `Label` simply doubles as its
 exported tag.
 
-**Material export**: each object's own `ViewObject.DiffuseColor` (one
-RGBA entry per `Shape.Faces` - the same property materials-import
-applies) becomes a SketchUp material per distinct color, deduplicated
-across faces *and* across objects (the same color reused anywhere
-registers exactly once). Solid colors and opacity only, matching
-import's own scope - no texture export. Only available under the real
-GUI, same limitation as materials-import (`ViewObject` doesn't exist
-under headless `freecadcmd`) - a headless export still carries geometry
-and layers, just no color.
+**Material export**: plain `Part::Feature` objects export their
+`ViewObject.DiffuseColor` (one RGBA entry per `Shape.Faces`) as one SketchUp
+material per distinct colour, deduplicated across faces and objects under the
+GUI (`ViewObject` does not exist under headless `freecadcmd`, where plain
+objects still export geometry and tags). Objects imported with
+`ImportTextures` (`textures=True`) also export their textured materials,
+back-face paints, and per-face `front_uv` / `back_uv` mappings in both GUI and
+headless sessions.
 
-**Materials** (import only, for now) carry over too, as
-`ViewObject.DiffuseColor` (one RGBA entry per `Shape.Faces`, FreeCAD's
-own per-face-color mechanism - the same one `Part::Feature` objects with
-a mixed-material compound already use elsewhere): each face's own paint,
-or whatever an ancestor group/component painted itself with when the
-face has none, or a neutral default when nothing was ever painted -
-matching SketchUp's own paint-inheritance rule. Solid colors and opacity
-only for this pass - no texture images, and (deliberately, for now) not
-a face's individual layer-color fallback, since that needs a layer
-id → color lookup openskp doesn't expose publicly yet; real painted
-files resolve through material_id long before that fallback would
-matter. Only applied under the real GUI (`ViewObject` doesn't exist
-under headless `freecadcmd`) - the underlying color resolution itself is
-exercised either way (see `tests/test_import.py`).
+**Materials** carry over on import as `ViewObject.DiffuseColor` (one RGBA entry
+per `Shape.Faces`, FreeCAD's own per-face-colour mechanism): each face's own
+paint, or whatever an ancestor group/component painted itself with when the
+face has none, or a neutral default when nothing was ever painted — matching
+SketchUp's own paint-inheritance rule. Solid colours and opacity are applied by
+default (and texture images when `ImportTextures` / `textures=True` is enabled;
+see above). Deliberately skips a face's individual layer-colour fallback, since
+that needs a layer id → colour lookup `openskp` does not expose publicly yet;
+real painted files resolve through `material_id` long before that fallback
+would matter. `ViewObject.DiffuseColor` is applied under the real GUI
+(`ViewObject` does not exist under headless `freecadcmd`), while the underlying
+colour and texture resolution is exercised in both (`tests/test_import.py`,
+`tests/test_textures.py`, and `tests/gui_hierarchy.py`).
 
 **Layers in the merged layout** (SketchUp calls them "tags") carry over too -
 unlike materials, which fit onto the existing single-compound design as

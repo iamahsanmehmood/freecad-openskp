@@ -73,6 +73,16 @@ EXPECTED = {
     # 1 Beam component on Framing, carrying a leader text, a screen text, and two linear dimensions.
     "annotations_2017.skp": (2, 0, 0, 0, 2, 0),
     "annotations_2021.skp": (2, 0, 0, 0, 2, 0),
+    # Textured-material fixtures (#30): existing openskp fixtures (colorize material palette + BMP/GIF/TGA/TIFF
+    # 2021 single-quad fixtures) plus SDK-written 2017 & 2021 UV/projection/inheritance/cutout fixtures.
+    "legacy_textured_colorize_2017.skp": (0, 0, 0, 0, 0, 0),
+    "texture_bmp_2021.skp": (1, 0, 0, 0, 1, 0),
+    "texture_gif_2021.skp": (1, 0, 0, 0, 1, 0),
+    "texture_tga_2021.skp": (1, 0, 0, 0, 1, 0),
+    "texture_tiff_2021.skp": (1, 0, 0, 0, 1, 0),
+    "textures_uv_2017.skp": (6, 0, 0, 0, 1, 0),
+    "textures_uv_2021.skp": (6, 0, 0, 0, 1, 0),
+    "textures_mirrored_2017.skp": (4, 0, 0, 0, 1, 0),
 }
 
 
@@ -101,11 +111,13 @@ def _expected_warnings(fixture_name):
 
 def check(fixture_name):
     path = os.path.join(FIXTURES_DIR, fixture_name)
+    expected = EXPECTED.get(fixture_name)
     doc = App.newDocument()
     try:
         importSKP.import_skp(path, doc, merge=True)
         objs = [o for o in doc.Objects if hasattr(o, "Shape")]
-        assert objs, f"{fixture_name}: no shape object created"
+        if expected is None or expected[0] > 0 or expected[3] > 0:
+            assert objs, f"{fixture_name}: no shape object created"
 
         # One object per layer now (not always exactly one object overall)
         # - aggregate faces/edges across all of them, matching how the
@@ -192,6 +204,9 @@ def check_face_colors(fixture_name, expected_face_count):
 
     stats = {"faces_built": 0, "faces_skipped": 0, "placements": 0, "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0}
     root_buckets = importSKP._get_local_shape(model.root, model, stats, {}, frozenset())
+    if expected_face_count == 0 and not root_buckets:
+        print(f"{fixture_name}: 0 faces (material-only fixture) - OK")
+        return
     assert root_buckets, f"{fixture_name}: _get_local_shape produced no layer buckets at all"
 
     all_colors = []
