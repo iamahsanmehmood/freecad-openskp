@@ -674,10 +674,55 @@ def _face_key(face):
     return (round(c.x, 4), round(c.y, 4), round(c.z, 4), round(face.Area, 4))
 
 
-def _make_solids(faces, colors, stats):
+def _brep_face_normal_tuple(brep_face):
+    """Outward topological normal of ``brep_face`` at its UV midpoint, or ``None``."""
+    try:
+        u0, u1, v0, v1 = brep_face.ParameterRange
+        n = brep_face.normalAt(0.5 * (u0 + u1), 0.5 * (v0 + v1))
+        if n.Length > 1e-12:
+            n.normalize()
+            return (float(n.x), float(n.y), float(n.z))
+    except Exception:
+        pass
+    return None
+
+
+def _reorient_uv_record_for_face(uv_rec, brep_face):
+    """Updates ``flipped`` (index 2) on a ``[front, back, flipped, skp_normal]``
+    per-face UV record to match ``brep_face``'s actual normal after sewing or
+    transforming (both planar faces and curved cylinder/cone/sphere faces)."""
+    if uv_rec is None:
+        return None
+    front_e, back_e, flipped, skp_n = uv_rec
+    if skp_n is not None:
+        if isinstance(skp_n, (list, tuple)) and len(skp_n) == 7 and skp_n[0] == "c":
+            try:
+                pt_mm = App.Vector(
+                    float(skp_n[1]) * INCH_TO_MM,
+                    float(skp_n[2]) * INCH_TO_MM,
+                    float(skp_n[3]) * INCH_TO_MM,
+                )
+                u, v = brep_face.Surface.parameter(pt_mm)
+                bn = brep_face.normalAt(u, v)
+                if bn.Length > 1e-12:
+                    bn.normalize()
+                    dot = bn.x * float(skp_n[4]) + bn.y * float(skp_n[5]) + bn.z * float(skp_n[6])
+                    flipped = 1 if dot < 0.0 else 0
+            except Exception:
+                pass
+        else:
+            bn = _brep_face_normal_tuple(brep_face)
+            if bn is not None:
+                dot = bn[0] * skp_n[0] + bn[1] * skp_n[1] + bn[2] * skp_n[2]
+                flipped = 1 if dot < 0.0 else 0
+    return [front_e, back_e, flipped, skp_n]
+
+
+def _make_solids(faces, colors, stats, face_uvs=None):
     """Sews ``faces`` (one definition's own faces, with one RGBA each in
     ``colors``) and turns every closed shell into a solid (#21). Returns
-    ``(shapes, colors)``: the solids, then every face no closed shell
+    ``(shapes, colors)`` (and updates ``face_uvs`` in place when given):
+    the solids, then every face no closed shell
     took, as they were, with the colours in the order of the result's
     faces. Sewing rebuilds faces, so each colour follows its face by
     centre of mass and area; a face that matches nothing keeps the default
@@ -685,12 +730,15 @@ def _make_solids(faces, colors, stats):
     if not faces:
         return [], []
     color_by_key = {}
+    uv_by_key = {}
     indices_by_key = {}
     coms = []
     areas = []
     for idx, (face, rgba) in enumerate(zip(faces, colors)):
         key = _face_key(face)
         color_by_key.setdefault(key, rgba)
+        if face_uvs is not None and idx < len(face_uvs):
+            uv_by_key.setdefault(key, face_uvs[idx])
         indices_by_key.setdefault(key, []).append(idx)
         coms.append(face.CenterOfMass)
         areas.append(face.Area)
@@ -701,14 +749,20 @@ def _make_solids(faces, colors, stats):
         return faces, colors
     solids = []
     solid_face_colors = []
+    solid_face_uvs = []
     used_indices = set()
+
+    def _default_uv_rec():
+        r, g, b, a = _DEFAULT_FACE_RGBA
+        return [["s", round(r, 6), round(g, 6), round(b, 6), round(a, 6), None], None, 0, None]
 
     def _claim_source_face(sf):
         sf_key = _face_key(sf)
         for cand in indices_by_key.get(sf_key, ()):
             if cand not in used_indices:
                 used_indices.add(cand)
-                return colors[cand]
+                uv_r = _reorient_uv_record_for_face(face_uvs[cand], sf) if face_uvs is not None else None
+                return colors[cand], uv_r
         sf_com = sf.CenterOfMass
         sf_area = sf.Area
         tol_pos = max(1e-2, 1e-4 * sf.BoundBox.DiagonalLength)
@@ -730,8 +784,14 @@ def _make_solids(faces, colors, stats):
                 best_idx = cand
         if best_idx is not None:
             used_indices.add(best_idx)
-            return colors[best_idx]
-        return color_by_key.get(sf_key, _DEFAULT_FACE_RGBA)
+            uv_r = _reorient_uv_record_for_face(face_uvs[best_idx], sf) if face_uvs is not None else None
+            return colors[best_idx], uv_r
+        fallback_uv = (
+            _reorient_uv_record_for_face(uv_by_key.get(sf_key, _default_uv_rec()), sf)
+            if face_uvs is not None
+            else None
+        )
+        return color_by_key.get(sf_key, _DEFAULT_FACE_RGBA), fallback_uv
 
     for shell in sewn.Shells:
         if not shell.isClosed():
@@ -748,7 +808,11 @@ def _make_solids(faces, colors, stats):
         if solid is None:
             continue
         solids.append(solid)
-        solid_face_colors.extend(_claim_source_face(f) for f in solid.Faces)
+        for sf in solid.Faces:
+            c_val, uv_val = _claim_source_face(sf)
+            solid_face_colors.append(c_val)
+            if face_uvs is not None:
+                solid_face_uvs.append(uv_val)
     # A single self-closed curved face (such as a full Part.Sphere) has no
     # inter-face seam for sewShape() to wrap into sewn.Shells; promote its
     # 1-face closed shell directly.
@@ -769,17 +833,24 @@ def _make_solids(faces, colors, stats):
         if closed_solid is not None:
             solids.append(closed_solid)
             solid_face_colors.append(rgba)
+            if face_uvs is not None:
+                solid_face_uvs.append(_reorient_uv_record_for_face(face_uvs[idx], closed_solid.Faces[0]))
             used_indices.add(idx)
     if not solids:
         stats["faces_left_open"] = stats.get("faces_left_open", 0) + len(faces)
         return faces, colors
     out_shapes = list(solids)
     out_colors = list(solid_face_colors)
+    out_uvs = list(solid_face_uvs) if face_uvs is not None else None
     for idx, (face, rgba) in enumerate(zip(faces, colors)):
         if idx not in used_indices:
             out_shapes.append(face)
             out_colors.append(rgba)
+            if out_uvs is not None:
+                out_uvs.append(face_uvs[idx])
             stats["faces_left_open"] = stats.get("faces_left_open", 0) + 1
+    if out_uvs is not None:
+        face_uvs[:] = out_uvs
     stats["solids_built"] = stats.get("solids_built", 0) + len(solids)
     return out_shapes, out_colors
 
@@ -792,7 +863,7 @@ def _arc_point_mm(center, ax, ay, angle):
     )
 
 
-def _group_smooth_faces(definition, model, inherited_material_id):
+def _group_smooth_faces(definition, model, inherited_material_id, tex_ctx=None):
     """Groups faces joined by soft or smooth edges (and sharing the same
     resolved display colour, since FreeCAD stores one DiffuseColor per face)
     into candidate curved-surface components (#18). Returns
@@ -805,6 +876,27 @@ def _group_smooth_faces(definition, model, inherited_material_id):
         fid: _resolve_face_color(face, model, inherited_material_id)
         for fid, face in faces_by_id.items()
     }
+    tex_sig_by_id = None
+    if tex_ctx is not None:
+        mat_to_key = tex_ctx["mat_id_to_key"]
+        projs = tex_ctx["face_projections"]
+        tex_sig_by_id = {}
+        for fid, face in faces_by_id.items():
+            fm_id = face.material_id if face.material_id is not None else inherited_material_id
+            bm_id = face.back_material_id if face.back_material_id is not None else inherited_material_id
+            fk = mat_to_key.get(fm_id)
+            bk = mat_to_key.get(bm_id)
+            fp_vec, bp_vec = projs.get(fid, (None, None))
+            # Non-projected positioned per-facet UVs depend on each facet's own plane basis:
+            # give each such facet a distinct token so it stays faceted with exact UVs.
+            f_pos = ("pos", fid) if (fk is not None and face.uv_transform is not None and fp_vec is None) else (
+                fp_vec, tuple(face.uv_transform) if face.uv_transform is not None else None
+            )
+            b_pos = ("pos", fid) if (bk is not None and face.uv_transform_back is not None and bp_vec is None) else (
+                bp_vec, tuple(face.uv_transform_back) if face.uv_transform_back is not None else None
+            )
+            tex_sig_by_id[fid] = (fm_id, bm_id, fk, bk, f_pos, b_pos)
+
     edge_faces: dict = {}
     for fid, face in faces_by_id.items():
         for loop in face.loops:
@@ -822,6 +914,8 @@ def _group_smooth_faces(definition, model, inherited_material_id):
             continue
         f1, f2 = fids
         if f1 != f2 and colors_by_id[f1] == colors_by_id[f2]:
+            if tex_sig_by_id is not None and tex_sig_by_id[f1] != tex_sig_by_id[f2]:
+                continue
             adj[f1].append(f2)
             adj[f2].append(f1)
 
@@ -1440,7 +1534,74 @@ def _fit_sphere(definition, group_faces, curve_edge_counts, edge_faces):
         return None
 
 
-def _build_own_geometry(definition, model, stats, inherited_material_id):
+def _build_face_side_uv_entry(mat_id, uv_transform, proj_vec, face_normal, model, tex_ctx, curved=False):
+    """Builds one face side's compact UV/material entry for ``SketchUpFaceUVsJSON``:
+    - Textured: ``["t", mat_key, basis_n_or_null, uv_transform_or_null, inv_m12_or_null]``
+    - Solid / unpainted: ``["s", r, g, b, a, mat_name_or_null]``
+    """
+    mat_key = tex_ctx["mat_id_to_key"].get(mat_id) if mat_id is not None else None
+    if mat_key is not None:
+        if proj_vec is not None:
+            basis = [float(proj_vec[0]), float(proj_vec[1]), float(proj_vec[2])]
+        elif curved:
+            basis = None  # curved B-rep surface with unpositioned texture: derive basis per triangle
+        elif face_normal is not None:
+            basis = [float(face_normal[0]), float(face_normal[1]), float(face_normal[2])]
+        else:
+            basis = [0.0, 0.0, 1.0]
+        uv_xf = [float(x) for x in uv_transform] if uv_transform is not None else None
+        return ["t", mat_key, basis, uv_xf, None]
+    mat = model.materials_by_id.get(mat_id) if mat_id is not None else None
+    if mat is not None:
+        r, g, b, a = _material_rgba(mat)
+        mname = mat.name if mat.name else None
+    else:
+        r, g, b, a = _DEFAULT_FACE_RGBA
+        mname = None
+    return ["s", round(r, 6), round(g, 6), round(b, 6), round(a, 6), mname]
+
+
+def _build_face_uv_record(face, brep_face, model, inherited_material_id, tex_ctx, curved=False):
+    """Returns ``[front_entry, back_entry_or_None, flipped_int, skp_normal_or_None]``."""
+    fm_id = face.material_id if face.material_id is not None else inherited_material_id
+    bm_id = face.back_material_id if face.back_material_id is not None else inherited_material_id
+    fp_vec = getattr(face, "uv_projection", None)
+    bp_vec = getattr(face, "uv_projection_back", None)
+    if fp_vec is None and bp_vec is None:
+        fp_vec, bp_vec = tex_ctx["face_projections"].get(face.id, (None, None))
+    fn = face.normal
+    front_e = _build_face_side_uv_entry(fm_id, face.uv_transform, fp_vec, fn, model, tex_ctx, curved=curved)
+    back_e = _build_face_side_uv_entry(bm_id, face.uv_transform_back, bp_vec, fn, model, tex_ctx, curved=curved)
+    if back_e == front_e:
+        back_e = None
+    if curved:
+        skp_n = None
+        try:
+            u0, u1, v0, v1 = brep_face.ParameterRange
+            um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+            pm = brep_face.Surface.value(um, vm)
+            nm = brep_face.normalAt(um, vm)
+            if nm.Length > 1e-12:
+                nm.normalize()
+                skp_n = [
+                    "c",
+                    float(pm.x / INCH_TO_MM),
+                    float(pm.y / INCH_TO_MM),
+                    float(pm.z / INCH_TO_MM),
+                    float(nm.x),
+                    float(nm.y),
+                    float(nm.z),
+                ]
+        except Exception:
+            skp_n = None
+    else:
+        skp_n = None if fn is None else (float(fn[0]), float(fn[1]), float(fn[2]))
+    return _reorient_uv_record_for_face([front_e, back_e, 0, skp_n], brep_face)
+
+
+def _build_own_geometry(
+    definition, model, stats, inherited_material_id, out_face_uvs=None, out_soft_midpoints=None
+):
     """One definition's OWN faces and loose-edge runs (not its nested
     instances), in its local space: ``(shapes, colors)``, where ``colors``
     holds one RGBA per face in the order the faces appear in ``shapes``
@@ -1449,6 +1610,7 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
     component hierarchy (_HierarchyImport)."""
     import openskp
 
+    tex_ctx = stats.get("_tex_ctx") if out_face_uvs is not None else None
     fit_curved = bool(stats.get("fit_curved_surfaces"))
     curve_edge_counts = None
     if fit_curved and getattr(definition, "arcs", None):
@@ -1462,7 +1624,7 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
     fitted_face_ids = set()
     edge_faces = {}
     if fit_curved:
-        groups, edge_faces = _group_smooth_faces(definition, model, inherited_material_id)
+        groups, edge_faces = _group_smooth_faces(definition, model, inherited_material_id, tex_ctx=tex_ctx)
         for group_faces, group_color in groups:
             fitted = _fit_cylinder_or_cone(definition, group_faces, curve_edge_counts)
             if fitted is None:
@@ -1481,6 +1643,12 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
                 stats[key] = stats.get(key, 0) + 1
                 shapes.append(surf_face)
                 colors.append(group_color)
+                if tex_ctx is not None:
+                    out_face_uvs.append(
+                        _build_face_uv_record(
+                            group_faces[0], surf_face, model, inherited_material_id, tex_ctx, curved=True
+                        )
+                    )
             else:
                 stats["curved_groups_unfitted"] = stats.get("curved_groups_unfitted", 0) + 1
 
@@ -1542,6 +1710,11 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
             shapes.extend(faces)
             color = _resolve_face_color(face, model, inherited_material_id)
             colors.extend([color] * len(faces))
+            if tex_ctx is not None:
+                for bf in faces:
+                    out_face_uvs.append(
+                        _build_face_uv_record(face, bf, model, inherited_material_id, tex_ctx, curved=False)
+                    )
             if len(faces) > 1:
                 stats["faces_triangulated"] = stats.get("faces_triangulated", 0) + 1
                 stats["triangles_built"] = stats.get("triangles_built", 0) + len(faces)
@@ -1551,6 +1724,21 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
                 f"openskp: skipped face {face.id} in {definition.name or '(model root)'!r}: "
                 "could not construct a valid face without changing its boundaries\n"
             )
+
+    if out_soft_midpoints is not None:
+        for edge in definition.edges.values():
+            if not (edge.soft or edge.smooth or edge.hidden):
+                continue
+            v1 = definition.vertices.get(edge.v1_id)
+            v2 = definition.vertices.get(edge.v2_id)
+            if v1 is not None and v2 is not None and len(out_soft_midpoints) < 8000:
+                out_soft_midpoints.append(
+                    (
+                        0.5 * (v1.x + v2.x) * INCH_TO_MM,
+                        0.5 * (v1.y + v2.y) * INCH_TO_MM,
+                        0.5 * (v1.z + v2.z) * INCH_TO_MM,
+                    )
+                )
 
     # Loose edges (SketchUp's own way of storing drawing/construction
     # geometry: a light-gauge-steel or structural-framing member is
@@ -1584,9 +1772,107 @@ def _build_own_geometry(definition, model, stats, inherited_material_id):
     if stats.get("make_solids"):
         faces = [s for s in shapes if s.ShapeType == "Face"]
         others = [s for s in shapes if s.ShapeType != "Face"]
-        solid_shapes, colors = _make_solids(faces, colors, stats)
+        solid_shapes, colors = _make_solids(faces, colors, stats, face_uvs=out_face_uvs)
         shapes = solid_shapes + others
     return shapes, colors
+
+
+def _invert_inch_m13_to_m12(m13):
+    """Returns the 12-float row-major 3x4 inverse ``[r00..r22, tx, ty, tz]`` (in
+    inches) of an openskp 13-element instance matrix, or ``None`` if singular."""
+    s = m13[12] if len(m13) > 12 else 1.0
+    m = [v * s for v in m13[:12]] if s != 1.0 else list(m13[:12])
+    a, b, c, d, e, f, g, h, i = m[0:9]
+    tx, ty, tz = m[9], m[10], m[11]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    if abs(det) <= 1e-15:
+        return None
+    inv_d = 1.0 / det
+    r00, r01, r02 = (e * i - f * h) * inv_d, (c * h - b * i) * inv_d, (b * f - c * e) * inv_d
+    r10, r11, r12 = (f * g - d * i) * inv_d, (a * i - c * g) * inv_d, (c * d - a * f) * inv_d
+    r20, r21, r22 = (d * h - e * g) * inv_d, (b * g - a * h) * inv_d, (a * e - b * d) * inv_d
+    itx = -(r00 * tx + r01 * ty + r02 * tz)
+    ity = -(r10 * tx + r11 * ty + r12 * tz)
+    itz = -(r20 * tx + r21 * ty + r22 * tz)
+    return [r00, r01, r02, r10, r11, r12, r20, r21, r22, itx, ity, itz]
+
+
+def _compose_m12(outer_m12, inner_m12):
+    """Composes ``p -> outer(inner(p))`` for two 12-float 3x4 matrices."""
+    if outer_m12 is None:
+        return list(inner_m12) if inner_m12 is not None else None
+    if inner_m12 is None:
+        return list(outer_m12)
+    a = outer_m12
+    b = inner_m12
+    return [
+        a[0] * b[0] + a[1] * b[3] + a[2] * b[6],
+        a[0] * b[1] + a[1] * b[4] + a[2] * b[7],
+        a[0] * b[2] + a[1] * b[5] + a[2] * b[8],
+        a[3] * b[0] + a[4] * b[3] + a[5] * b[6],
+        a[3] * b[1] + a[4] * b[4] + a[5] * b[7],
+        a[3] * b[2] + a[4] * b[5] + a[5] * b[8],
+        a[6] * b[0] + a[7] * b[3] + a[8] * b[6],
+        a[6] * b[1] + a[7] * b[4] + a[8] * b[7],
+        a[6] * b[2] + a[7] * b[5] + a[8] * b[8],
+        a[0] * b[9] + a[1] * b[10] + a[2] * b[11] + a[9],
+        a[3] * b[9] + a[4] * b[10] + a[5] * b[11] + a[10],
+        a[6] * b[9] + a[7] * b[10] + a[8] * b[11] + a[11],
+    ]
+
+
+def _apply_m12(m12, pt):
+    if m12 is None:
+        return pt
+    x, y, z = pt
+    return (
+        m12[0] * x + m12[1] * y + m12[2] * z + m12[9],
+        m12[3] * x + m12[4] * y + m12[5] * z + m12[10],
+        m12[6] * x + m12[7] * y + m12[8] * z + m12[11],
+    )
+
+
+def _transform_normal_by_inv_m12(skp_n, inv_m12):
+    """Maps a normal vector by ``M^{-T} = (inv_m12[:9])^T`` so front/back
+    orientation stays exact under non-uniform scale, mirroring, and shear."""
+    if skp_n is None or inv_m12 is None:
+        return skp_n
+    nx, ny, nz = skp_n
+    tx = inv_m12[0] * nx + inv_m12[3] * ny + inv_m12[6] * nz
+    ty = inv_m12[1] * nx + inv_m12[4] * ny + inv_m12[7] * nz
+    tz = inv_m12[2] * nx + inv_m12[5] * ny + inv_m12[8] * nz
+    ln = math.sqrt(tx * tx + ty * ty + tz * tz)
+    if ln <= 1e-12:
+        return skp_n
+    return (tx / ln, ty / ln, tz / ln)
+
+
+def _transform_uv_side(side_entry, step_inv_m12):
+    if side_entry is None or side_entry[0] != "t" or step_inv_m12 is None:
+        return side_entry
+    return [side_entry[0], side_entry[1], side_entry[2], side_entry[3], _compose_m12(side_entry[4], step_inv_m12)]
+
+
+def _transform_uv_records(child_uvs, m13, placed_faces):
+    step_inv = _invert_inch_m13_to_m12(m13)
+    s = m13[12] if len(m13) > 12 else 1.0
+    fwd_m12 = [v * s for v in m13[:12]] if s != 1.0 else list(m13[:12])
+    out = []
+    for idx, rec in enumerate(child_uvs):
+        fe, be, fl, sn = rec
+        n_fe = _transform_uv_side(fe, step_inv)
+        n_be = _transform_uv_side(be, step_inv)
+        if isinstance(sn, (list, tuple)) and len(sn) == 7 and sn[0] == "c":
+            px, py, pz = _apply_m12(fwd_m12, (float(sn[1]), float(sn[2]), float(sn[3])))
+            nx, ny, nz = _transform_normal_by_inv_m12((float(sn[4]), float(sn[5]), float(sn[6])), step_inv)
+            n_sn = ["c", px, py, pz, nx, ny, nz]
+        else:
+            n_sn = _transform_normal_by_inv_m12(sn, step_inv)
+        new_rec = [n_fe, n_be, fl, n_sn]
+        if idx < len(placed_faces):
+            new_rec = _reorient_uv_record_for_face(new_rec, placed_faces[idx])
+        out.append(new_rec)
+    return out
 
 
 def _get_local_shape(
@@ -1621,16 +1907,27 @@ def _get_local_shape(
         return {}  # a real cycle in the instance graph - bail, don't spin
     visiting = visiting | {key}
 
-    buckets: dict = {}  # layer_name -> {"shapes": [...], "colors": [...]}
+    track_uvs = stats.get("_tex_ctx") is not None
+    uv_cache = stats.setdefault("_merged_uv_cache", {}) if track_uvs else None
+    buckets: dict = {}  # layer_name -> {"shapes": [...], "colors": [...], ...}
 
     def bucket(layer_name):
+        if track_uvs:
+            return buckets.setdefault(layer_name, {"shapes": [], "colors": [], "uvs": [], "soft": []})
         return buckets.setdefault(layer_name, {"shapes": [], "colors": []})
 
-    own_shapes, own_colors = _build_own_geometry(definition, model, stats, inherited_material_id)
+    own_uvs = [] if track_uvs else None
+    own_soft = [] if track_uvs else None
+    own_shapes, own_colors = _build_own_geometry(
+        definition, model, stats, inherited_material_id, out_face_uvs=own_uvs, out_soft_midpoints=own_soft
+    )
     if own_shapes:
         b = bucket(inherited_layer)
         b["shapes"].extend(own_shapes)
         b["colors"].extend(own_colors)
+        if track_uvs:
+            b["uvs"].extend(own_uvs)
+            b["soft"].extend(own_soft)
 
     for inst in definition.instances:
         child_def = model.definitions.get(inst.ref_idx)
@@ -1644,6 +1941,7 @@ def _get_local_shape(
         # Instance.layer docstrings).
         child_material = inst.material_id if inst.material_id is not None else inherited_material_id
         child_layer = inst.layer if inst.layer else inherited_layer
+        child_key = (id(child_def), child_material, child_layer)
         child_buckets = _get_local_shape(
             child_def, model, stats, shape_cache, visiting, progress, child_material, child_layer
         )
@@ -1651,6 +1949,7 @@ def _get_local_shape(
             continue
         stats["placements"] += 1
         matrix = _to_freecad_matrix(inst.matrix)
+        child_uv_map = uv_cache.get(child_key, {}) if track_uvs else None
         for layer_name, (child_shape, child_colors) in child_buckets.items():
             placed = child_shape.copy()
             # checkScale=True: without it, Shape.transformShape() silently
@@ -1668,13 +1967,26 @@ def _get_local_shape(
             b = bucket(layer_name)
             b["shapes"].append(placed)
             b["colors"].extend(child_colors)
+            if track_uvs:
+                c_uvs, c_soft = child_uv_map.get(layer_name, ([], []))
+                b["uvs"].extend(_transform_uv_records(c_uvs, inst.matrix, placed.Faces))
+                if c_soft and len(b["soft"]) < 8000:
+                    room = 8000 - len(b["soft"])
+                    for sm in c_soft[:room]:
+                        mp = matrix.multVec(App.Vector(sm[0], sm[1], sm[2]))
+                        b["soft"].append((mp.x, mp.y, mp.z))
 
     result = {}
+    uv_result = {} if track_uvs else None
     for layer_name, b in buckets.items():
         if not b["shapes"]:
             continue
         result[layer_name] = (Part.makeCompound(b["shapes"]), b["colors"])
+        if track_uvs:
+            uv_result[layer_name] = (b["uvs"], b["soft"])
     shape_cache[key] = result
+    if track_uvs:
+        uv_cache[key] = uv_result
 
     # A real building-scale file can have thousands of unique definitions;
     # a totally silent multi-minute call looks identical to a hang from
@@ -1689,6 +2001,2524 @@ def _get_local_shape(
         print(f"  ...{len(shape_cache)} unique definitions built so far")
 
     return result
+
+
+# ── Textured materials (#30): shared document store + FeaturePython + Coin3D ─
+
+_MAX_TEXTURE_BLOB_BYTES = 64 * 1024 * 1024
+_MAX_PACK_TOTAL_BYTES = 512 * 1024 * 1024
+_MAX_TEXTURE_DIMENSION = 32767
+_MAX_TEXTURE_PIXELS = 64 * 1024 * 1024
+
+
+_DOC_SESSION_IDS: dict = {}
+_NEXT_DOC_SESSION_SEQ = 0
+
+
+def _doc_uid(doc):
+    global _NEXT_DOC_SESSION_SEQ
+    if doc is None:
+        return None
+    dname = getattr(doc, "Name", "") or ""
+    if not dname:
+        return ("_anon", id(doc))
+    tok = _DOC_SESSION_IDS.get(dname)
+    if tok is None:
+        _NEXT_DOC_SESSION_SEQ += 1
+        tok = _NEXT_DOC_SESSION_SEQ
+        _DOC_SESSION_IDS[dname] = tok
+    return (dname, tok)
+
+
+class _ByteBoundedCache:
+    """Insertion-ordered LRU cache bounded strictly by byte size, tracking
+    document ownership so closing a document evicts its cached entries (#30)."""
+
+    def __init__(self, max_bytes):
+        self.max_bytes = int(max_bytes)
+        self._data = {}  # key -> (value, nbytes, set_of_doc_uids)
+        self.total_bytes = 0
+
+    def __len__(self):
+        return len(self._data)
+
+    def __contains__(self, key):
+        return key in self._data
+
+    def clear(self):
+        self._data.clear()
+        self.total_bytes = 0
+
+    def get(self, key, default=None, doc_uid=None):
+        entry = self._data.pop(key, None)
+        if entry is None:
+            return default
+        val, nb, docs = entry
+        if doc_uid is not None:
+            docs.add(doc_uid)
+        self._data[key] = (val, nb, docs)
+        return val
+
+    def put(self, key, value, nbytes, doc_uid=None):
+        nb = max(1, int(nbytes))
+        old = self._data.pop(key, None)
+        docs = set(old[2]) if old is not None else set()
+        if old is not None:
+            self.total_bytes -= old[1]
+        if doc_uid is not None:
+            docs.add(doc_uid)
+        if nb > self.max_bytes:
+            return
+        while self._data and self.total_bytes + nb > self.max_bytes:
+            first_key = next(iter(self._data))
+            _, ev_nb, _ = self._data.pop(first_key)
+            self.total_bytes -= ev_nb
+        self._data[key] = (value, nb, docs)
+        self.total_bytes += nb
+
+    def evict_prefix(self, prefix_tuple):
+        plen = len(prefix_tuple)
+        dead = [k for k in self._data if isinstance(k, tuple) and k[:plen] == prefix_tuple]
+        for k in dead:
+            _, nb, _ = self._data.pop(k)
+            self.total_bytes -= nb
+
+    def release_doc(self, doc_uid):
+        if doc_uid is None:
+            return
+        dead = []
+        for k, (_v, _nb, docs) in self._data.items():
+            if isinstance(k, tuple) and k and k[0] == doc_uid:
+                dead.append(k)
+            elif doc_uid in docs:
+                docs.discard(doc_uid)
+                if not docs:
+                    dead.append(k)
+        for k in dead:
+            _, nb, _ = self._data.pop(k)
+            self.total_bytes -= nb
+
+
+class _LiveCoinTextureRegistry:
+    """Refcounted registry of live ``SoTexture2`` nodes keyed by
+    ``(doc_uid, store_name, mat_key)``. Keeps each ``SoTexture2`` node shared for
+    as long as at least one ``_TexturedViewProviderProxy`` holds it in its scene
+    graph (even above 256 MB of decoded textures), and releases it as soon as no
+    object uses it or its document closes."""
+
+    def __init__(self):
+        self._entries = {}  # key -> [value, nbytes, refcount]
+        self.total_bytes = 0
+
+    def __len__(self):
+        return len(self._entries)
+
+    def __contains__(self, key):
+        return key in self._entries
+
+    def clear(self):
+        self._entries.clear()
+        self.total_bytes = 0
+
+    def peek(self, key):
+        ent = self._entries.get(key)
+        return ent[0] if ent is not None else None
+
+    def acquire(self, key, build_fn):
+        ent = self._entries.get(key)
+        if ent is not None:
+            ent[2] += 1
+            return ent[0]
+        built = build_fn()
+        if built is None:
+            return None
+        val, nbytes = built
+        nb = max(1, int(nbytes))
+        self._entries[key] = [val, nb, 1]
+        self.total_bytes += nb
+        return val
+
+    def release(self, key):
+        ent = self._entries.get(key)
+        if ent is None:
+            return
+        ent[2] -= 1
+        if ent[2] <= 0:
+            self._entries.pop(key, None)
+            self.total_bytes = max(0, self.total_bytes - ent[1])
+
+    def release_doc(self, doc_uid):
+        if doc_uid is None:
+            return
+        dead = [k for k in self._entries if isinstance(k, tuple) and k and k[0] == doc_uid]
+        for k in dead:
+            _, nb, _ = self._entries.pop(k)
+            self.total_bytes = max(0, self.total_bytes - nb)
+
+
+_PROCESS_TEX_CACHE = _ByteBoundedCache(32 * 1024 * 1024)
+_PROCESS_MAT_CACHE = _ByteBoundedCache(4 * 1024 * 1024)
+_DECODED_GL_CACHE = _ByteBoundedCache(32 * 1024 * 1024)
+_STORE_UNPACK_CACHE = _ByteBoundedCache(32 * 1024 * 1024)
+_LIVE_COIN_TEX_NODES = _LiveCoinTextureRegistry()
+_COIN_TEX_NODE_CACHE = _LIVE_COIN_TEX_NODES
+_ACTIVE_IMPORT_TEX_CTX_BY_DOC: dict = {}
+_MAX_FACE_UV_JSON_BYTES = 512 * 1024 * 1024
+_UNRESOLVED_PASTE_OBJS_BY_DOC: dict = {}
+_UNRESOLVED_MISSING_KEYS_BY_DOC: dict = {}
+
+
+def _is_finite_num(val):
+    return isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(val)
+
+
+def _safe_float(val, default=0.0):
+    if isinstance(val, bool):
+        return float(default)
+    try:
+        f = float(val)
+        return f if math.isfinite(f) else float(default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _safe_rgba_u8_list(raw_rgba, default=(200, 200, 200, 255)):
+    if not isinstance(raw_rgba, (list, tuple)) or len(raw_rgba) < 3:
+        return list(default)
+    r = max(0, min(255, int(round(_safe_float(raw_rgba[0], default[0])))))
+    g = max(0, min(255, int(round(_safe_float(raw_rgba[1], default[1])))))
+    b = max(0, min(255, int(round(_safe_float(raw_rgba[2], default[2])))))
+    a = max(0, min(255, int(round(_safe_float(raw_rgba[3], default[3]))))) if len(raw_rgba) >= 4 else default[3]
+    return [r, g, b, a]
+
+
+def _safe_rgba_float(raw_rgba, default=_DEFAULT_FACE_RGBA):
+    if not isinstance(raw_rgba, (list, tuple)) or len(raw_rgba) < 3:
+        return default
+    r = max(0.0, min(1.0, _safe_float(raw_rgba[0], default[0])))
+    g = max(0.0, min(1.0, _safe_float(raw_rgba[1], default[1])))
+    b = max(0.0, min(1.0, _safe_float(raw_rgba[2], default[2])))
+    a = max(0.0, min(1.0, _safe_float(raw_rgba[3], default[3]))) if len(raw_rgba) >= 4 else default[3]
+    return (r, g, b, a)
+
+
+def _rgb_key(rgba):
+    c = _safe_rgba_float(rgba)
+    return (round(c[0] * 255), round(c[1] * 255), round(c[2] * 255))
+
+
+def _clear_doc_texture_caches(doc):
+    uid = _doc_uid(doc)
+    if doc is not None:
+        _DOC_SESSION_IDS.pop(getattr(doc, "Name", "") or "", None)
+    _ACTIVE_IMPORT_TEX_CTX_BY_DOC.pop(uid, None)
+    for cache in (
+        _STORE_UNPACK_CACHE,
+        _LIVE_COIN_TEX_NODES,
+        _DECODED_GL_CACHE,
+        _PROCESS_TEX_CACHE,
+        _PROCESS_MAT_CACHE,
+    ):
+        cache.release_doc(uid)
+    _UNRESOLVED_PASTE_OBJS_BY_DOC.pop(uid, None)
+    _UNRESOLVED_MISSING_KEYS_BY_DOC.pop(uid, None)
+    try:
+        remaining = [d for d in App.listDocuments().values() if _doc_uid(d) != uid]
+    except Exception:
+        remaining = []
+    if not remaining:
+        _STORE_UNPACK_CACHE.clear()
+        _LIVE_COIN_TEX_NODES.clear()
+        _DECODED_GL_CACHE.clear()
+        _PROCESS_TEX_CACHE.clear()
+        _PROCESS_MAT_CACHE.clear()
+        _UNRESOLVED_PASTE_OBJS_BY_DOC.clear()
+        _UNRESOLVED_MISSING_KEYS_BY_DOC.clear()
+
+
+def _encode_rgba_png(width, height, rgba_bytes):
+    """Encodes raw top-down ``RGBA8888`` bytes (`width * height * 4`) as a valid
+    PNG in pure stdlib (`struct` + `zlib`), used when exporting non-PNG/JPEG or
+    colorized textures through `openskp.create.add_texture_material`."""
+    import struct
+    import zlib
+
+    stride = width * 4
+    rows = [b"\x00" + rgba_bytes[y * stride : (y + 1) * stride] for y in range(height)]
+    raw = b"".join(rows)
+
+    def _chunk(tag, payload):
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + tag + payload + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", int(width), int(height), 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", zlib.compress(raw, 6))
+        + _chunk(b"IEND", b"")
+    )
+
+
+def _apply_sketchup_colorize_rgba(rgba_u8, target_rgb, colorize_type):
+    """Applies SketchUp's HLS colorize transform (`colorize_type` 0 = hue/L/S
+    shift, 1 = monochrome tint toward `target_rgb`) to an `(H, W, 4)` `uint8`
+    RGBA array, matching `SUTextureGetColorizedImageRep`."""
+    import colorsys
+    import numpy as np
+
+    arr = np.asarray(rgba_u8, dtype=np.uint8)
+    if arr.size == 0:
+        return arr
+    rgb_u8 = arr[..., :3]
+    avg_r = int(rgb_u8[..., 0].mean()) / 255.0
+    avg_g = int(rgb_u8[..., 1].mean()) / 255.0
+    avg_b = int(rgb_u8[..., 2].mean()) / 255.0
+    avg_h, avg_l, avg_s = colorsys.rgb_to_hls(avg_r, avg_g, avg_b)
+    tgt_h, tgt_l, tgt_s = colorsys.rgb_to_hls(
+        target_rgb[0] / 255.0, target_rgb[1] / 255.0, target_rgb[2] / 255.0
+    )
+
+    rgb = rgb_u8.astype(np.float64) / 255.0
+    r, g, b = rgb[..., 0], rgb[..., 1], rgb[..., 2]
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    rng = cmax - cmin
+    l = 0.5 * (cmax + cmin)
+    s = np.zeros_like(l)
+    nz = rng > 1e-12
+    low = nz & (l <= 0.5)
+    high = nz & (l > 0.5)
+    s[low] = rng[low] / (cmax[low] + cmin[low])
+    s[high] = rng[high] / (2.0 - cmax[high] - cmin[high])
+
+    if int(colorize_type or 0) == 0:
+        h = np.zeros_like(l)
+        rc = np.zeros_like(l)
+        gc = np.zeros_like(l)
+        bc = np.zeros_like(l)
+        rc[nz] = (cmax[nz] - r[nz]) / rng[nz]
+        gc[nz] = (cmax[nz] - g[nz]) / rng[nz]
+        bc[nz] = (cmax[nz] - b[nz]) / rng[nz]
+        mr = nz & (r == cmax)
+        mg = nz & ~mr & (g == cmax)
+        mb = nz & ~mr & ~mg
+        h[mr] = bc[mr] - gc[mr]
+        h[mg] = 2.0 + rc[mg] - bc[mg]
+        h[mb] = 4.0 + gc[mb] - rc[mb]
+        h = (h / 6.0) % 1.0
+        nh = (h + (tgt_h - avg_h)) % 1.0
+    else:
+        nh = np.full_like(l, tgt_h)
+
+    nl = np.clip(l + (tgt_l - avg_l), 0.0, 1.0)
+    ns = np.clip(s + (tgt_s - avg_s), 0.0, 1.0)
+
+    m2 = np.where(nl <= 0.5, nl * (1.0 + ns), nl + ns - nl * ns)
+    m1 = 2.0 * nl - m2
+
+    def _hue_to_ch(hue):
+        hue = hue % 1.0
+        res = np.full_like(hue, m1)
+        c1 = hue < (1.0 / 6.0)
+        c2 = (~c1) & (hue < 0.5)
+        c3 = (~c1) & (~c2) & (hue < (2.0 / 3.0))
+        res[c1] = m1[c1] + (m2[c1] - m1[c1]) * hue[c1] * 6.0
+        res[c2] = m2[c2]
+        res[c3] = m1[c3] + (m2[c3] - m1[c3]) * ((2.0 / 3.0) - hue[c3]) * 6.0
+        return res
+
+    achrom = ns <= 1e-12
+    nr = np.where(achrom, nl, _hue_to_ch(nh + 1.0 / 3.0))
+    ng = np.where(achrom, nl, _hue_to_ch(nh))
+    nb = np.where(achrom, nl, _hue_to_ch(nh - 1.0 / 3.0))
+
+    out = np.empty_like(arr)
+    out[..., 0] = np.clip(np.rint(nr * 255.0), 0, 255).astype(np.uint8)
+    out[..., 1] = np.clip(np.rint(ng * 255.0), 0, 255).astype(np.uint8)
+    out[..., 2] = np.clip(np.rint(nb * 255.0), 0, 255).astype(np.uint8)
+    out[..., 3] = arr[..., 3]
+    return out
+
+
+def _sniff_qt_image_format(raw_bytes, filename=""):
+    head = raw_bytes[:16]
+    if head[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if head[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if head[:2] == b"BM":
+        return "bmp"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if head[:4] in (b"II*\x00", b"MM\x00*"):
+        return "tiff"
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[:4] in (b"DDS ", b"8BPS") or head[:8] == b"\x00\x00\x00\x0cjP  ":
+        return None
+    if b"TRUEVISION-XFILE" in raw_bytes[-26:]:
+        return "tga"
+    ext = filename.replace("\\", "/").rsplit("/", 1)[-1].rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return {
+        "tga": "tga",
+        "tif": "tiff",
+        "tiff": "tiff",
+        "webp": "webp",
+        "gif": "gif",
+        "bmp": "bmp",
+        "png": "png",
+        "jpg": "jpeg",
+        "jpeg": "jpeg",
+    }.get(ext)
+
+
+def _decode_qimage_rgba(raw_bytes, filename=""):
+    """Decodes ``raw_bytes`` via ``PySide.QtGui.QImageReader`` into ``(w, h, rgba_bytes)``
+    (top-down ``RGBA8888``), checking ``QImageReader.size()`` first (width and height
+    up to 32,767) and returning ``None`` if unreadable or out of bounds."""
+    if not raw_bytes or len(raw_bytes) > _MAX_TEXTURE_BLOB_BYTES:
+        return None
+    qt_fmt = _sniff_qt_image_format(raw_bytes, filename or "")
+    if not qt_fmt:
+        return None
+    try:
+        from PySide import QtCore, QtGui
+    except Exception:
+        return None
+
+    try:
+        qbuf = QtCore.QBuffer()
+        qbuf.setData(raw_bytes)
+        qbuf.open(QtCore.QIODevice.ReadOnly)
+        fmt_ba = QtCore.QByteArray(qt_fmt.encode("ascii"))
+        rdr = None
+        try:
+            rdr = QtGui.QImageReader(qbuf, fmt_ba)
+            if hasattr(rdr, "setAllocationLimit"):
+                rdr.setAllocationLimit(256)
+            if not rdr.canRead():
+                return None
+            sz = rdr.size()
+            if sz.isValid():
+                sw, sh = sz.width(), sz.height()
+                if (
+                    sw <= 0
+                    or sh <= 0
+                    or sw > _MAX_TEXTURE_DIMENSION
+                    or sh > _MAX_TEXTURE_DIMENSION
+                    or sw * sh > _MAX_TEXTURE_PIXELS
+                ):
+                    return None
+            qimg = rdr.read()
+        finally:
+            if rdr is not None:
+                del rdr
+            qbuf.close()
+            del fmt_ba
+            del qbuf
+        if qimg is None or qimg.isNull():
+            return None
+        w, h = qimg.width(), qimg.height()
+        if (
+            w <= 0
+            or h <= 0
+            or w > _MAX_TEXTURE_DIMENSION
+            or h > _MAX_TEXTURE_DIMENSION
+            or w * h > _MAX_TEXTURE_PIXELS
+        ):
+            return None
+        qimg = qimg.convertToFormat(QtGui.QImage.Format_RGBA8888)
+        bpl = qimg.bytesPerLine()
+        buf = qimg.constBits()
+        raw = buf.tobytes() if hasattr(buf, "tobytes") else bytes(buf)
+        if bpl == w * 4:
+            rgba = raw[: w * h * 4]
+        else:
+            rgba = b"".join(raw[row * bpl : row * bpl + w * 4] for row in range(h))
+        return w, h, rgba
+    except Exception:
+        return None
+
+
+def _validate_qimage_header_and_decode(raw_bytes, filename=""):
+    """Validates ``raw_bytes`` once during ``_prepare_model_textures`` without
+    retaining decoded RGBA buffers in memory."""
+    res = _decode_qimage_rgba(raw_bytes, filename)
+    return res is not None
+
+
+def _decode_gl_texture_tuple(tex_id, raw_bytes, mat_info, doc_uid=None):
+    """Returns ``(w, h, nc, gl_bottom_up_bytes)`` ready for
+    ``coin.SoTexture2().image.setValue(SbVec2s(w, h), nc, gl_bytes)``, or
+    ``None`` when decoding fails."""
+    import numpy as np
+
+    if not isinstance(tex_id, str) or not tex_id or not isinstance(mat_info, dict):
+        return None
+    colorized = bool(mat_info.get("colorized", False))
+    ctype = int(_safe_float(mat_info.get("colorize_type", 0), 0.0))
+    rgba_col = _safe_rgba_u8_list(mat_info.get("rgba"), default=(255, 255, 255, 255))
+    ckey = (
+        tex_id,
+        colorized,
+        ctype if colorized else 0,
+        tuple(rgba_col[:3]) if colorized else (255, 255, 255),
+    )
+    hit = _DECODED_GL_CACHE.get(ckey, doc_uid=doc_uid)
+    if hit is not None:
+        return hit
+    fname_raw = mat_info.get("filename", "")
+    decoded = _decode_qimage_rgba(raw_bytes, fname_raw if isinstance(fname_raw, str) else "")
+    if decoded is None:
+        return None
+    w, h, rgba_top_down = decoded
+    arr = np.frombuffer(rgba_top_down, dtype=np.uint8).reshape((h, w, 4))
+    if colorized:
+        arr = _apply_sketchup_colorize_rgba(arr, rgba_col[:3], ctype)
+    # SketchUp V=0 is the bottom of the image; OpenGL row 0 is also V=0.
+    arr_gl = np.ascontiguousarray(arr[::-1, :, :])
+    has_cutout = bool(np.any(arr_gl[..., 3] < 255))
+    opacity = max(0.0, min(1.0, _safe_float(mat_info.get("opacity", 1.0), 1.0)))
+    if has_cutout or opacity < 1.0 - 1e-6:
+        gl_bytes = arr_gl.tobytes()
+        res = (w, h, 4, gl_bytes)
+    else:
+        gl_bytes = np.ascontiguousarray(arr_gl[..., :3]).tobytes()
+        res = (w, h, 3, gl_bytes)
+    _DECODED_GL_CACHE.put(ckey, res, len(gl_bytes), doc_uid=doc_uid)
+    return res
+
+
+def _extract_face_projections(filepath, model):
+    """Returns ``{face_id: (front_proj_vec_or_None, back_proj_vec_or_None)}`` for
+    faces with projected/draped textures (#30):
+    - Uses ``Face.uv_projection`` / ``uv_projection_back`` directly if exposed
+      by a newer ``openskp`` release.
+    - Otherwise reads ``CFaceTextureCoords`` ``ks[9:12]`` / ``ks[21:24]`` in
+      classic pre-2021 files (only when ``uv_projected`` is set) and ``DC05``
+      ``1427``/``1627`` in 2021+ VFF ``model.dat`` (only when ``1027`` exists).
+    """
+    from openskp.model import Face
+
+    face_fields = getattr(Face, "__dataclass_fields__", {})
+    if "uv_projection" in face_fields:
+        out = {}
+        for defn in [model.root, *model.definitions.values()]:
+            for f in defn.faces.values():
+                fp = getattr(f, "uv_projection", None)
+                bp = getattr(f, "uv_projection_back", None)
+                if fp is not None or bp is not None:
+                    out[f.id] = (fp, bp)
+        return out
+
+    if not filepath or not os.path.isfile(filepath):
+        return {}
+
+    import struct
+    import zipfile
+
+    if zipfile.is_zipfile(filepath):
+        try:
+            with zipfile.ZipFile(filepath, "r") as zf:
+                zinfo = zf.getinfo("model.dat")
+                if zinfo.file_size > _MAX_PACK_TOTAL_BYTES:
+                    return {}
+                with zf.open(zinfo, "r") as zfh:
+                    md = zfh.read(_MAX_PACK_TOTAL_BYTES + 1)
+                if len(md) > _MAX_PACK_TOTAL_BYTES:
+                    return {}
+        except Exception:
+            return {}
+        if b"\x10\x27" not in md:
+            return {}
+        from openskp import _core
+
+        def _find_tlv(seq, tag_hex):
+            for t, body in seq:
+                if t == tag_hex:
+                    return body
+            return None
+
+        out = {}
+        pos = 0
+        n = len(md)
+        while True:
+            j = md.find(b"\xdc\x05", pos)
+            if j < 0:
+                break
+            pos = j + 1
+            if j + 12 > n:
+                continue
+            ln = struct.unpack_from("<I", md, j + 2)[0]
+            if ln < 20 or j + 6 + ln > n:
+                continue
+            dc_body = md[j + 6 : j + 6 + ln]
+            if dc_body[0:2] != b"\xde\x05" or b"\x10\x27" not in dc_body:
+                continue
+            de_len = struct.unpack_from("<I", dc_body, 2)[0]
+            if 6 + de_len > len(dc_body):
+                continue
+            f_id = _core.parse_var_int(dc_body, 6, de_len)
+            dd05 = _find_tlv(_core._tlv_flat(dc_body), "DD05")
+            b136 = _find_tlv(_core._tlv_flat(dd05), "B136") if dd05 else None
+            b236 = _find_tlv(_core._tlv_flat(b136), "B236") if b136 else None
+            t1027 = _find_tlv(_core._tlv_flat(b236), "1027") if b236 else None
+            if t1027 is None:
+                continue
+            sides = _core._tlv_flat(t1027)
+            p_vecs = []
+            for side_tag in ("1127", "1227"):
+                sbody = _find_tlv(sides, side_tag)
+                t1327 = _find_tlv(_core._tlv_flat(sbody), "1327") if sbody else None
+                pvec = None
+                if t1327 is not None:
+                    sub = _core._tlv_flat(t1327)
+                    t1427 = _find_tlv(sub, "1427")
+                    t1627 = _find_tlv(sub, "1627")
+                    flags = struct.unpack_from("<I", t1427, 0)[0] if t1427 and len(t1427) >= 4 else 0
+                    if (flags & 2) and t1627 and len(t1627) == 24:
+                        cand = struct.unpack("<3d", t1627)
+                        if cand[0] * cand[0] + cand[1] * cand[1] + cand[2] * cand[2] > 1e-18:
+                            pvec = cand
+                p_vecs.append(pvec)
+            if p_vecs[0] is not None or p_vecs[1] is not None:
+                out[f_id] = (p_vecs[0], p_vecs[1])
+        return out
+
+    has_any_proj = any(
+        getattr(f, "uv_projected", False) or getattr(f, "uv_projected_back", False)
+        for defn in [model.root, *model.definitions.values()]
+        for f in defn.faces.values()
+    )
+    if not has_any_proj:
+        return {}
+
+    try:
+        from openskp import legacy
+
+        orig_ftc = legacy._READERS.get("CFaceTextureCoords")
+        if orig_ftc is None:
+            return {}
+
+        def _ftc_with_proj(ar, r):
+            pos0 = r.pos
+            legacy._preamble(ar, r)
+            r.u32()
+            ks = r.f64s(24)
+            r.pos = pos0
+            res = orig_ftc(ar, r)
+            res["_front_proj_vec"] = tuple(ks[9:12]) if res.get("front_projected") else None
+            res["_back_proj_vec"] = tuple(ks[21:24]) if res.get("back_projected") else None
+            return res
+
+        raw_bytes = _real_open(filepath, "rb").read()
+        legacy._READERS["CFaceTextureCoords"] = _ftc_with_proj
+        try:
+            ar, _root, _layers, _materials = legacy._walk(raw_bytes)
+        finally:
+            legacy._READERS["CFaceTextureCoords"] = orig_ftc
+
+        face_projs = {}
+        for s, ent in ar.slots.items():
+            if ent[0] == "obj" and ent[1] == "CFace" and isinstance(ent[2], dict):
+                attrs = ent[2].get("attrs")
+                if isinstance(attrs, dict):
+                    for _cn, cv in attrs.get("children", ()):
+                        if isinstance(cv, dict) and cv.get("k") == "ftc":
+                            fp = cv.get("_front_proj_vec")
+                            bp = cv.get("_back_proj_vec")
+                            if fp is not None or bp is not None:
+                                face_projs[s] = (fp, bp)
+        return face_projs
+    except Exception:
+        return {}
+    return {}
+
+
+def _prepare_model_textures(model, filepath, stats, doc=None):
+    """Validates and deduplicates all textured materials referenced in ``model``
+    once per import (`textures=True`, #30). Any unreadable or corrupt texture is
+    counted in ``stats['textures_failed']`` and reported once without stopping
+    the import; affected faces fall back to solid ``DiffuseColor``."""
+    import hashlib
+    import json
+    from openskp.scene import _describe_image_format
+
+    doc_uid = _doc_uid(doc)
+    used_mat_ids = set()
+    for defn in [model.root, *model.definitions.values()]:
+        for f in defn.faces.values():
+            if f.material_id is not None:
+                used_mat_ids.add(f.material_id)
+            if f.back_material_id is not None:
+                used_mat_ids.add(f.back_material_id)
+        for inst in defn.instances:
+            if inst.material_id is not None:
+                used_mat_ids.add(inst.material_id)
+
+    tex_blobs = {}
+    failed_tex_ids = {}
+    failed_details = []
+    mat_entries = {}
+    mat_id_to_key = {}
+    seen_mat_obj_to_key = {}
+
+    for mid in sorted(used_mat_ids):
+        mat = model.materials_by_id.get(mid)
+        if mat is None or mat.texture is None:
+            continue
+        if id(mat) in seen_mat_obj_to_key:
+            mapped = seen_mat_obj_to_key[id(mat)]
+            if mapped is not None:
+                mat_id_to_key[mid] = mapped
+            continue
+
+        raw_data = mat.texture.data
+        fname = mat.texture.filename or ""
+        if not raw_data:
+            seen_mat_obj_to_key[id(mat)] = None
+            stats["textures_failed"] += 1
+            failed_details.append(f"{mat.name or '(unnamed)'} (empty image data)")
+            continue
+
+        tex_id = hashlib.sha256(raw_data).hexdigest()[:24]
+        if tex_id in failed_tex_ids:
+            seen_mat_obj_to_key[id(mat)] = None
+            stats["textures_failed"] += 1
+            failed_details.append(f"{mat.name or '(unnamed)'} ({failed_tex_ids[tex_id]})")
+            continue
+
+        if tex_id not in tex_blobs:
+            if not _validate_qimage_header_and_decode(raw_data, fname):
+                fmt = _describe_image_format(raw_data, fname)
+                failed_tex_ids[tex_id] = fmt
+                seen_mat_obj_to_key[id(mat)] = None
+                stats["textures_failed"] += 1
+                failed_details.append(f"{mat.name or '(unnamed)'} ({fmt})")
+                continue
+            tex_blobs[tex_id] = raw_data
+            _PROCESS_TEX_CACHE.put(tex_id, raw_data, len(raw_data), doc_uid=doc_uid)
+
+        r, g, b, a = mat.color
+        opacity = (a / 255.0) * mat.transparency
+        tw = float(mat.texture.width) if mat.texture.width and mat.texture.width > 1e-9 else 1.0
+        th = float(mat.texture.height) if mat.texture.height and mat.texture.height > 1e-9 else 1.0
+        m_sig = f"{mat.name}:{r},{g},{b},{a}:{opacity:.6f}:{tex_id}:{tw:.6f}:{th:.6f}:{int(mat.colorized)}:{mat.colorize_type}"
+        mat_key = "m_" + hashlib.sha256(m_sig.encode("utf-8")).hexdigest()[:16]
+        entry = {
+            "name": mat.name or f"Material_{mid}",
+            "rgba": [int(r), int(g), int(b), int(a)],
+            "opacity": float(opacity),
+            "tex_id": tex_id,
+            "filename": os.path.basename(fname.replace("\\", "/")),
+            "tile_w": tw,
+            "tile_h": th,
+            "colorized": bool(mat.colorized),
+            "colorize_type": int(mat.colorize_type or 0),
+        }
+        mat_entries[mat_key] = entry
+        _PROCESS_MAT_CACHE.put(mat_key, entry, len(json.dumps(entry)), doc_uid=doc_uid)
+        seen_mat_obj_to_key[id(mat)] = mat_key
+        mat_id_to_key[mid] = mat_key
+
+    stats["textures_loaded"] = len(tex_blobs)
+    stats["textured_materials"] = len(mat_entries)
+    if failed_details:
+        stats["_failed_texture_details"] = failed_details
+
+    face_projections = _extract_face_projections(filepath, model) if mat_entries else {}
+    ctx = {
+        "doc_uid": doc_uid,
+        "tex_blobs": tex_blobs,
+        "mat_entries": mat_entries,
+        "mat_id_to_key": mat_id_to_key,
+        "face_projections": face_projections,
+        "store_looked_up": False,
+        "store_obj": None,
+        "used_mats": {},
+        "used_blobs": {},
+        "defer_pack_write": True,
+    }
+    if doc_uid is not None:
+        _ACTIVE_IMPORT_TEX_CTX_BY_DOC[doc_uid] = ctx
+    return ctx
+
+
+class _LazyZipBlobMap:
+    """Read-only mapping backed by a ``ZIP_STORED`` ``TexturePack`` on disk for
+    large texture packs (> ``_STORE_UNPACK_CACHE.max_bytes``), reading individual
+    blobs on demand without holding the entire pack in Python memory."""
+
+    def __init__(self, pack_path, member_by_tid):
+        self._pack_path = pack_path
+        self._member_by_tid = dict(member_by_tid)
+
+    def __len__(self):
+        return len(self._member_by_tid)
+
+    def __contains__(self, tid):
+        return tid in self._member_by_tid
+
+    def keys(self):
+        return self._member_by_tid.keys()
+
+    def get(self, tid, default=None):
+        import zipfile
+
+        zn = self._member_by_tid.get(tid)
+        if zn is None or not os.path.isfile(self._pack_path):
+            return default
+        try:
+            with zipfile.ZipFile(self._pack_path, "r") as zf:
+                zinfo = zf.getinfo(zn)
+                if zinfo.file_size > _MAX_TEXTURE_BLOB_BYTES:
+                    return default
+                with zf.open(zinfo, "r") as zfh:
+                    data = zfh.read(_MAX_TEXTURE_BLOB_BYTES + 1)
+                if len(data) > _MAX_TEXTURE_BLOB_BYTES:
+                    return default
+                return data
+        except Exception:
+            return default
+
+    def __getitem__(self, tid):
+        val = self.get(tid, None)
+        if val is None:
+            raise KeyError(tid)
+        return val
+
+    def items(self):
+        for tid in self._member_by_tid:
+            val = self.get(tid, None)
+            if val is not None:
+                yield tid, val
+
+
+def _notify_texture_store_updated(store_fp):
+    if store_fp is None:
+        return
+    doc = getattr(store_fp, "Document", None)
+    uid = _doc_uid(doc) if doc is not None else None
+    if uid is not None:
+        if uid in _ACTIVE_IMPORT_TEX_CTX_BY_DOC:
+            return
+        _UNRESOLVED_MISSING_KEYS_BY_DOC.pop(uid, None)
+        if _UNRESOLVED_PASTE_OBJS_BY_DOC.get(uid):
+            try:
+                _sync_pasted_textures_for_document(doc)
+            except Exception:
+                pass
+    if App.GuiUp:
+        for in_obj in getattr(store_fp, "InList", ()) or ():
+            iv = getattr(in_obj, "ViewObject", None)
+            vp = getattr(iv, "Proxy", None) if iv is not None else None
+            if isinstance(vp, _TexturedViewProviderProxy) and getattr(vp, "_had_unresolved_textures", False):
+                vp._rebuild_if_needed(in_obj)
+
+
+class _TextureStoreProxy:
+    """Document-wide texture store (`OpenSKPTextures`), storing each unique
+    texture image's raw bytes once per document in `TexturePack`."""
+
+    def execute(self, fp):
+        _notify_texture_store_updated(fp)
+
+    def onChanged(self, fp, prop):
+        if prop in ("TexturePack", "MaterialsJSON"):
+            _notify_texture_store_updated(fp)
+
+    def onDocumentRestored(self, fp):
+        if App.GuiUp:
+            if hasattr(fp, "ViewObject") and fp.ViewObject is not None:
+                vobj = fp.ViewObject
+                if not isinstance(getattr(vobj, "Proxy", None), _TextureStoreViewProviderProxy):
+                    _TextureStoreViewProviderProxy(vobj)
+                vobj.Visibility = False
+                if hasattr(vobj, "ShowInTree"):
+                    try:
+                        vobj.ShowInTree = False
+                    except Exception:
+                        pass
+        _notify_texture_store_updated(fp)
+
+    def dumps(self):
+        return {}
+
+    def loads(self, state):
+        return None
+
+
+class _TextureStoreViewProviderProxy:
+    def __init__(self, vobj=None):
+        if vobj is not None:
+            vobj.Proxy = self
+
+    def attach(self, vobj):
+        self.vobj = vobj
+
+    def getDisplayModes(self, vobj):
+        return ["Standard"]
+
+    def getDefaultDisplayMode(self):
+        return "Standard"
+
+    def setDisplayMode(self, mode):
+        return mode
+
+    def dumps(self):
+        return {}
+
+    def loads(self, state):
+        return None
+
+
+def _parse_materials_json_dict(raw_mats):
+    import json
+
+    if not raw_mats or not isinstance(raw_mats, str) or len(raw_mats) > 16 * 1024 * 1024:
+        return {}
+    try:
+        parsed = json.loads(raw_mats)
+    except Exception:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {k: v for k, v in parsed.items() if isinstance(k, str) and isinstance(v, dict)}
+
+
+def _read_store_pack(store_obj):
+    """Returns ``(materials_dict, tex_blobs_mapping)`` from ``store_obj``, keeping
+    at most the single newest unpacked version per store in ``_STORE_UNPACK_CACHE``."""
+    import json
+    import zipfile
+
+    if store_obj is None:
+        return {}, {}
+    doc_uid = _doc_uid(getattr(store_obj, "Document", None))
+    store_key = (doc_uid, getattr(store_obj, "Name", "") or str(id(store_obj)))
+    raw_mats = getattr(store_obj, "MaterialsJSON", "") or ""
+    pack_path = getattr(store_obj, "TexturePack", "") or ""
+    mtime = 0
+    fsize = 0
+    if pack_path and os.path.isfile(pack_path):
+        try:
+            st = os.stat(pack_path)
+            mtime = st.st_mtime_ns
+            fsize = st.st_size
+        except OSError:
+            mtime = 0
+            fsize = 0
+    pack_sig = (pack_path, mtime, fsize, len(raw_mats), hash(raw_mats))
+    cached = _STORE_UNPACK_CACHE.get(store_key, doc_uid=doc_uid)
+    if cached is not None and cached[0] == pack_sig:
+        return cached[1], cached[2]
+
+    mats = _parse_materials_json_dict(raw_mats)
+    for mk, mv in mats.items():
+        _PROCESS_MAT_CACHE.put(mk, mv, len(json.dumps(mv)), doc_uid=doc_uid)
+
+    if not (pack_path and os.path.isfile(pack_path)):
+        _STORE_UNPACK_CACHE.put(store_key, (pack_sig, mats, {}), max(1, len(raw_mats)), doc_uid=doc_uid)
+        return mats, {}
+
+    blobs = {}
+    member_by_tid = {}
+    total_unpacked = 0
+    use_lazy = fsize > _STORE_UNPACK_CACHE.max_bytes
+    try:
+        with zipfile.ZipFile(pack_path, "r") as zf:
+            infos = [zi for zi in zf.infolist() if not zi.is_dir()]
+            sum_decl = sum(max(0, zi.file_size) for zi in infos)
+            if sum_decl > _MAX_PACK_TOTAL_BYTES:
+                use_lazy = True
+            elif sum_decl > _STORE_UNPACK_CACHE.max_bytes:
+                use_lazy = True
+            for zi in infos:
+                if zi.file_size > _MAX_TEXTURE_BLOB_BYTES:
+                    continue
+                tid = os.path.splitext(os.path.basename(zi.filename))[0]
+                if not tid:
+                    continue
+                if use_lazy:
+                    member_by_tid[tid] = zi.filename
+                else:
+                    if total_unpacked + zi.file_size > _MAX_PACK_TOTAL_BYTES:
+                        continue
+                    with zf.open(zi, "r") as zfh:
+                        data = zfh.read(_MAX_TEXTURE_BLOB_BYTES + 1)
+                    if len(data) > _MAX_TEXTURE_BLOB_BYTES:
+                        continue
+                    blobs[tid] = data
+                    total_unpacked += len(data)
+                    _PROCESS_TEX_CACHE.put(tid, data, len(data), doc_uid=doc_uid)
+    except Exception:
+        blobs = {}
+        member_by_tid = {}
+
+    if use_lazy:
+        lazy_map = _LazyZipBlobMap(pack_path, member_by_tid)
+        _STORE_UNPACK_CACHE.put(
+            store_key,
+            (pack_sig, mats, lazy_map),
+            max(1, len(raw_mats) + len(member_by_tid) * 64),
+            doc_uid=doc_uid,
+        )
+        return mats, lazy_map
+
+    _STORE_UNPACK_CACHE.put(
+        store_key,
+        (pack_sig, mats, blobs),
+        max(1, len(raw_mats) + total_unpacked),
+        doc_uid=doc_uid,
+    )
+    return mats, blobs
+
+
+def _write_store_pack(store_obj, mats_dict, blobs_dict):
+    import json
+    import tempfile
+    import zipfile
+
+    doc_uid = _doc_uid(getattr(store_obj, "Document", None))
+    store_key = (doc_uid, getattr(store_obj, "Name", "") or str(id(store_obj)))
+    raw_mats_str = json.dumps(mats_dict, separators=(",", ":"))
+    store_obj.MaterialsJSON = raw_mats_str
+    fd, tmp_zip = tempfile.mkstemp(suffix=".zip")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            with zipfile.ZipFile(fh, "w", compression=zipfile.ZIP_STORED) as zf:
+                for tid in sorted(blobs_dict.keys()):
+                    raw = blobs_dict[tid]
+                    if raw is not None and len(raw) <= _MAX_TEXTURE_BLOB_BYTES:
+                        zf.writestr(f"{tid}.bin", raw)
+        store_obj.TexturePack = tmp_zip
+    finally:
+        try:
+            os.remove(tmp_zip)
+        except OSError:
+            pass
+
+    _STORE_UNPACK_CACHE.evict_prefix(store_key)
+    pack_path = getattr(store_obj, "TexturePack", "") or ""
+    if pack_path and os.path.isfile(pack_path):
+        try:
+            st = os.stat(pack_path)
+            pack_sig = (pack_path, st.st_mtime_ns, st.st_size, len(raw_mats_str), hash(raw_mats_str))
+            if st.st_size <= _STORE_UNPACK_CACHE.max_bytes and isinstance(blobs_dict, dict):
+                plain_blobs = dict(blobs_dict)
+                nb = len(raw_mats_str) + sum(len(v) for v in plain_blobs.values())
+                _STORE_UNPACK_CACHE.put(store_key, (pack_sig, dict(mats_dict), plain_blobs), max(1, nb), doc_uid=doc_uid)
+            else:
+                members = {tid: f"{tid}.bin" for tid in blobs_dict.keys()}
+                lazy_map = _LazyZipBlobMap(pack_path, members)
+                _STORE_UNPACK_CACHE.put(
+                    store_key,
+                    (pack_sig, dict(mats_dict), lazy_map),
+                    max(1, len(raw_mats_str) + len(members) * 64),
+                    doc_uid=doc_uid,
+                )
+        except OSError:
+            pass
+
+
+def _find_or_create_empty_texture_store(doc):
+    for obj in doc.Objects:
+        if getattr(obj, "IsSketchUpTextureStore", False):
+            return obj
+    store = doc.addObject("App::FeaturePython", "OpenSKPTextures")
+    store.Label = "SketchUp textures"
+    store.addProperty(
+        "App::PropertyBool",
+        "IsSketchUpTextureStore",
+        "SketchUp",
+        "Holds deduplicated texture images shared across SketchUp objects in this document",
+    )
+    store.IsSketchUpTextureStore = True
+    store.addProperty(
+        "App::PropertyFileIncluded",
+        "TexturePack",
+        "SketchUp",
+        "Packed SketchUp texture images (each image stored once per document)",
+    )
+    store.addProperty(
+        "App::PropertyString",
+        "MaterialsJSON",
+        "SketchUp",
+        "SketchUp textured material descriptors",
+    )
+    for hidden_prop in ("IsSketchUpTextureStore", "MaterialsJSON"):
+        try:
+            store.setEditorMode(hidden_prop, 2)
+        except Exception:
+            pass
+    store.Proxy = _TextureStoreProxy()
+    store.Visibility = False
+    if App.GuiUp and hasattr(store, "ViewObject") and store.ViewObject is not None:
+        _TextureStoreViewProviderProxy(store.ViewObject)
+        store.ViewObject.Visibility = False
+        if hasattr(store.ViewObject, "ShowInTree"):
+            try:
+                store.ViewObject.ShowInTree = False
+            except Exception:
+                pass
+    return store
+
+
+def _ensure_document_texture_store(doc, tex_blobs, mat_entries):
+    """Returns ``doc``'s single ``OpenSKPTextures`` object, merging deduplicated
+    images when called outside an active batch import (e.g. cross-doc paste)."""
+    store = _find_or_create_empty_texture_store(doc)
+    if getattr(store, "TexturePack", "") or getattr(store, "MaterialsJSON", ""):
+        existing_mats, existing_blobs_map = _read_store_pack(store)
+        merged_mats = dict(existing_mats)
+        merged_blobs = dict(existing_blobs_map.items())
+    else:
+        merged_mats = {}
+        merged_blobs = {}
+    changed = False
+    for mk, mv in mat_entries.items():
+        if mk not in merged_mats:
+            merged_mats[mk] = mv
+            changed = True
+        tid = mv.get("tex_id")
+        if tid and tid not in merged_blobs and tid in tex_blobs:
+            merged_blobs[tid] = tex_blobs[tid]
+            changed = True
+    if changed or not getattr(store, "TexturePack", ""):
+        _write_store_pack(store, merged_mats, merged_blobs)
+    return store
+
+
+def _acquire_import_texture_store(doc, tex_ctx, needed_blobs, needed_mats):
+    """Searches/creates ``doc``'s ``OpenSKPTextures`` once per import and batches
+    ``needed_blobs`` / ``needed_mats`` in memory so ``TexturePack`` is written
+    once at the end of ``import_skp`` instead of once per object."""
+    if not tex_ctx.get("store_looked_up"):
+        tex_ctx["store_obj"] = _find_or_create_empty_texture_store(doc)
+        tex_ctx["store_looked_up"] = True
+    tex_ctx["used_mats"].update(needed_mats)
+    tex_ctx["used_blobs"].update(needed_blobs)
+    return tex_ctx["store_obj"]
+
+
+def _finalize_import_texture_store(doc, tex_ctx):
+    if tex_ctx is None:
+        return
+    store = tex_ctx.get("store_obj")
+    used_mats = tex_ctx.get("used_mats") or {}
+    used_blobs = tex_ctx.get("used_blobs") or {}
+    if store is None or (not used_mats and not used_blobs):
+        return
+    if getattr(store, "TexturePack", "") or getattr(store, "MaterialsJSON", ""):
+        existing_mats, existing_blobs_map = _read_store_pack(store)
+        merged_mats = dict(existing_mats)
+        merged_blobs = dict(existing_blobs_map.items())
+    else:
+        merged_mats = {}
+        merged_blobs = {}
+    changed = False
+    for mk, mv in used_mats.items():
+        if mk not in merged_mats:
+            merged_mats[mk] = mv
+            changed = True
+    for tid, raw in used_blobs.items():
+        if tid not in merged_blobs:
+            merged_blobs[tid] = raw
+            changed = True
+    if changed or not getattr(store, "TexturePack", ""):
+        _write_store_pack(store, merged_mats, merged_blobs)
+
+
+def _resolve_object_materials_and_blobs(fp):
+    """Returns ``(mats_dict, blobs_mapping)`` for a textured ``Part::FeaturePython``
+    from an active import context or its linked ``OpenSKPTextures`` store."""
+    doc = getattr(fp, "Document", None)
+    doc_uid = _doc_uid(doc)
+    active_ctx = _ACTIVE_IMPORT_TEX_CTX_BY_DOC.get(doc_uid) if doc_uid is not None else None
+    store = getattr(fp, "SketchUpTextureStore", None)
+    if active_ctx is not None and (not getattr(store, "TexturePack", "")):
+        return active_ctx["mat_entries"], active_ctx["tex_blobs"]
+    mats, blobs = _read_store_pack(store)
+    return mats, blobs
+
+
+def _valid_face_uv_side(side):
+    if not isinstance(side, (list, tuple)) or len(side) < 5:
+        return False
+    kind = side[0]
+    if kind == "t":
+        if not isinstance(side[1], str) or not side[1]:
+            return False
+        b_raw, uv_xf, inv_m12 = side[2], side[3], side[4]
+        if b_raw is not None and (
+            not isinstance(b_raw, (list, tuple)) or len(b_raw) != 3 or not all(_is_finite_num(v) for v in b_raw)
+        ):
+            return False
+        if uv_xf is not None and (
+            not isinstance(uv_xf, (list, tuple)) or len(uv_xf) != 9 or not all(_is_finite_num(v) for v in uv_xf)
+        ):
+            return False
+        if inv_m12 is not None and (
+            not isinstance(inv_m12, (list, tuple)) or len(inv_m12) != 12 or not all(_is_finite_num(v) for v in inv_m12)
+        ):
+            return False
+        return True
+    if kind == "s":
+        if not all(_is_finite_num(v) for v in side[1:5]):
+            return False
+        if len(side) >= 6 and side[5] is not None and not isinstance(side[5], str):
+            return False
+        return True
+    return False
+
+
+def _parse_face_uvs_payload(raw_uv):
+    import json
+
+    if not raw_uv or not isinstance(raw_uv, str) or len(raw_uv) > _MAX_FACE_UV_JSON_BYTES:
+        return None
+    try:
+        payload = json.loads(raw_uv)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    faces = payload.get("faces")
+    if not isinstance(faces, list):
+        return None
+    clean_faces = []
+    any_repaired = False
+    for rec in faces:
+        if not isinstance(rec, (list, tuple)) or len(rec) < 3:
+            clean_faces.append((None, None, 0))
+            any_repaired = True
+            continue
+        raw_front, raw_back, raw_flip = rec[0], rec[1], rec[2]
+        front_ok = _valid_face_uv_side(raw_front)
+        back_ok = raw_back is None or _valid_face_uv_side(raw_back)
+        flip_ok = isinstance(raw_flip, (int, bool)) and raw_flip in (0, 1, False, True)
+        if front_ok and back_ok and flip_ok:
+            clean_faces.append(rec)
+        else:
+            clean_faces.append((
+                raw_front if front_ok else None,
+                raw_back if (raw_back is not None and back_ok) else None,
+                1 if (flip_ok and (raw_flip is True or raw_flip == 1)) else 0,
+            ))
+            any_repaired = True
+    if any_repaired:
+        out = dict(payload)
+        out["faces"] = clean_faces
+        return out
+    return payload
+
+
+def _unplaced_shape(fp):
+    """Returns ``fp.Shape`` with ``fp.Placement`` stripped into a mutable
+    ``Part.Shape`` wrapper sharing the same OCCT ``TopoDS_TShape``, so
+    ``ViewProvider``'s ``pcTransform`` applies ``Placement`` once and local UV
+    coordinates never swim."""
+    shape = getattr(fp, "Shape", None)
+    if shape is None or shape.isNull():
+        return shape
+    pl = getattr(fp, "Placement", None)
+    if pl is not None and not pl.isIdentity():
+        sh = Part.Shape(shape)
+        sh.Placement = App.Placement()
+        return sh
+    return shape
+
+
+def _same_local_tshape(s1, s2):
+    if s1 is None or s2 is None or s1.isNull() or s2.isNull():
+        return False
+    try:
+        return bool(s1.isPartner(s2)) and s1.Orientation == s2.Orientation
+    except Exception:
+        return False
+
+
+def _initial_side_diffuse_rgba(side_entry, mats_dict, doc_uid=None):
+    if isinstance(side_entry, (list, tuple)) and side_entry:
+        if side_entry[0] == "t" and len(side_entry) >= 2:
+            mk = side_entry[1]
+            if not isinstance(mk, str) or not mk:
+                return _DEFAULT_FACE_RGBA
+            mi = mats_dict.get(mk) if isinstance(mats_dict, dict) else None
+            if mi is None:
+                mi = _PROCESS_MAT_CACHE.get(mk, doc_uid=doc_uid)
+            if isinstance(mi, dict):
+                rc = _safe_rgba_u8_list(mi.get("rgba"), default=(200, 200, 200, 255))
+                op = max(0.0, min(1.0, _safe_float(mi.get("opacity", 1.0), 1.0)))
+                return (rc[0] / 255.0, rc[1] / 255.0, rc[2] / 255.0, op)
+        elif len(side_entry) >= 5:
+            return _safe_rgba_float(side_entry[1:5], default=_DEFAULT_FACE_RGBA)
+    return _DEFAULT_FACE_RGBA
+
+
+_TEXTURE_DOC_OBSERVER = None
+
+
+class _TextureDocumentObserver:
+    """Switches ``"Textured"`` ViewProviders to ``"Flat Lines"`` while writing an
+    ``.FCStd`` archive (restoring ``"Textured"`` immediately after save, even if
+    saving fails, and preserving any non-``"Textured"`` mode chosen by the user),
+    and releases per-object and per-document caches when objects or documents close (#30)."""
+
+    def __init__(self):
+        self._saved_modes = {}  # doc_uid -> (doc_name, [obj_name, ...])
+
+    def _restore_doc_modes(self, uid):
+        entry = self._saved_modes.pop(uid, None)
+        if not entry:
+            return
+        doc_name, names = entry
+        try:
+            doc = App.getDocument(doc_name)
+        except Exception:
+            doc = None
+        if doc is None or _doc_uid(doc) != uid:
+            return
+        for name in names:
+            obj = doc.getObject(name)
+            vobj = getattr(obj, "ViewObject", None) if obj is not None else None
+            vp = getattr(vobj, "Proxy", None) if vobj is not None else None
+            if vobj is not None and isinstance(vp, _TexturedViewProviderProxy):
+                vp._switching_for_save = True
+                try:
+                    vobj.DisplayMode = "Textured"
+                except Exception:
+                    pass
+                finally:
+                    vp._switching_for_save = False
+
+    def slotStartSaveDocument(self, doc, *args):
+        if not App.GuiUp or doc is None:
+            return
+        uid = _doc_uid(doc)
+        switched = []
+        for obj in getattr(doc, "Objects", ()):
+            vobj = getattr(obj, "ViewObject", None)
+            vp = getattr(vobj, "Proxy", None) if vobj is not None else None
+            if vobj is not None and isinstance(vp, _TexturedViewProviderProxy):
+                try:
+                    if vobj.DisplayMode == "Textured":
+                        vp._user_display_mode = "Textured"
+                        vp._switching_for_save = True
+                        try:
+                            vobj.DisplayMode = "Flat Lines"
+                        finally:
+                            vp._switching_for_save = False
+                        switched.append(obj.Name)
+                    else:
+                        vp._user_display_mode = str(vobj.DisplayMode)
+                except Exception:
+                    pass
+        if switched:
+            self._saved_modes[uid] = (doc.Name, switched)
+            try:
+                from PySide import QtCore
+
+                QtCore.QTimer.singleShot(0, lambda u=uid: self._restore_doc_modes(u))
+            except Exception:
+                pass
+
+    def slotFinishSaveDocument(self, doc, *args):
+        if not App.GuiUp or doc is None:
+            return
+        self._restore_doc_modes(_doc_uid(doc))
+
+    def slotFinishRestoreDocument(self, doc, *args):
+        if not App.GuiUp or doc is None:
+            return
+        for obj in getattr(doc, "Objects", ()):
+            proxy = getattr(obj, "Proxy", None)
+            if isinstance(proxy, _TexturedObjectProxy):
+                proxy._ensure_gui_view_provider(obj, on_restore=True)
+
+    def slotDeletedObject(self, obj, *args):
+        vobj = getattr(obj, "ViewObject", None) if obj is not None else None
+        vp = getattr(vobj, "Proxy", None) if vobj is not None else None
+        if isinstance(vp, _TexturedViewProviderProxy):
+            vp._replace_held_tex_keys(set())
+
+    def slotDeletedDocument(self, doc, *args):
+        if doc is not None:
+            self._saved_modes.pop(_doc_uid(doc), None)
+        _clear_doc_texture_caches(doc)
+
+
+def _ensure_texture_doc_observer():
+    global _TEXTURE_DOC_OBSERVER
+    if _TEXTURE_DOC_OBSERVER is not None:
+        return
+    if App is not None and hasattr(App, "addDocumentObserver"):
+        try:
+            obs = _TextureDocumentObserver()
+            App.addDocumentObserver(obs)
+            _TEXTURE_DOC_OBSERVER = obs
+        except Exception:
+            pass
+
+
+def _collect_object_needed_mat_keys(fp):
+    payload = _parse_face_uvs_payload(getattr(fp, "SketchUpFaceUVsJSON", "") or "")
+    if payload is None:
+        return None
+    mks = set()
+    for rec in payload.get("faces", ()):
+        for side in (rec[0], rec[1]):
+            if side is not None and side[0] == "t" and isinstance(side[1], str) and side[1]:
+                mks.add(side[1])
+    return mks
+
+
+def _find_doc_texture_store_fast(doc):
+    if doc is None:
+        return None
+    try:
+        cand = doc.getObject("OpenSKPTextures")
+        if cand is not None and getattr(cand, "IsSketchUpTextureStore", False):
+            return cand
+    except Exception:
+        pass
+    doc_uid = _doc_uid(doc)
+    objs = getattr(doc, "Objects", ()) or ()
+    neg_ent = _UNRESOLVED_MISSING_KEYS_BY_DOC.get(doc_uid)
+    if neg_ent is not None and neg_ent[0] == len(objs) and neg_ent[1] is None:
+        return None
+    for o in objs:
+        if getattr(o, "IsSketchUpTextureStore", False):
+            return o
+    return None
+
+
+def _open_stores_token():
+    try:
+        open_docs = list(App.listDocuments().values())
+    except Exception:
+        open_docs = []
+    parts = []
+    for d in open_docs:
+        st = _find_doc_texture_store_fast(d)
+        if st is not None:
+            raw_m = getattr(st, "MaterialsJSON", "") or ""
+            parts.append((_doc_uid(d), st.Name, getattr(st, "TexturePack", "") or "", len(raw_m), hash(raw_m)))
+    return tuple(parts)
+
+
+def _sync_pasted_textures_for_document(doc):
+    """Resolves textured materials and image blobs for unlinked pasted
+    ``Part::FeaturePython`` objects in ``doc`` in a single batch pass while
+    scanning only newly added objects since the last check under the same open
+    store state (avoiding quadratic ``doc.Objects`` rescans on unresolved pastes)."""
+    if doc is None:
+        return
+    doc_uid = _doc_uid(doc)
+    if doc_uid is not None and doc_uid in _ACTIVE_IMPORT_TEX_CTX_BY_DOC:
+        return
+
+    all_objs = list(getattr(doc, "Objects", ()) or ())
+    objs_len = len(all_objs)
+    existing_store = _find_doc_texture_store_fast(doc)
+    existing_store_name = existing_store.Name if existing_store is not None else None
+    stores_tok = _open_stores_token()
+    neg_state = _UNRESOLVED_MISSING_KEYS_BY_DOC.get(doc_uid)
+    same_env = (
+        neg_state is not None
+        and neg_state[1] == existing_store_name
+        and neg_state[2] == stores_tok
+    )
+
+    if same_env:
+        start_idx = min(neg_state[0], objs_len)
+        candidates = all_objs[start_idx:]
+    else:
+        tracked = _UNRESOLVED_PASTE_OBJS_BY_DOC.get(doc_uid)
+        if tracked:
+            seen_names = set()
+            candidates = []
+            for nm in list(tracked):
+                o_t = doc.getObject(nm)
+                if o_t is not None:
+                    candidates.append(o_t)
+                    seen_names.add(nm)
+            for o_a in all_objs:
+                if o_a.Name not in seen_names and getattr(o_a, "SketchUpTextureStore", None) is None:
+                    candidates.append(o_a)
+        else:
+            candidates = all_objs
+
+    pending = []
+    all_needed_mks = set()
+    tracked_set = _UNRESOLVED_PASTE_OBJS_BY_DOC.setdefault(doc_uid, set()) if doc_uid is not None else None
+    for obj in candidates:
+        if obj is None or getattr(obj, "TypeId", "") != "Part::FeaturePython":
+            continue
+        if getattr(obj, "SketchUpTextureStore", None) is not None:
+            if tracked_set is not None:
+                tracked_set.discard(obj.Name)
+            continue
+        if "SketchUpFaceUVsJSON" not in getattr(obj, "PropertiesList", ()):
+            continue
+        mks = _collect_object_needed_mat_keys(obj)
+        if mks:
+            pending.append((obj, mks))
+            all_needed_mks.update(mks)
+
+    if not pending:
+        if same_env and doc_uid is not None:
+            _UNRESOLVED_MISSING_KEYS_BY_DOC[doc_uid] = (objs_len, existing_store_name, stores_tok, neg_state[3])
+        return
+
+    if (
+        same_env
+        and all_needed_mks.issubset(neg_state[3])
+        and all(_PROCESS_MAT_CACHE.get(mk, doc_uid=doc_uid) is None for mk in all_needed_mks)
+    ):
+        _UNRESOLVED_MISSING_KEYS_BY_DOC[doc_uid] = (objs_len, existing_store_name, stores_tok, neg_state[3])
+        if tracked_set is not None:
+            for obj, _ in pending:
+                tracked_set.add(obj.Name)
+        return
+
+    if existing_store is not None:
+        have_mats, have_blobs = _read_store_pack(existing_store)
+    else:
+        have_mats, have_blobs = {}, {}
+
+    resolved_mats = {}
+    resolved_blobs = {}
+    missing_mks = set()
+    missing_tids = set()
+
+    for mk in all_needed_mks:
+        mv = have_mats.get(mk)
+        if not isinstance(mv, dict):
+            mv = _PROCESS_MAT_CACHE.get(mk, doc_uid=doc_uid)
+        if isinstance(mv, dict):
+            resolved_mats[mk] = mv
+            tid = mv.get("tex_id")
+            if isinstance(tid, str) and tid:
+                if tid not in have_blobs:
+                    blob = _PROCESS_TEX_CACHE.get(tid, doc_uid=doc_uid)
+                    if blob is not None:
+                        resolved_blobs[tid] = blob
+                    else:
+                        missing_tids.add(tid)
+        else:
+            missing_mks.add(mk)
+
+    if missing_mks or missing_tids:
+        try:
+            open_docs = list(App.listDocuments().values())
+        except Exception:
+            open_docs = []
+        for other_doc in open_docs:
+            if other_doc is doc:
+                continue
+            o = _find_doc_texture_store_fast(other_doc)
+            if o is None:
+                continue
+            o_mats, o_blobs = _read_store_pack(o)
+            for mk in list(missing_mks):
+                mv = o_mats.get(mk)
+                if isinstance(mv, dict):
+                    resolved_mats[mk] = mv
+                    missing_mks.discard(mk)
+                    tid = mv.get("tex_id")
+                    if isinstance(tid, str) and tid and tid not in have_blobs and tid not in resolved_blobs:
+                        missing_tids.add(tid)
+            for tid in list(missing_tids):
+                blob = o_blobs.get(tid) if o_blobs is not None else None
+                if blob is not None:
+                    resolved_blobs[tid] = blob
+                    missing_tids.discard(tid)
+            if not missing_mks and not missing_tids:
+                break
+
+    valid_mats = {}
+    valid_blobs = {}
+    still_missing_mks = set(missing_mks)
+    for mk, mv in resolved_mats.items():
+        tid = mv.get("tex_id")
+        if isinstance(tid, str) and tid:
+            if tid in have_blobs:
+                valid_mats[mk] = mv
+            elif tid in resolved_blobs:
+                valid_mats[mk] = mv
+                valid_blobs[tid] = resolved_blobs[tid]
+            else:
+                still_missing_mks.add(mk)
+        else:
+            still_missing_mks.add(mk)
+
+    if not valid_mats and existing_store is None:
+        if doc_uid is not None:
+            for obj, _ in pending:
+                tracked_set.add(obj.Name)
+            prev_miss = neg_state[3] if same_env else set()
+            _UNRESOLVED_MISSING_KEYS_BY_DOC[doc_uid] = (
+                objs_len,
+                None,
+                stores_tok,
+                prev_miss | still_missing_mks,
+            )
+        return
+
+    store = _ensure_document_texture_store(doc, valid_blobs, valid_mats)
+    final_mats, final_blobs = _read_store_pack(store)
+    for obj, mks in pending:
+        complete = True
+        for mk in mks:
+            mv = final_mats.get(mk)
+            tid = mv.get("tex_id") if isinstance(mv, dict) else None
+            if not (isinstance(tid, str) and tid and tid in final_blobs):
+                complete = False
+                break
+        if complete:
+            obj.SketchUpTextureStore = store
+            if tracked_set is not None:
+                tracked_set.discard(obj.Name)
+        elif tracked_set is not None:
+            tracked_set.add(obj.Name)
+    if doc_uid is not None:
+        new_len = len(getattr(doc, "Objects", ()) or ())
+        new_tok = _open_stores_token()
+        prev_miss = neg_state[3] if same_env else set()
+        _UNRESOLVED_MISSING_KEYS_BY_DOC[doc_uid] = (
+            new_len,
+            store.Name,
+            new_tok,
+            (prev_miss | still_missing_mks) if still_missing_mks else set(),
+        )
+
+
+class _TexturedObjectProxy:
+    """Part::FeaturePython proxy preserving exact B-rep ``Shape`` across
+    recompute, copy/paste, undo/redo, and ``.FCStd`` save/reopen (#30)."""
+
+    def __init__(self, fp=None):
+        _ensure_texture_doc_observer()
+
+    def execute(self, fp):
+        _ensure_texture_doc_observer()
+        if getattr(fp, "SketchUpTextureStore", None) is None and getattr(fp, "Document", None) is not None:
+            self._ensure_store_if_cached(fp)
+        if App.GuiUp:
+            self._ensure_gui_view_provider(fp, on_restore=False)
+
+    def onDocumentRestored(self, fp):
+        _ensure_texture_doc_observer()
+        try:
+            fp.setEditorMode("SketchUpFaceUVsJSON", 2)
+        except Exception:
+            pass
+        if App.GuiUp:
+            self._ensure_gui_view_provider(fp, on_restore=True)
+
+    def _ensure_gui_view_provider(self, fp, on_restore=False):
+        vobj = getattr(fp, "ViewObject", None)
+        if vobj is None:
+            return
+        vp = getattr(vobj, "Proxy", None)
+        if not isinstance(vp, _TexturedViewProviderProxy):
+            doc_uid = _doc_uid(getattr(fp, "Document", None))
+            shape = getattr(fp, "Shape", None)
+            n_faces = len(shape.Faces) if (shape is not None and not shape.isNull()) else 0
+            cur_dc = tuple(getattr(vobj, "DiffuseColor", ()) or ())
+            if n_faces and len(cur_dc) != n_faces:
+                payload = _parse_face_uvs_payload(getattr(fp, "SketchUpFaceUVsJSON", "") or "")
+                recs = payload.get("faces") if payload is not None else ()
+                if len(recs) == n_faces:
+                    mats_dict, _ = _resolve_object_materials_and_blobs(fp)
+                    restored_colors = [_initial_side_diffuse_rgba(r[0], mats_dict, doc_uid=doc_uid) for r in recs]
+                    try:
+                        vobj.DiffuseColor = restored_colors
+                    except Exception:
+                        pass
+            _TexturedViewProviderProxy(vobj)
+            try:
+                vobj.DisplayMode = "Textured"
+            except Exception:
+                pass
+        else:
+            vp._rebuild_if_needed(fp)
+            if on_restore:
+                want_mode = getattr(vp, "_restored_mode", None)
+                if want_mode == "Textured":
+                    vp._switching_for_save = True
+                    try:
+                        vobj.DisplayMode = "Textured"
+                    except Exception:
+                        pass
+                    finally:
+                        vp._switching_for_save = False
+
+    def _ensure_store_if_cached(self, fp):
+        _sync_pasted_textures_for_document(getattr(fp, "Document", None))
+
+    def dumps(self):
+        return {}
+
+    def loads(self, state):
+        _ensure_texture_doc_observer()
+        return None
+
+
+class _TexturedViewProviderProxy:
+    """Python ViewProvider building Coin3D's ``"Textured"`` display mode from
+    unplaced ``fp.Shape`` and ``openskp``'s ``face_uv_basis`` + ``compute_face_uv``,
+    sharing ``SoTexture2`` nodes per material and store and mapping picked Coin
+    primitives back to ``Face{i}`` / ``Edge{j}`` (#30)."""
+
+    def __init__(self, vobj=None):
+        _ensure_texture_doc_observer()
+        self._user_display_mode = "Textured"
+        self._restored_mode = None
+        self._switching_for_save = False
+        self._rebuild_count = 0
+        self._last_unplaced_shape = None
+        self._last_raw_uv = None
+        self._last_appearance_sig = None
+        self._last_store_sig = None
+        self._had_unresolved_textures = False
+        self._face_pick_map = {}
+        self._edge_pick_map = []
+        self._held_tex_keys = set()
+        if vobj is not None:
+            vobj.Proxy = self
+
+    def _ensure_attrs(self):
+        if not hasattr(self, "_user_display_mode"):
+            self._user_display_mode = "Textured"
+        if not hasattr(self, "_restored_mode"):
+            self._restored_mode = None
+        if not hasattr(self, "_switching_for_save"):
+            self._switching_for_save = False
+        if not hasattr(self, "_rebuild_count"):
+            self._rebuild_count = 0
+        if not hasattr(self, "_last_unplaced_shape"):
+            self._last_unplaced_shape = None
+        if not hasattr(self, "_last_raw_uv"):
+            self._last_raw_uv = None
+        if not hasattr(self, "_last_appearance_sig"):
+            self._last_appearance_sig = None
+        if not hasattr(self, "_last_store_sig"):
+            self._last_store_sig = None
+        if not hasattr(self, "_had_unresolved_textures"):
+            self._had_unresolved_textures = False
+        if not hasattr(self, "_face_pick_map"):
+            self._face_pick_map = {}
+        if not hasattr(self, "_edge_pick_map"):
+            self._edge_pick_map = []
+        if not hasattr(self, "_held_tex_keys"):
+            self._held_tex_keys = set()
+
+    def _replace_held_tex_keys(self, new_keys):
+        self._ensure_attrs()
+        for dead_key in self._held_tex_keys - new_keys:
+            _LIVE_COIN_TEX_NODES.release(dead_key)
+        self._held_tex_keys = set(new_keys)
+
+    def onDelete(self, vobj, subelements):
+        self._replace_held_tex_keys(set())
+        return True
+
+    def attach(self, vobj):
+        from pivy import coin
+
+        _ensure_texture_doc_observer()
+        self._ensure_attrs()
+        self.vobj = vobj
+        self.tex_root = coin.SoSeparator()
+        self.tex_root.setName("OpenSKPTexturedRoot")
+        vobj.addDisplayMode(self.tex_root, "Textured")
+        self._rebuild_if_needed(vobj.Object)
+
+    def getDisplayModes(self, vobj):
+        return ["Textured"]
+
+    def getDefaultDisplayMode(self):
+        return "Textured"
+
+    def setDisplayMode(self, mode):
+        return mode
+
+    def getElementPicked(self, pp):
+        self._ensure_attrs()
+        vobj = getattr(self, "vobj", None)
+        if vobj is not None and getattr(vobj, "DisplayMode", "Textured") != "Textured":
+            raise NotImplementedError
+        if pp is None:
+            raise NotImplementedError
+        picked = None
+        try:
+            from pivy import coin
+
+            path = pp.getPath()
+            det = pp.getDetail()
+            tail = path.getTail() if (path is not None and det is not None) else None
+            if tail is not None:
+                sb_n = tail.getName()
+                tname = sb_n.getString() if hasattr(sb_n, "getString") else str(sb_n)
+                if tname in self._face_pick_map:
+                    fmap = self._face_pick_map[tname]
+                    fdet = coin.cast(det, "SoFaceDetail") if hasattr(coin, "cast") else det
+                    tri_idx = int(fdet.getFaceIndex())
+                    if 0 <= tri_idx < len(fmap):
+                        picked = f"Face{fmap[tri_idx]}"
+                elif tname == "OpenSKPEdgeBatch":
+                    ldet = coin.cast(det, "SoLineDetail") if hasattr(coin, "cast") else det
+                    line_idx = int(ldet.getLineIndex())
+                    if 0 <= line_idx < len(self._edge_pick_map):
+                        picked = f"Edge{self._edge_pick_map[line_idx]}"
+        except Exception:
+            picked = None
+        if picked is not None:
+            return picked
+        raise NotImplementedError
+
+    def _appearance_signature(self, vobj):
+        if vobj is None:
+            return None
+        try:
+            dc = tuple(_material_key(c) for c in (getattr(vobj, "DiffuseColor", ()) or ()))
+        except Exception:
+            dc = ()
+        try:
+            lc_raw = getattr(vobj, "LineColor", None)
+            lc = (round(float(lc_raw[0]), 3), round(float(lc_raw[1]), 3), round(float(lc_raw[2]), 3)) if lc_raw else None
+        except Exception:
+            lc = None
+        try:
+            lw = round(float(getattr(vobj, "LineWidth", 1.0) or 1.0), 2)
+        except Exception:
+            lw = 1.0
+        try:
+            tr = int(getattr(vobj, "Transparency", 0) or 0)
+        except Exception:
+            tr = 0
+        return (dc, lc, lw, tr)
+
+    @staticmethod
+    def _store_signature(fp):
+        store_obj = getattr(fp, "SketchUpTextureStore", None) if fp is not None else None
+        if store_obj is None:
+            return None
+        raw_m = getattr(store_obj, "MaterialsJSON", "") or ""
+        return (
+            getattr(store_obj, "Name", None),
+            getattr(store_obj, "TexturePack", "") or "",
+            len(raw_m),
+            hash(raw_m),
+        )
+
+    def _rebuild_if_needed(self, fp, force=False):
+        self._ensure_attrs()
+        if not hasattr(self, "tex_root") or self.tex_root is None or fp is None:
+            return
+        unplaced = _unplaced_shape(fp)
+        raw_uv = getattr(fp, "SketchUpFaceUVsJSON", "") or ""
+        vobj = getattr(self, "vobj", None)
+        app_sig = self._appearance_signature(vobj)
+        store_obj = getattr(fp, "SketchUpTextureStore", None)
+        store_name = getattr(store_obj, "Name", None) if store_obj is not None else None
+        if (
+            not force
+            and not self._had_unresolved_textures
+            and _same_local_tshape(unplaced, self._last_unplaced_shape)
+            and raw_uv == self._last_raw_uv
+            and app_sig == self._last_appearance_sig
+            and store_name == self._last_store_sig
+        ):
+            return
+        self._rebuild(fp, unplaced_shape=unplaced, raw_uv=raw_uv, app_sig=app_sig, store_sig=store_name)
+
+    def updateData(self, fp, prop):
+        if prop in ("Shape", "SketchUpFaceUVsJSON", "SketchUpTextureStore"):
+            self._rebuild_if_needed(fp)
+
+    def onChanged(self, vobj, prop):
+        self._ensure_attrs()
+        if prop == "DisplayMode":
+            if not self._switching_for_save:
+                try:
+                    self._user_display_mode = str(vobj.DisplayMode)
+                except Exception:
+                    pass
+        elif prop in ("DiffuseColor", "ShapeAppearance", "ShapeColor", "LineColor", "LineWidth", "Transparency"):
+            fp = getattr(vobj, "Object", None)
+            if fp is not None:
+                self._rebuild_if_needed(fp)
+
+    def dumps(self):
+        self._ensure_attrs()
+        return {"mode": self._user_display_mode}
+
+    def loads(self, state):
+        _ensure_texture_doc_observer()
+        self._ensure_attrs()
+        if isinstance(state, dict) and isinstance(state.get("mode"), str):
+            self._restored_mode = state["mode"]
+            self._user_display_mode = state["mode"]
+        return None
+
+    def _acquire_coin_texture_node(self, doc_uid, store_name, mat_key, mat_info, blobs_map, new_held_keys):
+        from pivy import coin
+
+        if not isinstance(mat_key, str) or not mat_key or not isinstance(mat_info, dict):
+            return None
+        cache_key = (doc_uid, store_name, mat_key)
+        if cache_key in new_held_keys:
+            hit = _LIVE_COIN_TEX_NODES.peek(cache_key)
+            if hit is not None:
+                return hit
+        if cache_key in self._held_tex_keys:
+            hit = _LIVE_COIN_TEX_NODES.peek(cache_key)
+            if hit is not None:
+                new_held_keys.add(cache_key)
+                return hit
+
+        def _build_node():
+            tid = mat_info.get("tex_id")
+            if not isinstance(tid, str) or not tid:
+                return None
+            raw_bytes = blobs_map.get(tid) if blobs_map is not None else None
+            if raw_bytes is None:
+                raw_bytes = _PROCESS_TEX_CACHE.get(tid, doc_uid=doc_uid)
+            if not raw_bytes:
+                return None
+            decoded = _decode_gl_texture_tuple(tid, raw_bytes, mat_info, doc_uid=doc_uid)
+            if decoded is None:
+                return None
+            w, h, nc, gl_bytes = decoded
+            tex = coin.SoTexture2()
+            tex.image.setValue(coin.SbVec2s(w, h), nc, gl_bytes)
+            tex.model = coin.SoTexture2.MODULATE
+            op_m = max(0.0, min(1.0, _safe_float(mat_info.get("opacity", 1.0), 1.0)))
+            return (tex, nc == 4 or op_m < 1.0 - 1e-6), max(1, w * h * nc)
+
+        res = _LIVE_COIN_TEX_NODES.acquire(cache_key, _build_node)
+        if res is not None:
+            new_held_keys.add(cache_key)
+        return res
+
+    def _rebuild(self, fp, unplaced_shape=None, raw_uv=None, app_sig=None, store_sig=None):
+        from pivy import coin
+        from openskp._face_groups import compute_face_uv, face_uv_basis
+
+        self._ensure_attrs()
+        if not hasattr(self, "tex_root") or self.tex_root is None or fp is None:
+            return
+        new_held_keys = set()
+        try:
+            self.tex_root.removeAllChildren()
+            self._face_pick_map = {}
+            self._edge_pick_map = []
+            shape = unplaced_shape if unplaced_shape is not None else _unplaced_shape(fp)
+            if raw_uv is None:
+                raw_uv = getattr(fp, "SketchUpFaceUVsJSON", "") or ""
+            vobj = getattr(self, "vobj", None)
+            if app_sig is None:
+                app_sig = self._appearance_signature(vobj)
+            if store_sig is None:
+                s_o = getattr(fp, "SketchUpTextureStore", None)
+                store_sig = getattr(s_o, "Name", None) if s_o is not None else None
+
+            self._last_unplaced_shape = shape if (shape is not None and not shape.isNull()) else None
+            self._last_raw_uv = raw_uv
+            self._last_appearance_sig = app_sig
+            self._last_store_sig = store_sig
+            self._had_unresolved_textures = False
+            self._rebuild_count += 1
+
+            if shape is None or shape.isNull():
+                return
+            brep_faces = shape.Faces
+            payload = _parse_face_uvs_payload(raw_uv) if raw_uv else None
+            if payload is not None:
+                face_records = payload.get("faces") or ()
+                if len(face_records) != len(brep_faces):
+                    face_records = [(None, None, 0)] * len(brep_faces)
+            else:
+                payload = {}
+                face_records = [(None, None, 0)] * len(brep_faces)
+
+            doc_uid = _doc_uid(getattr(fp, "Document", None))
+            store_obj = getattr(fp, "SketchUpTextureStore", None)
+            if store_obj is None and doc_uid is not None and raw_uv:
+                _UNRESOLVED_PASTE_OBJS_BY_DOC.setdefault(doc_uid, set()).add(fp.Name)
+            store_name = getattr(store_obj, "Name", "") or "_mem"
+            mats_dict, blobs_map = _resolve_object_materials_and_blobs(fp)
+
+            cur_dc = ()
+            line_rgb = (0.12, 0.12, 0.12)
+            line_w = 0.0
+            vobj_transp_alpha = 1.0
+            if vobj is not None:
+                try:
+                    cur_dc = tuple(getattr(vobj, "DiffuseColor", ()) or ())
+                except Exception:
+                    cur_dc = ()
+                try:
+                    lc_v = getattr(vobj, "LineColor", None)
+                    if lc_v is not None and len(lc_v) >= 3:
+                        line_rgb = (
+                            _safe_float(lc_v[0], 0.12),
+                            _safe_float(lc_v[1], 0.12),
+                            _safe_float(lc_v[2], 0.12),
+                        )
+                except Exception:
+                    pass
+                try:
+                    line_w = _safe_float(getattr(vobj, "LineWidth", 0.0) or 0.0, 0.0)
+                except Exception:
+                    line_w = 0.0
+                try:
+                    tr_pct = int(getattr(vobj, "Transparency", 0) or 0)
+                    vobj_transp_alpha = max(0.0, min(1.0, 1.0 - tr_pct / 100.0))
+                except Exception:
+                    vobj_transp_alpha = 1.0
+
+            tex_batches = {}
+            solid_batches = {}
+            basis_cache = {}
+            unresolved = [False]
+
+            def _get_basis(bn_tuple):
+                b_hit = basis_cache.get(bn_tuple)
+                if b_hit is None:
+                    b_hit = face_uv_basis(bn_tuple)
+                    basis_cache[bn_tuple] = b_hit
+                return b_hit
+
+            def _emit_solid(double_sided, rgba, verts_mm, tris_oriented, verts_nrms, face_1based, alpha_override=None):
+                c_rgba = _safe_rgba_float(rgba)
+                sb = solid_batches.setdefault(
+                    double_sided,
+                    {"pts": [], "nrms": [], "idx": [], "colors": [], "transp": [], "any_translucent": False, "faces": []},
+                )
+                base = len(sb["pts"])
+                sb["pts"].extend((v.x, v.y, v.z) for v in verts_mm)
+                sb["nrms"].extend(verts_nrms)
+                rgb = (c_rgba[0], c_rgba[1], c_rgba[2])
+                eff_alpha = max(0.0, min(1.0, c_rgba[3] if alpha_override is None else float(alpha_override)))
+                tr = 1.0 - eff_alpha
+                if tr > 1e-6:
+                    sb["any_translucent"] = True
+                for i0, i1, i2 in tris_oriented:
+                    sb["colors"].append(rgb)
+                    sb["transp"].append(tr)
+                    sb["idx"].extend((base + i0, base + i1, base + i2, -1))
+                    sb["faces"].append(face_1based)
+
+            def _emit_side(
+                side_entry,
+                double_sided,
+                verts_mm,
+                tris_oriented,
+                verts_nrms,
+                face_1based,
+                dc_override=None,
+                alpha_override=None,
+            ):
+                if dc_override is not None:
+                    _emit_solid(double_sided, dc_override, verts_mm, tris_oriented, verts_nrms, face_1based)
+                    return
+                if side_entry[0] == "t" and len(side_entry) >= 5 and isinstance(side_entry[1], str):
+                    mk = side_entry[1]
+                    minfo = mats_dict.get(mk) if isinstance(mats_dict, dict) else None
+                    if minfo is None:
+                        minfo = _PROCESS_MAT_CACHE.get(mk, doc_uid=doc_uid)
+                    tex_pair = (
+                        self._acquire_coin_texture_node(doc_uid, store_name, mk, minfo, blobs_map, new_held_keys)
+                        if isinstance(minfo, dict)
+                        else None
+                    )
+                    if tex_pair is not None:
+                        tex_node, is_trans = tex_pair
+                        base_op = _safe_float(minfo.get("opacity", 1.0), 1.0)
+                        eff_op = max(0.0, min(1.0, base_op if alpha_override is None else float(alpha_override)))
+                        bkey = (mk, double_sided, round(eff_op, 4))
+                        tb = tex_batches.get(bkey)
+                        if tb is None:
+                            tb = {
+                                "pts": [],
+                                "nrms": [],
+                                "uvs": [],
+                                "idx": [],
+                                "translucent": is_trans or eff_op < 1.0 - 1e-6,
+                                "eff_opacity": eff_op,
+                                "tex_node": tex_node,
+                                "faces": [],
+                            }
+                            tex_batches[bkey] = tb
+                        tw = _safe_float(minfo.get("tile_w"), 1.0)
+                        th = _safe_float(minfo.get("tile_h"), 1.0)
+                        if tw <= 1e-12:
+                            tw = 1.0
+                        if th <= 1e-12:
+                            th = 1.0
+                        basis_raw = side_entry[2]
+                        uv_xf = tuple(side_entry[3]) if isinstance(side_entry[3], (list, tuple)) else None
+                        inv_m12 = side_entry[4] if isinstance(side_entry[4], (list, tuple)) else None
+                        if isinstance(basis_raw, (list, tuple)) and len(basis_raw) == 3:
+                            xr, yr = _get_basis(
+                                (
+                                    _safe_float(basis_raw[0], 0.0),
+                                    _safe_float(basis_raw[1], 0.0),
+                                    _safe_float(basis_raw[2], 1.0),
+                                )
+                            )
+                            base = len(tb["pts"])
+                            for v, vn_i in zip(verts_mm, verts_nrms):
+                                tb["pts"].append((v.x, v.y, v.z))
+                                tb["nrms"].append(vn_i)
+                                p_in = _apply_m12(inv_m12, (v.x / INCH_TO_MM, v.y / INCH_TO_MM, v.z / INCH_TO_MM))
+                                tb["uvs"].append(compute_face_uv(p_in, xr, yr, uv_xf, tw, th))
+                            for i0, i1, i2 in tris_oriented:
+                                tb["idx"].extend((base + i0, base + i1, base + i2, -1))
+                                tb["faces"].append(face_1based)
+                        else:
+                            for i0, i1, i2 in tris_oriented:
+                                va, vb, vc = verts_mm[i0], verts_mm[i1], verts_mm[i2]
+                                pa = _apply_m12(inv_m12, (va.x / INCH_TO_MM, va.y / INCH_TO_MM, va.z / INCH_TO_MM))
+                                pb = _apply_m12(inv_m12, (vb.x / INCH_TO_MM, vb.y / INCH_TO_MM, vb.z / INCH_TO_MM))
+                                pc = _apply_m12(inv_m12, (vc.x / INCH_TO_MM, vc.y / INCH_TO_MM, vc.z / INCH_TO_MM))
+                                ex, ey, ez = pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]
+                                fx, fy, fz = pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]
+                                tnx = ey * fz - ez * fy
+                                tny = ez * fx - ex * fz
+                                tnz = ex * fy - ey * fx
+                                tlen = math.sqrt(tnx * tnx + tny * tny + tnz * tnz)
+                                tn = (tnx / tlen, tny / tlen, tnz / tlen) if tlen > 1e-12 else (0.0, 0.0, 1.0)
+                                xr, yr = face_uv_basis(tn)
+                                base = len(tb["pts"])
+                                for v_mm, p_loc, vn_i in (
+                                    (va, pa, verts_nrms[i0]),
+                                    (vb, pb, verts_nrms[i1]),
+                                    (vc, pc, verts_nrms[i2]),
+                                ):
+                                    tb["pts"].append((v_mm.x, v_mm.y, v_mm.z))
+                                    tb["nrms"].append(vn_i)
+                                    tb["uvs"].append(compute_face_uv(p_loc, xr, yr, uv_xf, tw, th))
+                                tb["idx"].extend((base, base + 1, base + 2, -1))
+                                tb["faces"].append(face_1based)
+                        return
+                    unresolved[0] = True
+                    if isinstance(minfo, dict):
+                        rc = _safe_rgba_u8_list(minfo.get("rgba"), default=(200, 200, 200, 255))
+                        op = max(0.0, min(1.0, _safe_float(minfo.get("opacity", 1.0), 1.0)))
+                        _emit_solid(
+                            double_sided,
+                            (rc[0] / 255.0, rc[1] / 255.0, rc[2] / 255.0, op),
+                            verts_mm,
+                            tris_oriented,
+                            verts_nrms,
+                            face_1based,
+                            alpha_override=alpha_override,
+                        )
+                        return
+                rgba = _safe_rgba_float(side_entry[1:5]) if len(side_entry) >= 5 else _DEFAULT_FACE_RGBA
+                _emit_solid(
+                    double_sided, rgba, verts_mm, tris_oriented, verts_nrms, face_1based, alpha_override=alpha_override
+                )
+
+            has_dc_list = len(cur_dc) == len(brep_faces)
+            has_single_dc = len(cur_dc) == 1 and len(brep_faces) >= 1
+
+            for f_idx0, (bf, rec) in enumerate(zip(brep_faces, face_records)):
+                face_1based = f_idx0 + 1
+                front_e, back_e = rec[0], rec[1]
+                flipped = 1 if (rec[2] is True or rec[2] == 1) else 0
+                try:
+                    diag = max(1.0, bf.BoundBox.DiagonalLength)
+                    tol = max(0.05, 0.004 * diag)
+                    verts_mm, raw_tris = bf.tessellate(tol)
+                except Exception:
+                    continue
+                if not verts_mm or not raw_tris:
+                    continue
+
+                dc_override = None
+                front_alpha_override = None
+                back_alpha_override = None
+                if front_e is None:
+                    raw_dc = cur_dc[f_idx0] if f_idx0 < len(cur_dc) else (cur_dc[0] if cur_dc else _DEFAULT_FACE_RGBA)
+                    fb_c = _safe_rgba_float(raw_dc)
+                    if fb_c[3] >= 0.999 and vobj_transp_alpha < 0.999:
+                        fb_c = (fb_c[0], fb_c[1], fb_c[2], vobj_transp_alpha)
+                    front_e = ("s", fb_c[0], fb_c[1], fb_c[2], fb_c[3], None)
+                elif has_dc_list or has_single_dc:
+                    cand_c = _safe_rgba_float(cur_dc[f_idx0] if has_dc_list else cur_dc[0])
+                    mk_known = True
+                    if front_e[0] == "t" and len(front_e) >= 2 and isinstance(front_e[1], str):
+                        fk = front_e[1]
+                        f_mi = mats_dict.get(fk) if isinstance(mats_dict, dict) else None
+                        if f_mi is None:
+                            f_mi = _PROCESS_MAT_CACHE.get(fk, doc_uid=doc_uid)
+                        mk_known = isinstance(f_mi, dict)
+                    if not mk_known:
+                        # Material descriptor is not resolved yet (e.g. unlinked paste before store arrives):
+                        # keep _had_unresolved_textures=True so linking/updating the store rebuilds into textured mode,
+                        # while drawing the face's DiffuseColor in the meantime.
+                        unresolved[0] = True
+                        dc_override = cand_c
+                    else:
+                        init_c = _initial_side_diffuse_rgba(front_e, mats_dict, doc_uid=doc_uid)
+                        if _rgb_key(cand_c) != _rgb_key(init_c):
+                            dc_override = cand_c
+                        else:
+                            front_alpha_override = cand_c[3]
+                            if abs(cand_c[3] - init_c[3]) > 1e-2:
+                                back_alpha_override = cand_c[3]
+
+                is_planar = isinstance(bf.Surface, Part.Plane)
+                if is_planar:
+                    bn = _brep_face_normal_tuple(bf) or (0.0, 0.0, 1.0)
+                    front_n = (-bn[0], -bn[1], -bn[2]) if flipped else bn
+                    front_tris = []
+                    for a_i, b_i, c_i in raw_tris:
+                        va, vb, vc = verts_mm[a_i], verts_mm[b_i], verts_mm[c_i]
+                        cr = (vb - va).cross(vc - va)
+                        if cr.x * front_n[0] + cr.y * front_n[1] + cr.z * front_n[2] < 0.0:
+                            front_tris.append((a_i, c_i, b_i))
+                        else:
+                            front_tris.append((a_i, b_i, c_i))
+                    front_nrms = [front_n] * len(verts_mm)
+                    if back_e is None:
+                        _emit_side(
+                            front_e,
+                            True,
+                            verts_mm,
+                            front_tris,
+                            front_nrms,
+                            face_1based,
+                            dc_override=dc_override,
+                            alpha_override=front_alpha_override,
+                        )
+                    else:
+                        back_n = (-front_n[0], -front_n[1], -front_n[2])
+                        back_tris = [(a_i, c_i, b_i) for a_i, b_i, c_i in front_tris]
+                        back_nrms = [back_n] * len(verts_mm)
+                        _emit_side(
+                            front_e,
+                            False,
+                            verts_mm,
+                            front_tris,
+                            front_nrms,
+                            face_1based,
+                            dc_override=dc_override,
+                            alpha_override=front_alpha_override,
+                        )
+                        _emit_side(
+                            back_e,
+                            False,
+                            verts_mm,
+                            back_tris,
+                            back_nrms,
+                            face_1based,
+                            alpha_override=back_alpha_override,
+                        )
+                else:
+                    raw_vn = []
+                    for v_pt in verts_mm:
+                        try:
+                            u_p, v_p = bf.Surface.parameter(v_pt)
+                            nv = bf.normalAt(u_p, v_p)
+                            if nv.Length > 1e-12:
+                                nv.normalize()
+                                raw_vn.append((float(nv.x), float(nv.y), float(nv.z)))
+                            else:
+                                raw_vn.append((0.0, 0.0, 1.0))
+                        except Exception:
+                            raw_vn.append((0.0, 0.0, 1.0))
+                    if flipped:
+                        front_nrms = [(-nx, -ny, -nz) for nx, ny, nz in raw_vn]
+                    else:
+                        front_nrms = raw_vn
+                    front_tris = []
+                    for a_i, b_i, c_i in raw_tris:
+                        va, vb, vc = verts_mm[a_i], verts_mm[b_i], verts_mm[c_i]
+                        cr = (vb - va).cross(vc - va)
+                        na, nb_v, nc_v = front_nrms[a_i], front_nrms[b_i], front_nrms[c_i]
+                        mx = na[0] + nb_v[0] + nc_v[0]
+                        my = na[1] + nb_v[1] + nc_v[1]
+                        mz = na[2] + nb_v[2] + nc_v[2]
+                        if cr.x * mx + cr.y * my + cr.z * mz < 0.0:
+                            front_tris.append((a_i, c_i, b_i))
+                        else:
+                            front_tris.append((a_i, b_i, c_i))
+                    if back_e is None:
+                        _emit_side(
+                            front_e,
+                            True,
+                            verts_mm,
+                            front_tris,
+                            front_nrms,
+                            face_1based,
+                            dc_override=dc_override,
+                            alpha_override=front_alpha_override,
+                        )
+                    else:
+                        back_nrms = [(-nx, -ny, -nz) for nx, ny, nz in front_nrms]
+                        back_tris = [(a_i, c_i, b_i) for a_i, b_i, c_i in front_tris]
+                        _emit_side(
+                            front_e,
+                            False,
+                            verts_mm,
+                            front_tris,
+                            front_nrms,
+                            face_1based,
+                            dc_override=dc_override,
+                            alpha_override=front_alpha_override,
+                        )
+                        _emit_side(
+                            back_e,
+                            False,
+                            verts_mm,
+                            back_tris,
+                            back_nrms,
+                            face_1based,
+                            alpha_override=back_alpha_override,
+                        )
+
+            self._had_unresolved_textures = unresolved[0]
+
+            poly_group = coin.SoSeparator()
+            poff = coin.SoPolygonOffset()
+            poff.factor = 1.0
+            poff.units = 1.0
+            poly_group.addChild(poff)
+            batch_seq = [0]
+
+            def _add_solid_batch(double_sided, sb):
+                sep = coin.SoSeparator()
+                hints = coin.SoShapeHints()
+                hints.vertexOrdering = coin.SoShapeHints.COUNTERCLOCKWISE
+                hints.shapeType = (
+                    coin.SoShapeHints.UNKNOWN_SHAPE_TYPE if double_sided else coin.SoShapeHints.SOLID
+                )
+                sep.addChild(hints)
+                mat = coin.SoMaterial()
+                mat.diffuseColor.setValues(0, len(sb["colors"]), sb["colors"])
+                mat.transparency.setValues(0, len(sb["transp"]), sb["transp"])
+                sep.addChild(mat)
+                mbind = coin.SoMaterialBinding()
+                mbind.value = coin.SoMaterialBinding.PER_FACE
+                sep.addChild(mbind)
+                coords = coin.SoCoordinate3()
+                coords.point.setValues(0, len(sb["pts"]), sb["pts"])
+                sep.addChild(coords)
+                nrm = coin.SoNormal()
+                nrm.vector.setValues(0, len(sb["nrms"]), sb["nrms"])
+                sep.addChild(nrm)
+                nbind = coin.SoNormalBinding()
+                nbind.value = coin.SoNormalBinding.PER_VERTEX_INDEXED
+                sep.addChild(nbind)
+                fset = coin.SoIndexedFaceSet()
+                bname = f"OpenSKPFaceBatch_{batch_seq[0]}"
+                batch_seq[0] += 1
+                fset.setName(bname)
+                self._face_pick_map[bname] = sb["faces"]
+                fset.coordIndex.setValues(0, len(sb["idx"]), sb["idx"])
+                fset.normalIndex.setValues(0, len(sb["idx"]), sb["idx"])
+                sep.addChild(fset)
+                poly_group.addChild(sep)
+
+            def _add_tex_batch(double_sided, tb):
+                sep = coin.SoSeparator()
+                hints = coin.SoShapeHints()
+                hints.vertexOrdering = coin.SoShapeHints.COUNTERCLOCKWISE
+                hints.shapeType = (
+                    coin.SoShapeHints.UNKNOWN_SHAPE_TYPE if double_sided else coin.SoShapeHints.SOLID
+                )
+                sep.addChild(hints)
+                sep.addChild(tb["tex_node"])
+                mat = coin.SoMaterial()
+                mat.diffuseColor.setValue(1.0, 1.0, 1.0)
+                op = tb["eff_opacity"]
+                if op < 1.0 - 1e-6:
+                    mat.transparency.setValue(1.0 - op)
+                sep.addChild(mat)
+                coords = coin.SoCoordinate3()
+                coords.point.setValues(0, len(tb["pts"]), tb["pts"])
+                sep.addChild(coords)
+                nrm = coin.SoNormal()
+                nrm.vector.setValues(0, len(tb["nrms"]), tb["nrms"])
+                sep.addChild(nrm)
+                nbind = coin.SoNormalBinding()
+                nbind.value = coin.SoNormalBinding.PER_VERTEX_INDEXED
+                sep.addChild(nbind)
+                tcoords = coin.SoTextureCoordinate2()
+                tcoords.point.setValues(0, len(tb["uvs"]), tb["uvs"])
+                sep.addChild(tcoords)
+                tbind = coin.SoTextureCoordinateBinding()
+                tbind.value = coin.SoTextureCoordinateBinding.PER_VERTEX_INDEXED
+                sep.addChild(tbind)
+                fset = coin.SoIndexedFaceSet()
+                bname = f"OpenSKPFaceBatch_{batch_seq[0]}"
+                batch_seq[0] += 1
+                fset.setName(bname)
+                self._face_pick_map[bname] = tb["faces"]
+                fset.coordIndex.setValues(0, len(tb["idx"]), tb["idx"])
+                fset.normalIndex.setValues(0, len(tb["idx"]), tb["idx"])
+                fset.textureCoordIndex.setValues(0, len(tb["idx"]), tb["idx"])
+                sep.addChild(fset)
+                poly_group.addChild(sep)
+
+            for pass_translucent in (False, True):
+                for ds, sb in solid_batches.items():
+                    if bool(sb["any_translucent"]) == pass_translucent:
+                        _add_solid_batch(ds, sb)
+                for (_mk, ds, _op_r), tb in tex_batches.items():
+                    if bool(tb["translucent"]) == pass_translucent:
+                        _add_tex_batch(ds, tb)
+            self.tex_root.addChild(poly_group)
+
+            edges = shape.Edges
+            if edges:
+                raw_soft = payload.get("soft")
+                soft_set = (
+                    {tuple(s) for s in raw_soft if isinstance(s, (list, tuple)) and len(s) == 3}
+                    if isinstance(raw_soft, list)
+                    else set()
+                )
+                line_pts = []
+                line_idx = []
+                edge_1based_map = []
+                for e_idx0, edge in enumerate(edges):
+                    try:
+                        if _is_straight_edge(edge):
+                            p0 = edge.valueAt(edge.FirstParameter)
+                            p1 = edge.valueAt(edge.LastParameter)
+                            if soft_set:
+                                mk = (
+                                    round(0.5 * (p0.x + p1.x), 1),
+                                    round(0.5 * (p0.y + p1.y), 1),
+                                    round(0.5 * (p0.z + p1.z), 1),
+                                )
+                                if mk in soft_set:
+                                    continue
+                            base = len(line_pts)
+                            line_pts.append((p0.x, p0.y, p0.z))
+                            line_pts.append((p1.x, p1.y, p1.z))
+                            line_idx.extend((base, base + 1, -1))
+                            edge_1based_map.append(e_idx0 + 1)
+                        else:
+                            pts_e = list(edge.discretize(Number=25))
+                            if len(pts_e) >= 2:
+                                base = len(line_pts)
+                                for pv in pts_e:
+                                    line_pts.append((pv.x, pv.y, pv.z))
+                                line_idx.extend(range(base, base + len(pts_e)))
+                                line_idx.append(-1)
+                                edge_1based_map.append(e_idx0 + 1)
+                    except Exception:
+                        continue
+                if line_pts and line_idx:
+                    lsep = coin.SoSeparator()
+                    lm = coin.SoLightModel()
+                    lm.model = coin.SoLightModel.BASE_COLOR
+                    lsep.addChild(lm)
+                    if line_w > 0.0:
+                        dstyle = coin.SoDrawStyle()
+                        dstyle.lineWidth = line_w
+                        lsep.addChild(dstyle)
+                    lmat = coin.SoMaterial()
+                    lmat.diffuseColor.setValue(line_rgb[0], line_rgb[1], line_rgb[2])
+                    lsep.addChild(lmat)
+                    lcoords = coin.SoCoordinate3()
+                    lcoords.point.setValues(0, len(line_pts), line_pts)
+                    lsep.addChild(lcoords)
+                    lset = coin.SoIndexedLineSet()
+                    lset.setName("OpenSKPEdgeBatch")
+                    self._edge_pick_map = edge_1based_map
+                    lset.coordIndex.setValues(0, len(line_idx), line_idx)
+                    lsep.addChild(lset)
+                    self.tex_root.addChild(lsep)
+        finally:
+            self._replace_held_tex_keys(new_held_keys)
+
+
+def _has_any_textured_face(face_uvs):
+    if not face_uvs:
+        return False
+    for rec in face_uvs:
+        if rec[0][0] == "t":
+            return True
+        if rec[1] is not None and rec[1][0] == "t":
+            return True
+    return False
+
+
+def _create_geometry_object(doc, base_name, label, shape, colors, stats, face_uvs=None, soft_midpoints=None):
+    """Creates a plain ``Part::Feature`` unless ``textures=True`` and at least
+    one face on ``shape`` uses a valid textured material, in which case only
+    this object becomes ``Part::FeaturePython`` (#30)."""
+    import json
+
+    tex_ctx = stats.get("_tex_ctx")
+    if tex_ctx is not None and face_uvs is not None and len(face_uvs) == len(shape.Faces) and _has_any_textured_face(face_uvs):
+        needed_mats = {}
+        needed_blobs = {}
+        for rec in face_uvs:
+            for side in (rec[0], rec[1]):
+                if side is not None and side[0] == "t":
+                    mk = side[1]
+                    mv = tex_ctx["mat_entries"].get(mk)
+                    if mv is not None:
+                        needed_mats[mk] = mv
+                        tid = mv["tex_id"]
+                        needed_blobs[tid] = tex_ctx["tex_blobs"][tid]
+        store = _acquire_import_texture_store(doc, tex_ctx, needed_blobs, needed_mats)
+        obj = doc.addObject("Part::FeaturePython", base_name)
+        obj.Label = label
+        obj.Shape = shape
+        obj.addProperty(
+            "App::PropertyLinkHidden",
+            "SketchUpTextureStore",
+            "SketchUp",
+            "Document-wide SketchUp texture store",
+        )
+        obj.SketchUpTextureStore = store
+        obj.addProperty(
+            "App::PropertyString",
+            "SketchUpFaceUVsJSON",
+            "SketchUp",
+            "Per-face SketchUp texture and UV mapping",
+        )
+        try:
+            obj.setEditorMode("SketchUpFaceUVsJSON", 2)
+        except Exception:
+            pass
+        compact = {"v": 1, "faces": [[r[0], r[1], r[2]] for r in face_uvs]}
+        if soft_midpoints:
+            compact["soft"] = [
+                [round(p[0], 1), round(p[1], 1), round(p[2], 1)] for p in soft_midpoints[:8000]
+            ]
+        obj.SketchUpFaceUVsJSON = json.dumps(compact, separators=(",", ":"))
+        obj.Proxy = _TexturedObjectProxy(obj)
+        stats["textured_objects"] = stats.get("textured_objects", 0) + 1
+        if App.GuiUp and hasattr(obj, "ViewObject") and obj.ViewObject is not None:
+            if len(colors) == len(shape.Faces):
+                obj.ViewObject.DiffuseColor = colors
+            _TexturedViewProviderProxy(obj.ViewObject)
+            try:
+                obj.ViewObject.DisplayMode = "Textured"
+            except Exception:
+                pass
+        return obj
+
+    obj = doc.addObject("Part::Feature", base_name)
+    obj.Label = label
+    obj.Shape = shape
+    if App.GuiUp and hasattr(obj, "ViewObject") and obj.ViewObject is not None:
+        if len(colors) == len(shape.Faces):
+            obj.ViewObject.DiffuseColor = colors
+    return obj
 
 
 _PARAM_PATH = "User parameter:BaseApp/Preferences/Mod/OpenSKP"
@@ -2642,7 +5472,9 @@ class _HierarchyImport:
         self.parts = {}  # (id(definition), effective inherited material) -> App::Part / AssemblyObject
         self.built_definitions = set()  # id(definition)
         self.paint_memo = {}
-        self.merged_cache = {}  # for sheared placements, see _place
+        self.back_paint_memo = {}
+        self.tex_subtree_memo = {}
+        self.merged_cache = {}  # for sheared / mirrored placements, see _place
         self.components = None
         if self.annotations:
             try:
@@ -2687,12 +5519,47 @@ class _HierarchyImport:
         self.paint_memo[key] = result
         return result
 
+    def _passes_back_paint_down(self, definition, visiting=frozenset()):
+        """Whether any face back side in this definition's subtree is unpainted
+        and therefore inherits a textured paint from its placing instance."""
+        key = id(definition)
+        if key in self.back_paint_memo:
+            return self.back_paint_memo[key]
+        if key in visiting:
+            return False
+        visiting = visiting | {key}
+        result = any(face.back_material_id is None for face in definition.faces.values())
+        if not result:
+            for inst in definition.instances:
+                child = self.model.definitions.get(inst.ref_idx)
+                if child is not None and inst.material_id is None and self._passes_back_paint_down(child, visiting):
+                    result = True
+                    break
+        self.back_paint_memo[key] = result
+        return result
+
     def _geometry(self, definition, inherited_material_id, label):
-        shapes, colors = _build_own_geometry(definition, self.model, self.stats, inherited_material_id)
+        tex_on = self.stats.get("_tex_ctx") is not None
+        face_uvs = [] if tex_on else None
+        soft_mids = [] if tex_on else None
+        shapes, colors = _build_own_geometry(
+            definition, self.model, self.stats, inherited_material_id,
+            out_face_uvs=face_uvs, out_soft_midpoints=soft_mids,
+        )
         if not shapes:
             return None
+        compound = Part.makeCompound(shapes)
+        if tex_on:
+            self.stats["object_face_colors_pending"] = colors
+            obj = _create_geometry_object(
+                self.doc, "Geometry", label, compound, colors, self.stats,
+                face_uvs=face_uvs, soft_midpoints=soft_mids,
+            )
+            self.stats.pop("object_face_colors_pending", None)
+            self.stats["object_face_colors"][obj.Name] = colors
+            return obj
         obj = self._add("Part::Feature", "Geometry", label)
-        obj.Shape = Part.makeCompound(shapes)
+        obj.Shape = compound
         self._apply_colors(obj, colors)
         return obj
 
@@ -2717,7 +5584,11 @@ class _HierarchyImport:
         is enabled and ``definition`` contains nested instances) for
         ``definition`` as it looks when placed with ``inherited_material_id``
         passed down, built on first use."""
-        material_key = inherited_material_id if self._passes_paint_down(definition) else None
+        tex_ctx = self.stats.get("_tex_ctx")
+        passes = self._passes_paint_down(definition)
+        if not passes and tex_ctx is not None and inherited_material_id in tex_ctx["mat_id_to_key"]:
+            passes = self._passes_back_paint_down(definition)
+        material_key = inherited_material_id if passes else None
         key = (id(definition), material_key)
         if key in self.parts:
             return self.parts[key]
@@ -2774,7 +5645,7 @@ class _HierarchyImport:
                 part.addObject(placed)
                 if inst.layer and self.layer_hidden.get(inst.layer, False):
                     self._hide(placed)
-                if self.annotations and _link_transform(inst.matrix) is None:
+                if self.annotations and not _is_type(placed, "App::Link"):
                     try:
                         child = self.model.definitions.get(inst.ref_idx)
                         if child is not None and id(child) in self.defs_with_annots:
@@ -2807,9 +5678,45 @@ class _HierarchyImport:
             self.progress.next()
         return part
 
+    def _subtree_has_textured_face(self, definition, inherited_material_id, visiting=frozenset()):
+        """Whether ``definition`` or any nested child under ``inherited_material_id``
+        resolves at least one textured face side (so a negative-determinant
+        placement must be imported as a placed copy rather than an ``App::Link``
+        whose overriding ``SoShapeHints`` disables backface culling)."""
+        tex_ctx = self.stats.get("_tex_ctx")
+        if tex_ctx is None:
+            return False
+        mat_to_key = tex_ctx["mat_id_to_key"]
+        inh_tex = inherited_material_id in mat_to_key
+        mkey = (id(definition), inh_tex)
+        if mkey in self.tex_subtree_memo:
+            return self.tex_subtree_memo[mkey]
+        if mkey in visiting:
+            return False
+        visiting = visiting | {mkey}
+        result = False
+        for face in definition.faces.values():
+            fm = face.material_id if face.material_id is not None else inherited_material_id
+            bm = face.back_material_id if face.back_material_id is not None else inherited_material_id
+            if fm in mat_to_key or bm in mat_to_key:
+                result = True
+                break
+        if not result:
+            for inst in definition.instances:
+                child = self.model.definitions.get(inst.ref_idx)
+                if child is None:
+                    continue
+                cm = inst.material_id if inst.material_id is not None else inherited_material_id
+                if self._subtree_has_textured_face(child, cm, visiting):
+                    result = True
+                    break
+        self.tex_subtree_memo[mkey] = result
+        return result
+
     def _place(self, inst, inherited_material_id, visiting):
         """An App::Link placing ``inst``, or a placed copy when its matrix is
-        sheared; ``None`` when it references no definition."""
+        sheared (or mirrored with textured faces, #30); ``None`` when it
+        references no definition."""
         child = self.model.definitions.get(inst.ref_idx)
         if child is None:
             return None
@@ -2818,7 +5725,13 @@ class _HierarchyImport:
         self.stats["placements"] += 1
         split = _link_transform(inst.matrix)
         if split is None:
-            obj = self._placed_copy(inst, child, child_material, label)
+            obj = self._placed_copy(inst, child, child_material, label, reason="sheared")
+        elif (
+            split[1].x * split[1].y * split[1].z < 0.0
+            and self.stats.get("_tex_ctx") is not None
+            and self._subtree_has_textured_face(child, child_material)
+        ):
+            obj = self._placed_copy(inst, child, child_material, label, reason="mirrored")
         else:
             target = self.component(child, child_material, visiting)
             if target is None:
@@ -2834,27 +5747,98 @@ class _HierarchyImport:
         _set_layer_property(obj, inst.layer)
         return obj
 
-    def _placed_copy(self, inst, child, child_material, label):
-        """A sheared placement: the component's whole geometry (nested
-        instances included), transformed and stored as one Part::Feature,
-        built the same way as the merged import."""
+    def _placed_copy(self, inst, child, child_material, label, reason="sheared"):
+        """A sheared (or mirrored textured) placement: for sheared placements,
+        stores the component's whole geometry as one compound (matching ``main``,
+        including empty geometry on annotation-only sheared components); for
+        mirrored textured placements (#30), preserves per-tag visibility and
+        the placing instance's ``SketchUpInstanceName``."""
+        tex_ctx = self.stats.get("_tex_ctx")
         scratch = {"faces_built": 0, "faces_skipped": 0, "placements": 0,
                    "edge_runs_built": 0, "edge_runs_skipped": 0, "arcs_built": 0,
                    "make_solids": self.stats.get("make_solids", False),
                    "fit_curved_surfaces": self.stats.get("fit_curved_surfaces", False),
                    "face_arcs_built": 0, "cylinders_built": 0, "cones_built": 0,
                    "spheres_built": 0, "curved_groups_unfitted": 0}
+        if tex_ctx is not None:
+            scratch["_tex_ctx"] = tex_ctx
+            scratch["_merged_uv_cache"] = self.stats.setdefault("_sheared_uv_cache", {})
         buckets = _get_local_shape(child, self.model, scratch, self.merged_cache, frozenset(), None,
                                    child_material, "Layer0")
-        shapes, colors = [], []
-        for shape, layer_colors in buckets.values():
+        uv_layer_map = (
+            scratch["_merged_uv_cache"].get((id(child), child_material, "Layer0"), {})
+            if tex_ctx is not None
+            else {}
+        )
+        mat_fc = _to_freecad_matrix(inst.matrix)
+
+        if reason == "mirrored":
+            if not buckets:
+                return None
+
+            def _make_mirrored_tag_obj(layer_name, obj_label):
+                shape, layer_colors = buckets[layer_name]
+                l_uvs, l_soft = uv_layer_map.get(layer_name, ([], []))
+                tag_comp = Part.makeCompound([shape])
+                tag_comp.transformShape(mat_fc, False, True)
+                xf_uvs = _transform_uv_records(l_uvs, inst.matrix, tag_comp.Faces)
+                xf_soft = []
+                for sm in l_soft[:8000]:
+                    mp = mat_fc.multVec(App.Vector(sm[0], sm[1], sm[2]))
+                    xf_soft.append((mp.x, mp.y, mp.z))
+                colors_list = list(layer_colors)
+                gobj = _create_geometry_object(
+                    self.doc, "PlacedCopy", obj_label, tag_comp, colors_list, self.stats,
+                    face_uvs=xf_uvs, soft_midpoints=xf_soft,
+                )
+                self.stats["object_face_colors"][gobj.Name] = colors_list
+                eff_tag = (inst.layer or "Layer0") if layer_name == "Layer0" else layer_name
+                _set_layer_property(gobj, eff_tag)
+                if (
+                    self.layer_hidden.get(layer_name, False)
+                    or (layer_name == "Layer0" and inst.layer and self.layer_hidden.get(inst.layer, False))
+                ):
+                    self._hide(gobj)
+                return gobj
+
+            if len(buckets) == 1 and next(iter(buckets)) == "Layer0":
+                obj = _make_mirrored_tag_obj("Layer0", f"{label} (mirrored copy)")
+                _set_instance_name_property(obj, inst.name)
+            else:
+                obj = self._add("App::Part", "PlacedCopy", f"{label} (mirrored copy)")
+                _set_instance_name_property(obj, inst.name)
+                for layer_name in buckets:
+                    gobj = _make_mirrored_tag_obj(layer_name, f"{label} ({layer_name})")
+                    obj.addObject(gobj)
+            self.stats["mirrored_copies"] = self.stats.get("mirrored_copies", 0) + 1
+            return obj
+
+        shapes, colors, raw_uvs, raw_soft = [], [], [], []
+        for layer_name, (shape, layer_colors) in buckets.items():
             shapes.append(shape)
             colors.extend(layer_colors)
+            if tex_ctx is not None:
+                l_uvs, l_soft = uv_layer_map.get(layer_name, ([], []))
+                raw_uvs.extend(l_uvs)
+                raw_soft.extend(l_soft)
         compound = Part.makeCompound(shapes)
-        compound.transformShape(_to_freecad_matrix(inst.matrix), False, True)
-        obj = self._add("Part::Feature", "PlacedCopy", f"{label} (sheared copy)")
-        obj.Shape = compound
-        self._apply_colors(obj, colors)
+        compound.transformShape(mat_fc, False, True)
+        copy_label = f"{label} ({reason} copy)"
+        if tex_ctx is not None:
+            xf_uvs = _transform_uv_records(raw_uvs, inst.matrix, compound.Faces)
+            xf_soft = []
+            for sm in raw_soft[:8000]:
+                mp = mat_fc.multVec(App.Vector(sm[0], sm[1], sm[2]))
+                xf_soft.append((mp.x, mp.y, mp.z))
+            obj = _create_geometry_object(
+                self.doc, "PlacedCopy", copy_label, compound, colors, self.stats,
+                face_uvs=xf_uvs, soft_midpoints=xf_soft,
+            )
+            self.stats["object_face_colors"][obj.Name] = colors
+        else:
+            obj = self._add("Part::Feature", "PlacedCopy", copy_label)
+            obj.Shape = compound
+            self._apply_colors(obj, colors)
         self.stats["sheared_copies"] += 1
         App.Console.PrintWarning(
             f"openskp: {label!r} is placed with a sheared transformation, which a link cannot hold; "
@@ -2928,7 +5912,7 @@ class _HierarchyImport:
             layer_group(layer).addObject(placed)
             if self.layer_hidden.get(layer, False):
                 self._hide(placed)
-            if self.annotations and _link_transform(inst.matrix) is None:
+            if self.annotations and not _is_type(placed, "App::Link"):
                 try:
                     child = self.model.definitions.get(inst.ref_idx)
                     if child is not None and id(child) in self.defs_with_annots:
@@ -3053,6 +6037,7 @@ def import_skp(
     assemblies=None,
     curved_surfaces=None,
     annotations=None,
+    textures=None,
 ):
     """Import a .skp file into a FreeCAD document, returning the document.
 
@@ -3100,6 +6085,14 @@ def import_skp(
     hierarchy layout, #29). ``annotations=None`` reads the ``ImportAnnotations``
     preference (True unless set to ``false``).
 
+    ``textures=True`` promotes only geometry objects that carry at least one
+    textured face to ``Part::FeaturePython`` with a Coin3D ``"Textured"``
+    display mode, storing each unique texture image once per document and
+    computing UVs via ``openskp``'s ``face_uv_basis`` and ``compute_face_uv``
+    (#30). ``textures=None`` reads the ``ImportTextures`` preference (False
+    unless set). When False, the imported document is identical to a plain
+    solid-colour import (no proxy objects and no extra properties).
+
     Each face's resolved color/opacity (its own paint, or whatever an
     ancestor group/component painted itself with, or a neutral default)
     is applied as ViewObject.DiffuseColor, one entry per Shape.Faces -
@@ -3121,6 +6114,8 @@ def import_skp(
         curved_surfaces = _bool_preference("FitCurvedSurfaces")
     if annotations is None:
         annotations = _bool_preference("ImportAnnotations", default=True)
+    if textures is None:
+        textures = _bool_preference("ImportTextures", default=False)
 
     print(f"openskp: parsing {os.path.basename(filepath)} "
           "(can take a while for a large file - this is real work, not a hang)...")
@@ -3197,11 +6192,18 @@ def import_skp(
         "dimensions_skipped_unresolved": 0,
         "annotations_capped": 0,
         "annotation_failures": 0,
+        "import_textures": bool(textures),
+        "textures_loaded": 0,
+        "textured_materials": 0,
+        "textured_objects": 0,
+        "textures_failed": 0,
         "unread_root_entities": unread_root_entities,
         "warnings": list(library_warnings),
         "large_hierarchy_warning": large_hierarchy,
     }
     last_import_stats = stats
+    if textures:
+        stats["_tex_ctx"] = _prepare_model_textures(model, filepath, stats, doc=doc)
 
     # FreeCAD's own native progress bar (the same Base.ProgressIndicator
     # its Draft/DXF importer uses) - visible in the GUI's status bar
@@ -3231,6 +6233,7 @@ def import_skp(
             saved_gui_selection = None
 
     skp_parsed = getattr(skp, "_parsed", None)
+    import_succeeded = False
     try:
         if merge:
             built = _import_merged(
@@ -3258,7 +6261,28 @@ def import_skp(
                 filepath=filepath,
             ).run()
             built = stats["components"]
+        import_succeeded = True
     finally:
+        tex_ctx_done = stats.pop("_tex_ctx", None)
+        if textures and tex_ctx_done is not None:
+            try:
+                _finalize_import_texture_store(doc, tex_ctx_done)
+            except Exception as exc:
+                pack_msg = (
+                    f"{os.path.basename(filepath)}: failed to write texture pack "
+                    f"({type(exc).__name__}: {exc})"
+                )
+                if import_succeeded:
+                    stats["warnings"].append(pack_msg)
+                App.Console.PrintWarning(f"openskp: {pack_msg}\n")
+        _ACTIVE_IMPORT_TEX_CTX_BY_DOC.pop(_doc_uid(doc), None)
+        if isinstance(tex_ctx_done, dict):
+            tex_ctx_done.clear()
+        stats.pop("_merged_uv_cache", None)
+        stats.pop("_sheared_uv_cache", None)
+        skp = None
+        model = None
+        skp_parsed = None
         if progress is not None:
             progress.stop()
         if App.GuiUp and use_annotations:
@@ -3315,6 +6339,20 @@ def import_skp(
         App.Console.PrintWarning(f"openskp: {msg}\n")
     else:
         stats.pop("_first_annotation_error", None)
+    if stats["textures_failed"]:
+        tex_details = stats.pop("_failed_texture_details", ())
+        preview = ", ".join(tex_details[:3])
+        if len(tex_details) > 3:
+            preview += f", +{len(tex_details) - 3} more"
+        msg = (
+            f"{base_file}: failed to read {stats['textures_failed']} texture(s)"
+            + (f" ({preview})" if preview else "")
+            + "; affected faces use solid colours"
+        )
+        stats["warnings"].append(msg)
+        App.Console.PrintWarning(f"openskp: {msg}\n")
+    else:
+        stats.pop("_failed_texture_details", None)
 
     doc.recompute()
     common = (
@@ -3332,6 +6370,11 @@ def import_skp(
             f"{stats['spheres_built']} spheres, "
             f"{stats['curved_groups_unfitted']} smoothed groups left faceted, "
             f"{stats['face_arcs_built']} circle/arc face edges"
+        )
+    if textures:
+        common += (
+            f"; {stats['textures_loaded']} textures ({stats['textured_objects']} textured objects"
+            + (f", {stats['textures_failed']} failed)" if stats["textures_failed"] else ")")
         )
     annot_skipped_total = (
         stats["texts_skipped_no_position"]
@@ -3384,6 +6427,11 @@ def _import_merged(doc, model, stats, progress, annotations=False, skp_parsed=No
     definitions built."""
     shape_cache: dict = {}
     root_buckets = _get_local_shape(model.root, model, stats, shape_cache, frozenset(), progress)
+    root_uv_map = (
+        stats.get("_merged_uv_cache", {}).get((id(model.root), None, "Layer0"), {})
+        if stats.get("_tex_ctx") is not None
+        else None
+    )
 
     layer_hidden = {layer.name: layer.hidden for layer in model.layers}
     # Kept on stats (not just applied to the ViewObject below) so this is
@@ -3392,16 +6440,27 @@ def _import_merged(doc, model, stats, progress, annotations=False, skp_parsed=No
     stats["layer_face_colors"] = {}
     for layer_name, (shape, colors) in root_buckets.items():
         base_name = "".join(c if c.isalnum() else "_" for c in layer_name) or "Layer"
-        obj = doc.addObject("Part::Feature", f"SketchUpImport_{base_name}")
-        obj.Label = layer_name
-        obj.Shape = shape
-        stats["layer_face_colors"][layer_name] = colors
-        if App.GuiUp:
-            if len(colors) == len(shape.Faces):
-                obj.ViewObject.DiffuseColor = colors
-            if layer_hidden.get(layer_name, False):
+        if root_uv_map is not None:
+            l_uvs, l_soft = root_uv_map.get(layer_name, ([], []))
+            obj = _create_geometry_object(
+                doc, f"SketchUpImport_{base_name}", layer_name, shape, colors, stats,
+                face_uvs=l_uvs, soft_midpoints=l_soft,
+            )
+            stats["layer_face_colors"][layer_name] = colors
+            if App.GuiUp and layer_hidden.get(layer_name, False):
                 obj.ViewObject.Visibility = False
                 stats["hidden_layers"] += 1
+        else:
+            obj = doc.addObject("Part::Feature", f"SketchUpImport_{base_name}")
+            obj.Label = layer_name
+            obj.Shape = shape
+            stats["layer_face_colors"][layer_name] = colors
+            if App.GuiUp:
+                if len(colors) == len(shape.Faces):
+                    obj.ViewObject.DiffuseColor = colors
+                if layer_hidden.get(layer_name, False):
+                    obj.ViewObject.Visibility = False
+                    stats["hidden_layers"] += 1
 
     if annotations:
         try:
@@ -3486,15 +6545,11 @@ def _is_straight_edge(edge):
     return chord > 0.0 and abs(edge.Length - chord) <= 1e-7 * max(1.0, edge.Length)
 
 
-def _wire_points_inches(wire, placement):
-    """A wire's ordered vertex points, in world space (``placement`` is an
-    App.Matrix or App.Placement, anything with multVec) and converted from FreeCAD's native millimetres
-    back to SketchUp's native inches. No closing/repeated final point -
-    openskp's add_face expects the polygon open, matching how
-    OrderedVertexes already returns it. Curved edges (circles/arcs) are
-    discretised in wire traversal order so circular discs and holes survive
-    export, while straight BSpline edges produced by OCCT's GTransform on
-    sheared/scaled faces stay two-point segments."""
+def _wire_points_inches_with_local(wire, placement, local_inv=None):
+    """Returns ``(world_pts_in, local_pts_in)`` in SketchUp inches for ``wire``:
+    ``world_pts_in`` has ``placement`` applied, while ``local_pts_in`` strips the
+    owning object's ``Placement`` via ``local_inv`` so per-face UV recipes stay
+    anchored to unplaced local coordinates without swimming."""
     edges = wire.OrderedEdges
     if all(_is_straight_edge(e) for e in edges):
         raw_pts = [v.Point for v in wire.OrderedVertexes]
@@ -3511,9 +6566,25 @@ def _wire_points_inches(wire, placement):
                 pts_e = pts_e[::-1]
             raw_pts.extend(pts_e[:-1])
     pts = []
+    local_pts = []
     for pt in raw_pts:
+        lp = local_inv.multVec(pt) if local_inv is not None else pt
+        local_pts.append((lp.x / INCH_TO_MM, lp.y / INCH_TO_MM, lp.z / INCH_TO_MM))
         p = placement.multVec(pt)
         pts.append((p.x / INCH_TO_MM, p.y / INCH_TO_MM, p.z / INCH_TO_MM))
+    return pts, local_pts
+
+
+def _wire_points_inches(wire, placement):
+    """A wire's ordered vertex points, in world space (``placement`` is an
+    App.Matrix or App.Placement, anything with multVec) and converted from FreeCAD's native millimetres
+    back to SketchUp's native inches. No closing/repeated final point -
+    openskp's add_face expects the polygon open, matching how
+    OrderedVertexes already returns it. Curved edges (circles/arcs) are
+    discretised in wire traversal order so circular discs and holes survive
+    export, while straight BSpline edges produced by OCCT's GTransform on
+    sheared/scaled faces stay two-point segments."""
+    pts, _ = _wire_points_inches_with_local(wire, placement)
     return pts
 
 
@@ -3534,7 +6605,7 @@ def _material_name(key):
     return name
 
 
-def _register_face_materials(obj, builder, material_handle_by_key):
+def _register_face_materials(obj, builder, material_handle_by_key, used_mat_names=None):
     """Returns a list of material handles, one per obj.Shape.Faces entry
     (all None where no per-face color is available), registering any
     newly-seen distinct color via openskp's builder.add_material() as
@@ -3565,8 +6636,9 @@ def _register_face_materials(obj, builder, material_handle_by_key):
         if key not in material_handle_by_key:
             r, g, b, a100 = key
             opacity = a100 / 100.0
+            mname = _unique_material_export_name(_material_name(key), used_mat_names) if used_mat_names is not None else _material_name(key)
             material_handle_by_key[key] = builder.add_material(
-                _material_name(key), (r, g, b), opacity=None if opacity >= 1.0 else opacity
+                mname, (r, g, b), opacity=None if opacity >= 1.0 else opacity
             )
         handles.append(material_handle_by_key[key])
     return handles
@@ -3687,10 +6759,15 @@ _ASSEMBLY_META_GROUPS = (
 )
 
 
+def _is_texture_store(obj):
+    return bool(getattr(obj, "IsSketchUpTextureStore", False))
+
+
 def _is_skipped_export_group(obj):
     return (
         _is_definitions_group(obj)
         or bool(getattr(obj, "SketchUpAnnotations", False))
+        or _is_texture_store(obj)
         or any(_is_type(obj, t) for t in _ASSEMBLY_META_GROUPS)
     )
 
@@ -3797,9 +6874,17 @@ def _polygon_coplanar_and_valid(points, holes=()):
     return True
 
 
-def _extract_shape_faces(shape, transform, stats):
-    """Returns ``[(outer_pts, holes, face_idx), ...]`` in inches for every
-    valid face of ``shape`` mapped through ``transform`` (mm), incrementing
+def _object_local_inverse_matrix(obj):
+    pl = getattr(obj, "Placement", None)
+    if pl is None or pl.isIdentity():
+        return None
+    return pl.toMatrix().inverse()
+
+
+def _extract_shape_faces(shape, transform, stats, local_inv=None):
+    """Returns ``[(outer_pts, holes, face_idx, local_outer_pts), ...]`` in inches
+    for every valid face of ``shape`` mapped through ``transform`` (mm), stripping
+    ``obj.Placement`` via ``local_inv`` for ``local_outer_pts`` and incrementing
     ``stats['faces_skipped']`` for degenerate or non-planar faces."""
     mirrored = transform.determinant() < 0
     extracted = []
@@ -3812,18 +6897,36 @@ def _extract_shape_faces(shape, transform, stats):
                 stats["faces_skipped"] += 1
                 continue
             pts_in = []
+            loc_in = []
+            v_nrms = []
             for v in verts_mm:
+                lv = local_inv.multVec(v) if local_inv is not None else v
+                loc_in.append((lv.x / INCH_TO_MM, lv.y / INCH_TO_MM, lv.z / INCH_TO_MM))
                 p = transform.multVec(v)
                 pts_in.append((p.x / INCH_TO_MM, p.y / INCH_TO_MM, p.z / INCH_TO_MM))
+                try:
+                    u_p, v_p = face.Surface.parameter(v)
+                    v_nrms.append(face.normalAt(u_p, v_p))
+                except Exception:
+                    v_nrms.append(None)
             for a, b, c in tris:
-                tri_pts = [pts_in[a], pts_in[c], pts_in[b]] if mirrored else [pts_in[a], pts_in[b], pts_in[c]]
+                va, vb, vc = verts_mm[a], verts_mm[b], verts_mm[c]
+                cr = (vb - va).cross(vc - va)
+                na = v_nrms[a]
+                flip_brep = na is not None and cr.dot(na) < 0.0
+                if flip_brep ^ mirrored:
+                    tri_pts = [pts_in[a], pts_in[c], pts_in[b]]
+                    tri_loc = [loc_in[a], loc_in[c], loc_in[b]]
+                else:
+                    tri_pts = [pts_in[a], pts_in[b], pts_in[c]]
+                    tri_loc = [loc_in[a], loc_in[b], loc_in[c]]
                 if _polygon_coplanar_and_valid(tri_pts):
-                    extracted.append((tri_pts, [], i))
+                    extracted.append((tri_pts, [], i, tri_loc, -1.0 if mirrored else 1.0))
                 else:
                     stats["faces_skipped"] += 1
             continue
         outer = face.OuterWire
-        outer_pts = _wire_points_inches(outer, transform)
+        outer_pts, local_outer_pts = _wire_points_inches_with_local(outer, transform, local_inv=local_inv)
         if len(outer_pts) < 3:
             stats["faces_skipped"] += 1
             continue
@@ -3836,8 +6939,9 @@ def _extract_shape_faces(shape, transform, stats):
                 holes.append(hole_pts[::-1] if mirrored else hole_pts)
         if mirrored:
             outer_pts = outer_pts[::-1]
+            local_outer_pts = local_outer_pts[::-1]
         if _polygon_coplanar_and_valid(outer_pts, holes):
-            extracted.append((outer_pts, holes, i))
+            extracted.append((outer_pts, holes, i, local_outer_pts, -1.0 if mirrored else 1.0))
         else:
             stats["faces_skipped"] += 1
     return extracted
@@ -3960,7 +7064,7 @@ def _collect_export_plan(exportList, stats):
             if shape is None or shape.isNull():
                 return
             leaf = matrix * obj.Placement.toMatrix().inverse() if is_root_target else matrix
-            extracted = _extract_shape_faces(shape, leaf, stats)
+            extracted = _extract_shape_faces(shape, leaf, stats, local_inv=_object_local_inverse_matrix(obj))
             if extracted:
                 own_leaves.append((obj, extracted, def_layer))
 
@@ -4006,7 +7110,7 @@ def _collect_export_plan(exportList, stats):
         shape = getattr(obj, "Shape", None)
         if shape is None or shape.isNull():
             return
-        extracted = _extract_shape_faces(shape, matrix, stats)
+        extracted = _extract_shape_faces(shape, matrix, stats, local_inv=_object_local_inverse_matrix(obj))
         if extracted:
             root_leaves.append((obj, extracted, layer))
 
@@ -4030,13 +7134,415 @@ def _collect_export_plan(exportList, stats):
     return ordered_definitions, root_leaves, root_instances
 
 
-def _write_extracted_faces(target_builder, extracted, stats, layer_handle, material_handles):
-    for outer_pts, holes, face_idx in extracted:
-        material = material_handles[face_idx] if material_handles and face_idx < len(material_handles) else None
+def _unique_material_export_name(base_name, used_mat_names):
+    base = (base_name or "Material").strip() or "Material"
+    if base not in used_mat_names:
+        used_mat_names.add(base)
+        return base
+    idx = 1
+    while f"{base}_{idx}" in used_mat_names:
+        idx += 1
+    cand = f"{base}_{idx}"
+    used_mat_names.add(cand)
+    return cand
+
+
+def _export_texture_bytes_and_ext(raw_bytes, mat_info):
+    """Returns ``(png_or_jpeg_bytes, ext)`` accepted by
+    ``openskp.create``'s textured material writer (PNG/JPEG), or ``None``."""
+    if not isinstance(mat_info, dict):
+        return None
+    colorized = bool(mat_info.get("colorized", False))
+    if not colorized and raw_bytes:
+        if len(raw_bytes) >= 8 and raw_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+            return raw_bytes, ".png"
+        if len(raw_bytes) >= 3 and raw_bytes[0] == 0xFF and raw_bytes[1] == 0xD8 and raw_bytes[2] == 0xFF:
+            return raw_bytes, ".jpg"
+    fname_raw = mat_info.get("filename", "")
+    decoded = _decode_qimage_rgba(raw_bytes, fname_raw if isinstance(fname_raw, str) else "")
+    if decoded is None:
+        return None
+    w, h, rgba_top_down = decoded
+    if colorized:
+        import numpy as np
+
+        arr = np.frombuffer(rgba_top_down, dtype=np.uint8).reshape((h, w, 4))
+        rgba_col = _safe_rgba_u8_list(mat_info.get("rgba"), default=(255, 255, 255, 255))
+        ctype = int(_safe_float(mat_info.get("colorize_type", 0), 0.0))
+        arr = _apply_sketchup_colorize_rgba(arr, rgba_col[:3], ctype)
+        rgba_top_down = arr.tobytes()
+    return _encode_rgba_png(w, h, rgba_top_down), ".png"
+
+
+def _builder_add_texture_material_bytes(
+    builder, name, bare_fn, img_bytes, applied_width=1.0, applied_height=1.0, opacity=None
+):
+    """Registers an image-textured material directly from in-memory PNG/JPEG
+    ``img_bytes`` with a neutral bare filename ``bare_fn`` (writing zero temporary
+    files and embedding zero host paths into ``CMaterial``)."""
+    import inspect
+    from openskp.create import SkpWriteError, _detect_image_subtype
+
+    if hasattr(builder, "add_texture_material"):
+        sig = inspect.signature(builder.add_texture_material)
+        if "image_bytes" in sig.parameters:
+            return builder.add_texture_material(
+                name,
+                bare_fn,
+                image_bytes=img_bytes,
+                applied_width=applied_width,
+                applied_height=applied_height,
+                opacity=opacity,
+            )
+    if builder._geometry_writer is not None:
+        raise SkpWriteError("add_texture_material must be called before any add_face calls")
+    if builder._layer_writer is not None:
+        raise SkpWriteError("add_texture_material must be called before any add_layer calls")
+    if builder._definition_writer is not None:
+        raise SkpWriteError("add_texture_material must be called before any add_component_definition calls")
+    if name in builder.materials_by_name:
+        return builder.materials_by_name[name]
+    subtype = _detect_image_subtype(img_bytes)
+    slot = builder._material_writer.write_textured_material(
+        name,
+        img_bytes,
+        bare_fn,
+        subtype=subtype,
+        applied_width=applied_width,
+        applied_height=applied_height,
+        opacity=opacity,
+    )
+    builder.materials_by_name[name] = slot
+    builder._applied_sizes[slot] = (
+        1.0 if applied_width is None else float(applied_width),
+        1.0 if applied_height is None else float(applied_height),
+    )
+    builder._material_count += 1
+    return slot
+
+
+def _register_export_object_faces(obj, builder, material_handle_by_key, used_mat_names, stats=None):
+    """Returns ``[(front_handle, back_handle, front_uv_fn, back_uv_fn), ...]``
+    (one entry per ``obj.Shape.Faces``), handling both textured
+    ``Part::FeaturePython`` objects (#30, headless and GUI alike) and plain
+    ``Part::Feature`` ``DiffuseColor`` objects."""
+    import hashlib
+    from openskp._face_groups import compute_face_uv, face_uv_basis
+
+    doc_uid = _doc_uid(getattr(obj, "Document", None))
+    shape = obj.Shape
+    payload = _parse_face_uvs_payload(getattr(obj, "SketchUpFaceUVsJSON", "") or "")
+    face_records = payload.get("faces") if payload is not None else ()
+    if face_records and len(face_records) == len(shape.Faces):
+        mats_dict, blobs_dict = _resolve_object_materials_and_blobs(obj)
+        gui_colors = None
+        if App.GuiUp and hasattr(obj, "ViewObject") and obj.ViewObject is not None:
+            try:
+                cand_c = list(obj.ViewObject.DiffuseColor)
+                if len(cand_c) == len(shape.Faces):
+                    gui_colors = [_safe_rgba_float(c) for c in cand_c]
+                elif len(cand_c) == 1 and len(shape.Faces) >= 1:
+                    gui_colors = [_safe_rgba_float(cand_c[0])] * len(shape.Faces)
+            except Exception:
+                gui_colors = None
+
+        def _reg_solid_fallback(rgba, mname):
+            ckey = _material_key(_safe_rgba_float(rgba))
+            skey = ("solid", *ckey, (mname or "")[:120])
+            if skey not in material_handle_by_key:
+                r_i, g_i, b_i, a100 = ckey
+                skp_mname = _unique_material_export_name((mname or _material_name(ckey))[:120], used_mat_names)
+                try:
+                    material_handle_by_key[skey] = builder.add_material(
+                        skp_mname, (r_i, g_i, b_i), opacity=None if a100 >= 100 else a100 / 100.0
+                    )
+                except Exception:
+                    if stats is not None:
+                        stats["materials_failed"] = stats.get("materials_failed", 0) + 1
+                    return None
+            return material_handle_by_key[skey]
+
+        def _reg_side(side_entry, gui_rgba_override=None, local_normal_sign=1.0, alpha_only_override=None):
+            if side_entry is None:
+                if gui_rgba_override is not None:
+                    return _reg_solid_fallback(gui_rgba_override, None), None
+                return None, None
+            if side_entry[0] == "t" and len(side_entry) >= 5 and isinstance(side_entry[1], str):
+                mk = side_entry[1]
+                minfo = mats_dict.get(mk) if isinstance(mats_dict, dict) else None
+                if minfo is None:
+                    minfo = _PROCESS_MAT_CACHE.get(mk, doc_uid=doc_uid)
+                if isinstance(minfo, dict):
+                    init_rgba = _initial_side_diffuse_rgba(side_entry, mats_dict, doc_uid=doc_uid)
+                    if gui_rgba_override is not None and _rgb_key(gui_rgba_override) != _rgb_key(init_rgba):
+                        return _reg_solid_fallback(gui_rgba_override, None), None
+                    tid = minfo.get("tex_id")
+                    raw_b = blobs_dict.get(tid) if (isinstance(tid, str) and tid and blobs_dict is not None) else None
+                    if raw_b is None and isinstance(tid, str) and tid:
+                        raw_b = _PROCESS_TEX_CACHE.get(tid, doc_uid=doc_uid)
+                    try:
+                        prep = _export_texture_bytes_and_ext(raw_b, minfo) if raw_b else None
+                    except Exception:
+                        prep = None
+                    if prep is not None:
+                        img_bytes, ext = prep
+                        tw = _safe_float(minfo.get("tile_w"), 1.0)
+                        th = _safe_float(minfo.get("tile_h"), 1.0)
+                        if tw <= 1e-12:
+                            tw = 1.0
+                        if th <= 1e-12:
+                            th = 1.0
+                        if gui_rgba_override is not None:
+                            op = max(0.0, min(1.0, _safe_float(gui_rgba_override[3], 1.0)))
+                        elif alpha_only_override is not None:
+                            op = max(0.0, min(1.0, _safe_float(alpha_only_override, 1.0)))
+                        else:
+                            op = max(0.0, min(1.0, _safe_float(minfo.get("opacity", 1.0), 1.0)))
+                        base_mname = str(minfo.get("name") or "TexturedMaterial")[:120]
+                        img_digest = hashlib.sha256(img_bytes).hexdigest()[:24]
+                        dkey = ("tex", img_digest, round(tw, 6), round(th, 6), round(op, 4), base_mname)
+                        handle = material_handle_by_key.get(dkey)
+                        if handle is None and dkey not in material_handle_by_key:
+                            try:
+                                skp_mname = _unique_material_export_name(base_mname, used_mat_names)
+                                orig_fn = os.path.basename(str(minfo.get("filename") or "").replace("\\", "/"))
+                                stem = os.path.splitext(orig_fn)[0] if orig_fn else f"tex_{len(material_handle_by_key)}"
+                                safe_stem = "".join(c if (c.isalnum() or c in "_-") else "_" for c in stem).strip("_")[:32] or "tex"
+                                bare_fn = f"{safe_stem}_{img_digest[:8]}{ext}"
+                                handle = _builder_add_texture_material_bytes(
+                                    builder,
+                                    skp_mname,
+                                    bare_fn,
+                                    img_bytes,
+                                    applied_width=tw,
+                                    applied_height=th,
+                                    opacity=None if op >= 1.0 - 1e-6 else op,
+                                )
+                                material_handle_by_key[dkey] = handle
+                            except Exception:
+                                material_handle_by_key[dkey] = None
+                                if stats is not None:
+                                    stats["materials_failed"] = stats.get("materials_failed", 0) + 1
+                                handle = None
+                        if handle is not None:
+                            basis_raw = side_entry[2]
+                            uv_xf = tuple(side_entry[3]) if isinstance(side_entry[3], (list, tuple)) else None
+                            inv_m12 = side_entry[4] if isinstance(side_entry[4], (list, tuple)) else None
+
+                            def _uv_fn(
+                                p_shape_in,
+                                tri_local_normal=None,
+                                _b=basis_raw,
+                                _xf=uv_xf,
+                                _inv=inv_m12,
+                                _tw=tw,
+                                _th=th,
+                                _ns=local_normal_sign,
+                            ):
+                                p_def = _apply_m12(_inv, p_shape_in)
+                                if isinstance(_b, (list, tuple)) and len(_b) == 3:
+                                    xr, yr = face_uv_basis(
+                                        (
+                                            _safe_float(_b[0], 0.0),
+                                            _safe_float(_b[1], 0.0),
+                                            _safe_float(_b[2], 1.0),
+                                        )
+                                    )
+                                elif tri_local_normal is not None:
+                                    n_use = (
+                                        (tri_local_normal[0] * _ns, tri_local_normal[1] * _ns, tri_local_normal[2] * _ns)
+                                        if _ns < 0.0
+                                        else tri_local_normal
+                                    )
+                                    xr, yr = face_uv_basis(_transform_normal_by_inv_m12(n_use, _inv))
+                                else:
+                                    xr, yr = face_uv_basis((0.0, 0.0, 1.0))
+                                return compute_face_uv(p_def, xr, yr, _xf, _tw, _th)
+
+                            return handle, _uv_fn
+                    rc = _safe_rgba_u8_list(minfo.get("rgba"), default=(200, 200, 200, 255))
+                    op = (
+                        max(0.0, min(1.0, _safe_float(gui_rgba_override[3], 1.0)))
+                        if gui_rgba_override is not None
+                        else max(0.0, min(1.0, _safe_float(minfo.get("opacity", 1.0), 1.0)))
+                    )
+                    rgba = (rc[0] / 255.0, rc[1] / 255.0, rc[2] / 255.0, op)
+                    return _reg_solid_fallback(rgba, minfo.get("name")), None
+                if stats is not None:
+                    stats["materials_failed"] = stats.get("materials_failed", 0) + 1
+                return None, None
+
+            stored_rgba = _safe_rgba_float(side_entry[1:5]) if len(side_entry) >= 5 else _DEFAULT_FACE_RGBA
+            mname = side_entry[5] if (len(side_entry) >= 6 and isinstance(side_entry[5], str)) else None
+            if gui_rgba_override is not None:
+                if _rgb_key(gui_rgba_override) != _rgb_key(stored_rgba):
+                    rgba = gui_rgba_override
+                    mname = None
+                    is_painted = True
+                elif abs(gui_rgba_override[3] - stored_rgba[3]) > 1e-2:
+                    rgba = (stored_rgba[0], stored_rgba[1], stored_rgba[2], gui_rgba_override[3])
+                    is_painted = True
+                else:
+                    rgba = stored_rgba
+                    is_painted = mname is not None
+            else:
+                rgba = stored_rgba
+                is_painted = mname is not None
+            if not is_painted:
+                return None, None
+            return _reg_solid_fallback(rgba, mname), None
+
+        specs = []
+        for f_idx, rec in enumerate(face_records):
+            front_e, back_e = rec[0], rec[1]
+            flipped = 1 if (rec[2] is True or rec[2] == 1) else 0
+            ns_skp = -1.0 if flipped else 1.0
+            g_override = gui_colors[f_idx] if gui_colors is not None else None
+            f_orig_h, f_orig_uv = _reg_side(front_e, gui_rgba_override=g_override, local_normal_sign=ns_skp)
+            if back_e is None:
+                b_orig_h, b_orig_uv = f_orig_h, f_orig_uv
+            else:
+                back_alpha = None
+                if g_override is not None:
+                    init_f = _initial_side_diffuse_rgba(front_e, mats_dict, doc_uid=doc_uid)
+                    if _rgb_key(g_override) == _rgb_key(init_f) and abs(g_override[3] - init_f[3]) > 1e-2:
+                        back_alpha = g_override[3]
+                b_orig_h, b_orig_uv = _reg_side(
+                    back_e, gui_rgba_override=None, local_normal_sign=ns_skp, alpha_only_override=back_alpha
+                )
+            if flipped:
+                f_h, f_uv, b_h, b_uv = b_orig_h, b_orig_uv, f_orig_h, f_orig_uv
+            else:
+                f_h, f_uv, b_h, b_uv = f_orig_h, f_orig_uv, b_orig_h, b_orig_uv
+            specs.append((f_h, b_h, f_uv, b_uv))
+        return specs
+
+    solid_handles = _register_face_materials(obj, builder, material_handle_by_key, used_mat_names=used_mat_names)
+    return [(h, None, None, None) for h in solid_handles]
+
+
+def _build_three_uv_pins(outer_pts, local_pts, uv_fn, normal_sign=1.0):
+    """Selects 3 well-separated non-collinear polygon vertices in O(N) time
+    using scale-relative area and UV-determinant thresholds, returning
+    ``[(outer_pt, (u, v)), ...]`` for ``add_face(front_uv=..., back_uv=...)``,
+    or ``None`` if no non-degenerate triple exists."""
+    if uv_fn is None or len(outer_pts) < 3 or len(local_pts) != len(outer_pts):
+        return None
+    n = len(outer_pts)
+    ax, ay, az = outer_pts[0]
+
+    # Pass 1 (O(N)): find vertex i1 farthest from vertex 0.
+    best_j = -1
+    best_d2 = 0.0
+    for j in range(1, n):
+        dx = outer_pts[j][0] - ax
+        dy = outer_pts[j][1] - ay
+        dz = outer_pts[j][2] - az
+        d2 = dx * dx + dy * dy + dz * dz
+        if d2 > best_d2:
+            best_d2 = d2
+            best_j = j
+    if best_j < 0 or best_d2 <= 1e-20:
+        return None
+
+    e1x = outer_pts[best_j][0] - ax
+    e1y = outer_pts[best_j][1] - ay
+    e1z = outer_pts[best_j][2] - az
+
+    # Pass 2 (O(N)): collect up to 4 vertices maximizing |e1 x (p_k - p_0)|^2
+    # above a scale-relative collinearity threshold (1e-12 * |e1|^4).
+    area2_min = 1e-12 * (best_d2 * best_d2)
+    top_k = []
+    for k in range(1, n):
+        if k == best_j:
+            continue
+        e2x = outer_pts[k][0] - ax
+        e2y = outer_pts[k][1] - ay
+        e2z = outer_pts[k][2] - az
+        crx = e1y * e2z - e1z * e2y
+        cry = e1z * e2x - e1x * e2z
+        crz = e1x * e2y - e1y * e2x
+        area2 = crx * crx + cry * cry + crz * crz
+        if area2 <= area2_min:
+            continue
+        if len(top_k) < 4:
+            top_k.append((area2, k))
+            top_k.sort(reverse=True)
+        elif area2 > top_k[-1][0]:
+            top_k[-1] = (area2, k)
+            top_k.sort(reverse=True)
+
+    if not top_k:
+        return None
+
+    k0 = top_k[0][1]
+    ia, ib, ic = sorted((0, best_j, k0))
+    pa, pb, pc = local_pts[ia], local_pts[ib], local_pts[ic]
+    lex, ley, lez = pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]
+    lfx, lfy, lfz = pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]
+    tnx = (ley * lfz - lez * lfy) * normal_sign
+    tny = (lez * lfx - lex * lfz) * normal_sign
+    tnz = (lex * lfy - ley * lfx) * normal_sign
+    tlen = math.sqrt(tnx * tnx + tny * tny + tnz * tnz)
+    tri_n = (tnx / tlen, tny / tlen, tnz / tlen) if tlen > 1e-12 else (0.0, 0.0, 1.0)
+
+    u0, v0 = uv_fn(local_pts[0], tri_n)
+    u1, v1 = uv_fn(local_pts[best_j], tri_n)
+    du1, dv1 = u1 - u0, v1 - v0
+    d1_uv2 = du1 * du1 + dv1 * dv1
+    for _area2, k in top_k:
+        uk, vk = uv_fn(local_pts[k], tri_n)
+        duk, dvk = uk - u0, vk - v0
+        uv_det = du1 * dvk - dv1 * duk
+        uv_span2 = max(d1_uv2, duk * duk + dvk * dvk)
+        if uv_span2 > 1e-30 and abs(uv_det) > 1e-7 * uv_span2:
+            return [(outer_pts[0], (u0, v0)), (outer_pts[best_j], (u1, v1)), (outer_pts[k], (uk, vk))]
+    return None
+
+
+def _write_extracted_faces(target_builder, extracted, stats, layer_handle, face_material_specs):
+    for item in extracted:
+        if len(item) == 5:
+            outer_pts, holes, face_idx, local_pts, n_sign = item
+        elif len(item) == 4:
+            outer_pts, holes, face_idx, local_pts = item
+            n_sign = 1.0
+        else:
+            outer_pts, holes, face_idx = item
+            local_pts = outer_pts
+            n_sign = 1.0
+        spec = face_material_specs[face_idx] if face_material_specs and face_idx < len(face_material_specs) else None
+        if isinstance(spec, tuple):
+            front_mat, back_mat, front_uv_fn, back_uv_fn = spec
+        else:
+            front_mat, back_mat, front_uv_fn, back_uv_fn = spec, None, None, None
+        front_uv = _build_three_uv_pins(outer_pts, local_pts, front_uv_fn, normal_sign=n_sign) if front_mat is not None else None
+        back_uv = _build_three_uv_pins(outer_pts, local_pts, back_uv_fn, normal_sign=n_sign) if back_mat is not None else None
         try:
-            target_builder.add_face(outer_pts, holes=holes, layer=layer_handle, material=material)
+            target_builder.add_face(
+                outer_pts,
+                holes=holes,
+                layer=layer_handle,
+                material=front_mat,
+                back_material=back_mat,
+                front_uv=front_uv,
+                back_uv=back_uv,
+            )
             stats["faces_written"] += 1
         except Exception:
+            if front_uv is not None or back_uv is not None:
+                try:
+                    target_builder.add_face(
+                        outer_pts,
+                        holes=holes,
+                        layer=layer_handle,
+                        material=front_mat,
+                        back_material=back_mat,
+                    )
+                    stats["faces_written"] += 1
+                    continue
+                except Exception:
+                    pass
             stats["faces_skipped"] += 1
 
 
@@ -4055,9 +7561,10 @@ def export(exportList, filename):
 
     Tags come from ``SketchUpLayer`` on imported tag groups and links; for
     plain objects that were never part of an imported hierarchy, each
-    object's ``Label`` becomes its SketchUp tag. Per-face ``DiffuseColor``
-    materials are deduplicated across all component definitions and loose
-    objects when running under the GUI.
+    object's ``Label`` becomes its SketchUp tag. Textured ``Part::FeaturePython``
+    objects (#30) export their textured materials and per-face front/back UVs
+    (in both headless and GUI sessions); plain ``Part::Feature`` objects export
+    their deduplicated ``ViewObject.DiffuseColor`` materials under the GUI.
     """
     from openskp import create
 
@@ -4067,21 +7574,26 @@ def export(exportList, filename):
     stats = {
         "faces_written": 0, "faces_skipped": 0, "objects_skipped": 0,
         "definitions_written": 0, "instances_written": 0,
-        "materials_written": 0, "layers_written": 0,
+        "materials_written": 0, "materials_failed": 0, "layers_written": 0,
     }
-    stats["objects_skipped"] = sum(1 for o in exportList if not _can_export(o))
+    stats["objects_skipped"] = sum(
+        1 for o in exportList if not _can_export(o) and not _is_texture_store(o)
+    )
     ordered_definitions, root_leaves, root_instances = _collect_export_plan(exportList, stats)
 
     # openskp's writer requires materials, then layers, then component
     # definitions, then root-level faces and instances, in that exact order.
     material_handle_by_key = {}
-    object_material_handles = {}
+    used_mat_names = set()
+    object_material_specs = {}
     all_leaf_objs = [obj for plan in ordered_definitions for obj, _, _ in plan["leaves"]] + [
         obj for obj, _, _ in root_leaves
     ]
     for obj in all_leaf_objs:
-        if id(obj) not in object_material_handles:
-            object_material_handles[id(obj)] = _register_face_materials(obj, builder, material_handle_by_key)
+        if id(obj) not in object_material_specs:
+            object_material_specs[id(obj)] = _register_export_object_faces(
+                obj, builder, material_handle_by_key, used_mat_names, stats=stats
+            )
 
     layer_names = []
     for plan in ordered_definitions:
@@ -4101,7 +7613,7 @@ def export(exportList, filename):
             for obj, extracted, layer in plan["leaves"]:
                 _write_extracted_faces(
                     db, extracted, stats, layer_handle_by_label.get(layer),
-                    object_material_handles.get(id(obj)),
+                    object_material_specs.get(id(obj)),
                 )
             for inst_name, child_key, m3, trans, layer in plan["instances"]:
                 db.add_instance(
@@ -4118,7 +7630,7 @@ def export(exportList, filename):
     for obj, extracted, layer in root_leaves:
         _write_extracted_faces(
             builder, extracted, stats, layer_handle_by_label.get(layer),
-            object_material_handles.get(id(obj)),
+            object_material_specs.get(id(obj)),
         )
     for inst_name, def_key, m3, trans, layer in root_instances:
         builder.add_instance(
@@ -4130,7 +7642,7 @@ def export(exportList, filename):
         )
         stats["instances_written"] += 1
 
-    stats["materials_written"] = len(material_handle_by_key)
+    stats["materials_written"] = sum(1 for v in material_handle_by_key.values() if v is not None)
     stats["layers_written"] = len(layer_handle_by_label)
     last_export_stats = stats
 

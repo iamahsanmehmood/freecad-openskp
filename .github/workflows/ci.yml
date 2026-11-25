@@ -65,6 +65,11 @@ jobs:
           ${{ steps.locate.outputs.freecadcmd }} _pip_install.py
           rm _pip_install.py
 
+      - name: Run textured materials option tests
+        run: |
+          git fetch origin a7544128e7f02476cfb0781029dc72001bf9003e --depth=1
+          ${{ steps.locate.outputs.freecadcmd }} tests/test_textures.py
+
       - name: Run import tests
         run: ${{ steps.locate.outputs.freecadcmd }} tests/test_import.py
 
@@ -88,6 +93,9 @@ jobs:
 
       - name: Run annotations option tests
         run: ${{ steps.locate.outputs.freecadcmd }} tests/test_annotations.py
+
+      - name: Run textured materials headless benchmark
+        run: ${{ steps.locate.outputs.freecadcmd }} tests/bench_textures.py
 
       # The tests above call the importer directly, so none of them can tell whether
       # FreeCAD registers the .skp types by itself at startup (#14). This one starts a
@@ -148,6 +156,11 @@ jobs:
           if [ ! -f "$GUI_OUT/result.txt" ]; then echo "::error::the GUI check wrote no result"; exit 1; fi
           cat "$GUI_OUT/result.txt"
           head -1 "$GUI_OUT/result.txt" | grep -qx PASS
+
+      - name: Run textured materials GUI benchmark
+        run: |
+          FREECADCMD=$(find squashfs-root -type f -name 'freecadcmd' | head -1)
+          BENCH_LAUNCHER='xvfb-run -a -s "-screen 0 1600x1000x24" squashfs-root/AppRun' "$FREECADCMD" tests/bench_textures.py
 
       - name: Upload screenshots
         if: always()
