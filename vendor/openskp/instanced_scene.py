@@ -28,9 +28,16 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import _core
-from ._curves import _chain_loose_edges, _solve_run_arc
-from ._face_groups import FaceGroupContext, FaceGroupKey, build_local_face_groups
+from ._curves import _prepare_definition_curves, _solve_run_arc
+from ._face_groups import (
+    FaceGroupContext,
+    build_local_face_groups,
+    resolve_color,
+    resolve_material,
+    unpainted_style_colors,
+)
 from .errors import SkpParseError
+from .model import Page, _convert_pages
 from .scene import SceneTexture, _original_image_mime, _sniff_image_mime, _warn_skipped_texture
 
 logger = logging.getLogger("openskp.instanced_scene")
@@ -77,7 +84,12 @@ class LocalPrimitive:
     normals: array
     uvs: array
     indices: array
+    # Triangle offsets for separately emitted back sides.
+    back_triangles: array = field(default_factory=lambda: array("I"), kw_only=True)
     material_index: int
+    # The back copies of faces with no paint on either side; see
+    # openskp.scene.GlbPrimitive.unpainted_back.
+    unpainted_back: bool = False
 
 
 @dataclass
@@ -213,6 +225,11 @@ class InstancedScene:
     # this was never threaded through here even after that fix landed for
     # the baked path (openskp#272).
     layer_hidden: Dict[str, bool] = field(default_factory=dict)
+    unread_root_entities: int = 0
+    # Saved scenes (SketchUp's "Scenes" tabs), identical to SkpModel.pages.
+    # Camera eye/target/up and ortho_height stay in SketchUp's native Z-up
+    # frame and inches (unlike mesh_resources/matrix, which are Y-up metres).
+    pages: List[Page] = field(default_factory=list)
 
 
 def _to_gltf_matrix(m: List[float]) -> Tuple[float, ...]:
@@ -266,6 +283,8 @@ def build_instanced_scene(
     parsed: Dict[str, Any],
     name_override_keys: Sequence[str] = ("name", "label", "code"),
     original_textures: bool = False,
+    unpainted_faces: str = "style",
+    include_curve_sets: bool = True,
 ) -> InstancedScene:
     """Build an instanced scene from already-parsed raw data.
 
@@ -300,9 +319,14 @@ def build_instanced_scene(
     def get_layer_color(name: str) -> Tuple[int, int, int]:
         return layer_colors.get(name, (136, 136, 136))
 
-    # Textures deduplicated by bytes, exactly as the baked path does.
+    style_colors = unpainted_style_colors(parsed, unpainted_faces)
+
+    # Textures deduplicated by full content, with an object-identity fast
+    # path per face, matching scene.py.
     textures: List[SceneTexture] = []
-    texture_index_by_key: Dict[str, int] = {}
+    texture_index_by_id: Dict[int, int] = {}
+    texture_index_by_bytes: Dict[bytes, int] = {}
+    kept_data_refs: List[Any] = []
     skipped_textures: set = set()
 
     def texture_index_for(tex: Optional[Dict[str, Any]], material_name: Optional[str] = None) -> Optional[int]:
@@ -311,6 +335,9 @@ def build_instanced_scene(
         data = tex.get("data")
         if not data:
             return None
+        hit = texture_index_by_id.get(id(data))
+        if hit is not None:
+            return hit
         mime_type = _sniff_image_mime(data)
         if mime_type is None and original_textures:
             mime_type = _original_image_mime(data)
@@ -318,16 +345,17 @@ def build_instanced_scene(
             # a format glTF cannot carry: leave it out, but say so
             _warn_skipped_texture(logger, skipped_textures, material_name, tex, data)
             return None
-        key = f"{len(data)}:{data[:16].hex()}"
-        hit = texture_index_by_key.get(key)
-        if hit is not None:
-            return hit
-        idx = len(textures)
-        textures.append(SceneTexture(data=data, mime_type=mime_type, filename=tex.get("filename", "")))
-        texture_index_by_key[key] = idx
+        data_bytes = data if isinstance(data, bytes) else bytes(data)
+        idx = texture_index_by_bytes.get(data_bytes)
+        if idx is None:
+            idx = len(textures)
+            textures.append(SceneTexture(data=data_bytes, mime_type=mime_type, filename=tex.get("filename", "")))
+            texture_index_by_bytes[data_bytes] = idx
+        kept_data_refs.append(data)
+        texture_index_by_id[id(data)] = idx
         return idx
 
-    color_to_material_index: Dict[FaceGroupKey, int] = {}
+    color_to_material_index: Dict[Tuple[Any, ...], int] = {}
     gltf_materials: List[Dict[str, Any]] = []
 
     def get_material_index(
@@ -339,7 +367,17 @@ def build_instanced_scene(
         colorized: bool = False,
         colorize_type: int = 0,
     ) -> int:
-        key = (color, double_sided, texture_index, transparency, material_name)
+        effective_colorized = bool(colorized) and texture_index is not None
+        effective_colorize_type = int(colorize_type) if effective_colorized else 0
+        key = (
+            color,
+            double_sided,
+            texture_index,
+            transparency,
+            material_name,
+            effective_colorized,
+            effective_colorize_type,
+        )
         if key in color_to_material_index:
             return color_to_material_index[key]
         idx = len(gltf_materials)
@@ -354,11 +392,13 @@ def build_instanced_scene(
         mat_dict: Dict[str, Any] = {"pbrMetallicRoughness": pbr}
         if material_name:
             mat_dict["name"] = material_name
-        if colorized:
+        if effective_colorized:
             # A colourized copy shares its source material's image untinted;
             # baseColorFactor is the target colour to re-tint it toward
             # (colorize_type 0 = hue shift, 1 = greyscale then tint).
-            mat_dict["extras"] = {"sketchup": {"colorized": True, "colorize_type": colorize_type}}
+            mat_dict["extras"] = {
+                "sketchup": {"colorized": True, "colorize_type": effective_colorize_type}
+            }
         if double_sided:
             mat_dict["doubleSided"] = True
         # See scene.py's get_material_index for why: BLEND for genuinely
@@ -374,6 +414,40 @@ def build_instanced_scene(
 
     mesh_resources: List[InstancedMeshResource] = []
     resource_id_by_key: Dict[str, str] = {}
+    face_layer_summary_cache: Dict[Any, Tuple[Optional[str], Optional[str]]] = {}
+
+    def _face_layer_summary(def_id: Any) -> Tuple[Optional[str], Optional[str]]:
+        hit = face_layer_summary_cache.get(def_id)
+        if hit is not None or def_id in face_layer_summary_cache:
+            return hit  # type: ignore[return-value]
+        d = defs_dict.get(def_id)
+        if d is None or not d["builder"].faces:
+            res: Tuple[Optional[str], Optional[str]] = (None, None)
+            face_layer_summary_cache[def_id] = res
+            return res
+        counts: Dict[Any, int] = {}
+        all_same = True
+        common_name: Optional[str] = None
+        for f in d["builder"].faces.values():
+            lid = f.get("layer")
+            fname = layer_id_to_name.get(lid, "") if lid else ""
+            if fname == "Layer0":
+                fname = ""
+            if fname:
+                counts[lid] = counts.get(lid, 0) + 1
+                if common_name is None:
+                    common_name = fname
+                elif fname != common_name:
+                    all_same = False
+            else:
+                all_same = False
+        uniform_layer = common_name if all_same else None
+        majority_layer = (
+            layer_id_to_name.get(max(counts, key=counts.get)) if counts else None
+        )
+        res = (uniform_layer, majority_layer)
+        face_layer_summary_cache[def_id] = res
+        return res
 
     def mesh_resource_for(
         def_id: Any,
@@ -399,8 +473,17 @@ def build_instanced_scene(
         if d is None or not d["builder"].faces:
             return None
 
-        fallback_color = inherited_color if inherited_color is not None else get_layer_color(layer)
+        if inherited_color is not None:
+            fallback_color = fallback_back_color = inherited_color
+        elif style_colors is not None:
+            fallback_color, fallback_back_color = style_colors
+        else:
+            _, majority_layer = _face_layer_summary(def_id)
+            color_layer = majority_layer if majority_layer is not None else layer
+            fallback_color = fallback_back_color = get_layer_color(color_layer)
         key = f"{def_id}|{fallback_color[0]},{fallback_color[1]},{fallback_color[2]}"
+        if fallback_back_color != fallback_color:
+            key += f"/{fallback_back_color[0]},{fallback_back_color[1]},{fallback_back_color[2]}"
         if inherited_material is not None:
             key += f"|{inherited_material.get('name', '')}"
         hit = resource_id_by_key.get(key)
@@ -417,11 +500,14 @@ def build_instanced_scene(
                 fallback_color=fallback_color,
                 definition_id=def_id,
                 fallback_material=inherited_material,
+                fallback_back_color=fallback_back_color,
             ),
         )
 
         primitives: List[LocalPrimitive] = []
-        for (color, double_sided, tex_index, transparency, material_name), group in face_groups.items():
+        for (
+            color, double_sided, tex_index, transparency, material_name, unpainted_back
+        ), group in face_groups.items():
             local_faces = group["local_faces"]
             if not local_faces:
                 continue
@@ -470,10 +556,12 @@ def build_instanced_scene(
                     normals=normals,
                     uvs=uvs,
                     indices=indices,
+                    back_triangles=group["back_triangles"],
                     material_index=get_material_index(
                         color, double_sided, tex_index, transparency,
                         material_name, group["colorized"], group["colorize_type"],
                     ),
+                    unpainted_back=unpainted_back,
                 )
             )
 
@@ -494,109 +582,60 @@ def build_instanced_scene(
         return resource_id
 
     curve_resources: List[InstancedCurveResource] = []
-    curve_resource_id_by_key: Dict[str, str] = {}
+    curve_resource_id_by_key: Dict[str, Optional[str]] = {}
+    prepared_local_curves_cache: Dict[Any, List[Tuple[List[Tuple[float, float, float]], bool, Optional[str], Optional[Dict[str, Any]]]]] = {}
 
     def curve_resource_for(def_id: Any, layer: str) -> Optional[str]:
         """Build (or reuse) the local-space loose-edge resource for a
         definition in the given inherited-layer context. Returns ``None``
         when the definition has no loose edges of its own.
-
-        Mirrors :func:`mesh_resource_for` exactly, one level simpler: a
-        loose edge has no paint-color equivalent to resolve, only a layer,
-        and that layer can be inherited the same contextual way an
-        unpainted face's color is - so the cache key is (definition,
-        effective fallback layer), same reasoning as the mesh case.
-
-        This is deliberately independent of whether the definition also
-        has face geometry (unlike the historical `if builder.faces:` gate
-        in ``scene.py``'s baked path before openskp#316): a definition can
-        be *entirely* loose edges (a structural-framing/light-gauge-steel
-        member drawn as a construction line, not a solid), and such a
-        definition contributing nothing to the instanced scene at all was
-        exactly the gap this closes.
         """
+        if not include_curve_sets:
+            return None
         d = defs_dict.get(def_id)
         if d is None:
             return None
-        builder = d["builder"]
-        runs = _chain_loose_edges(builder)
-        if not runs:
+
+        uniform_layer, _ = _face_layer_summary(def_id)
+        effective_layer = (
+            (uniform_layer if uniform_layer is not None else layer)
+            if layer == "Layer0"
+            else layer
+        )
+
+        key = f"{def_id}|{effective_layer}"
+        if key in curve_resource_id_by_key:
+            return curve_resource_id_by_key[key]
+
+        local_runs = prepared_local_curves_cache.get(def_id)
+        if local_runs is None:
+            builder = d["builder"]
+            prepared_runs, curve_counts = _prepare_definition_curves(builder, layer_id_to_name)
+            local_runs = []
+            for eids, local_verts, closed, explicit_layer in prepared_runs:
+                pts = [
+                    (round(v[0] * INCHES_TO_M, 6),
+                     round(v[2] * INCHES_TO_M, 6),
+                     round(-v[1] * INCHES_TO_M, 6))
+                    for v in local_verts
+                ]
+                arc = _solve_run_arc(builder, eids, None, pts, closed, curve_counts)
+                local_runs.append((pts, closed, explicit_layer, arc))
+            prepared_local_curves_cache[def_id] = local_runs
+
+        if not local_runs:
+            curve_resource_id_by_key[key] = None
             return None
 
-        key = f"{def_id}|{layer}"
-        hit = curve_resource_id_by_key.get(key)
-        if hit is not None:
-            return hit
-
-        # A definition's OWN faces (if any) carry their own layer and take
-        # priority over the caller's inherited one - the same override
-        # mesh_resource_for's caller applies before calling in here (see
-        # the `if builder.faces:` block in scene.py's instantiate(), which
-        # reassigns its local `parent_layer` the same way before ITS loose-
-        # edge block runs). Missing this produced a real, caught-by-testing
-        # bug: a mixed mesh+loose-edge definition's loose edges fell back to
-        # whatever layer the CALLING instance happened to inherit, instead
-        # of the definition's own dominant face layer - verified wrong
-        # against gondola_v20.skp ('Gondulas Laterais' expected, 'Layer0'
-        # produced) before this fallback was added.
-        effective_layer = layer
-        if builder.faces:
-            face_layer_counts: Dict[Any, int] = {}
-            for face in builder.faces.values():
-                face_layer = face.get("layer")
-                if face_layer:
-                    face_layer_counts[face_layer] = face_layer_counts.get(face_layer, 0) + 1
-            if face_layer_counts:
-                top_layer = max(face_layer_counts, key=face_layer_counts.get)
-                effective_layer = layer_id_to_name.get(top_layer, layer)
-
-        edge_layers = getattr(builder, "edge_layers", None) or {}
-        curves: List[LocalCurve] = []
-        for eids, chain, closed in runs:
-            pts: List[Tuple[float, float, float]] = []
-            complete = True
-            for vk in chain:
-                v = builder.vertices.get(vk)
-                if v is None:
-                    complete = False
-                    break
-                # Local space: no instance matrix, matching LocalPrimitive -
-                # only the inches->metres scale and SketchUp Z-up -> glTF
-                # Y-up axis swap, the same fixed conventions used there.
-                pts.append((round(v[0] * INCHES_TO_M, 6),
-                            round(v[2] * INCHES_TO_M, 6),
-                            round(-v[1] * INCHES_TO_M, 6)))
-            # A dangling vertex key would silently shorten the run, turning
-            # a parsing gap into a plausible-looking polyline. Drop the run
-            # instead - a missing curve is honest, a truncated one is not.
-            if not complete or len(pts) < 2:
-                continue
-
-            # A run whose edges disagree on layer resolves to the majority,
-            # same rule mesh_resource_for's faces use for the same reason.
-            lc: Dict[Any, int] = {}
-            for eid in eids:
-                edge_layer = edge_layers.get(eid)
-                if edge_layer:
-                    lc[edge_layer] = lc.get(edge_layer, 0) + 1
-            run_layer = effective_layer
-            if lc:
-                run_layer = layer_id_to_name.get(max(lc, key=lc.get), effective_layer)
-
-            curves.append(
-                LocalCurve(
-                    points_m=pts,
-                    closed=closed,
-                    layer=run_layer,
-                    # matrix=None: local space, same reasoning as the point
-                    # loop above - the frame's own axes get only the axis
-                    # swap, no per-instance transform.
-                    arc=_solve_run_arc(builder, eids, None, pts, closed),
-                )
+        curves = [
+            LocalCurve(
+                points_m=pts,
+                closed=closed,
+                layer=explicit_layer if explicit_layer is not None else effective_layer,
+                arc=arc,
             )
-
-        if not curves:
-            return None
+            for pts, closed, explicit_layer, arc in local_runs
+        ]
 
         resource_id = f"curve_{len(curve_resources)}"
         curve_resources.append(
@@ -636,8 +675,19 @@ def build_instanced_scene(
             inst_color = inherited_color
             inst_material = inherited_material
             properties: Dict[str, str] = dict(inst.get("properties") or {})
+            raw_attr_dicts = inst.get("attribute_dictionaries")
             attribute_dicts: Dict[str, Dict[str, str]] = {}
             name_override: Optional[str] = None
+
+            # A classic (pre-2021) instance has no D007: its own tag and paint
+            # were read with it.
+            l_name = layer_id_to_name.get(inst.get("layer_id"), l_name)
+            painted = resolve_material(
+                inst.get("material_id"), material_id_to_name, materials, materials_by_folder
+            )
+            if painted:
+                inst_color = resolve_color(painted)
+                inst_material = painted
 
             d007 = next((c for c in inst["children"] if c["tag"] == "D007"), None)
             if d007:
@@ -658,29 +708,33 @@ def build_instanced_scene(
                         inst_material = mat
 
                 try:
-                    all_dicts = _core.extract_attribute_dictionaries(d007)
-                    dynamic = all_dicts.get("dynamic_attributes", {})
+                    raw_attr_dicts = _core.extract_attribute_dictionaries(d007)
+                    dynamic = raw_attr_dicts.get("dynamic_attributes", {})
                     properties = {k: _core._stringify_vff_attr_value(v) for k, v in dynamic.items()}
-                    # See openskp.scene.build_scene's identical loop for why
-                    # SU_InstanceSet is skipped and name/label/code take
-                    # priority as the display-name override.
-                    for dict_name, entries in all_dicts.items():
-                        if dict_name in ("dynamic_attributes", "SU_InstanceSet"):
-                            continue
-                        attribute_dicts[dict_name] = {
-                            k: _core._stringify_vff_attr_value(v) for k, v in entries.items()
-                        }
-                        if name_override is None:
-                            for key in name_override_keys:
-                                val = entries.get(key)
-                                if val:
-                                    name_override = str(val)
-                                    break
                 except Exception:
+                    raw_attr_dicts = None
                     logger.debug(
                         "Failed to extract attribute dictionaries for instance %r (ref_idx=%r)",
                         inst.get("name"), ref_idx, exc_info=True,
                     )
+
+            # See openskp.scene.build_scene's identical loop for why
+            # SU_InstanceSet is skipped and name/label/code take priority as
+            # the display-name override.
+            if raw_attr_dicts:
+                for dict_name, entries in raw_attr_dicts.items():
+                    if dict_name in ("dynamic_attributes", "SU_InstanceSet"):
+                        continue
+                    attribute_dicts[dict_name] = {
+                        k: _core._stringify_vff_attr_value(v) for k, v in entries.items()
+                    }
+                    if name_override is None:
+                        for key in name_override_keys:
+                            if key in entries and entries[key] is not None:
+                                s = _core._stringify_vff_attr_value(entries[key])
+                                if s:
+                                    name_override = s
+                                    break
 
             def_name = (defs_dict.get(ref_idx) or {}).get("name") or ""
             # Fallback order: an attribute-dict name/label/code override,
@@ -709,6 +763,12 @@ def build_instanced_scene(
             children = walk(ref_idx, new_matrix, l_name, inst_color, inst_material)
             active_definitions.discard(ref_idx)
 
+            node_layer = l_name
+            if l_name == "Layer0" and not children and ref_idx in defs_dict:
+                child_uniform, _ = _face_layer_summary(ref_idx)
+                if child_uniform is not None:
+                    node_layer = child_uniform
+
             tx = new_matrix[9] * INCHES_TO_MM if len(new_matrix) > 9 else 0.0
             ty = new_matrix[10] * INCHES_TO_MM if len(new_matrix) > 10 else 0.0
             tz = new_matrix[11] * INCHES_TO_MM if len(new_matrix) > 11 else 0.0
@@ -718,7 +778,7 @@ def build_instanced_scene(
                     name=display_name,
                     name_is_generated=name_is_generated,
                     definition_name=def_name,
-                    layer=l_name,
+                    layer=node_layer,
                     matrix=_to_gltf_matrix(inst["matrix"]),
                     position_mm=(round(tx, 2), round(ty, 2), round(tz, 2)),
                     properties=properties,
@@ -840,4 +900,6 @@ def build_instanced_scene(
         gltf_materials=gltf_materials,
         textures=textures,
         layer_hidden=dict(parsed.get("layer_hidden") or {}),
+        unread_root_entities=int(parsed.get("unread_root_entities", 0)),
+        pages=_convert_pages(parsed),
     )

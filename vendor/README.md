@@ -2,9 +2,9 @@
 
 `vendor/openskp/` is a vendored copy of [openskp](https://github.com/iamahsanmehmood/openskp)
 (PyPI: [`openskp`](https://pypi.org/project/openskp/)), pinned to
-the **1.6.0 release** (tag `python-v1.6.0`, commit
-[`5021ffc`](https://github.com/iamahsanmehmood/openskp/commit/5021ffcaca68f9493127286a6fc0a7c7b95435f1),
-also on [PyPI](https://pypi.org/project/openskp/1.6.0/)). Pins before 1.4.0
+the **1.7.0 release** (tag `python-v1.7.0`, commit
+[`506bcbd`](https://github.com/iamahsanmehmood/openskp/commit/506bcbd8a0e3dfcca26898aef040eeb11dc00d29),
+also on [PyPI](https://pypi.org/project/openskp/1.7.0/)). Pins before 1.4.0
 were commits on `main` because 1.3.0 predated fixes this add-on needs (see
 "Why this release" below).
 
@@ -38,8 +38,53 @@ local patch is gone.
 
 ## Why this release
 
-Moved on 2026-11-22 from 1.4.0 (`d673706`). What the new copy changes for this
+Moved on 2026-11-25 from 1.6.0 (`5021ffc`). What the new copy changes for this
 add-on:
+
+- **2021+ texts and component dimensions, dimension offset vectors, and classic
+  leaderless texts:** 2021+ texts and linear dimensions inside components belong
+  to their owning `Definition` in local coordinates, with tags (`layer`),
+  visibility (`hidden`), and screen/leader placement
+  ([openskp#623](https://github.com/iamahsanmehmood/openskp/pull/623)); linear
+  dimensions carry `plane_x`, `normal`, `offset`, and `offset_vector`
+  ([#621](https://github.com/iamahsanmehmood/openskp/pull/621)); and classic
+  leaderless 3D texts keep their model coordinates
+  ([#604](https://github.com/iamahsanmehmood/openskp/pull/604)).
+- **Public texture filename override on export:** `SkpBuilder.add_texture_material`
+  and `add_image` accept an explicit `filename=` (and `open_existing()` preserves
+  stored texture filenames), so textured export writes neutral bare filenames
+  through the public API without touching private writer state
+  ([#667](https://github.com/iamahsanmehmood/openskp/pull/667)).
+- **More classic and large files open cleanly:** classic 2019 and 2020 files
+  with a custom line style on a textured tag now open
+  ([#514](https://github.com/iamahsanmehmood/openskp/issues/514),
+  [#674](https://github.com/iamahsanmehmood/openskp/pull/674)); classic 2015–2020
+  scenes that save shadows or axes alone no longer drop the file's scenes
+  ([#661](https://github.com/iamahsanmehmood/openskp/pull/661)); 2021+
+  `model.dat` containers whose 32-bit length wrapped (4 GiB+) read in full
+  ([#629](https://github.com/iamahsanmehmood/openskp/pull/629)); partial classic
+  reads populate `SkpModel.unread_root_entities` without writing directly to
+  `stderr` ([#575](https://github.com/iamahsanmehmood/openskp/pull/575),
+  [#582](https://github.com/iamahsanmehmood/openskp/pull/582)); and damaged
+  files raise `SkpParseError` instead of raw library exceptions
+  ([#636](https://github.com/iamahsanmehmood/openskp/pull/636)).
+- **Cleaner model metadata:** `Definition.guid` and `Instance.guid` use canonical
+  RFC-4122 byte order ([#622](https://github.com/iamahsanmehmood/openskp/pull/622)),
+  and 2021+ tag colour records (`materials/Layer_*`) stay out of
+  `SkpModel.materials` ([#581](https://github.com/iamahsanmehmood/openskp/pull/581)).
+- **Also new, available for future features:** `SkpModel.face_front_color` and
+  `face_back_color` ([#550](https://github.com/iamahsanmehmood/openskp/pull/550)),
+  `Face.layer` and `Edge.layer` tag names
+  ([#615](https://github.com/iamahsanmehmood/openskp/pull/615)), nested
+  construction guides with tags and `hidden` flags
+  ([#618](https://github.com/iamahsanmehmood/openskp/pull/618),
+  [#619](https://github.com/iamahsanmehmood/openskp/pull/619)), and scene
+  `Page.capture_flags` / `hidden_entity_ids`
+  ([#637](https://github.com/iamahsanmehmood/openskp/pull/637),
+  [#660](https://github.com/iamahsanmehmood/openskp/pull/660)).
+
+The 1.6.0 pin itself moved on 2026-11-22 from 1.4.0 (`d673706`). What that copy
+changed for this add-on:
 
 - **More classic (pre-2021) files import in full.** A dimension whose
   connection point is a vertex no longer ends the root entity list, which

@@ -87,17 +87,10 @@ EXPECTED = {
 
 
 def _expected_warnings(fixture_name):
-    import openskp
-
     if fixture_name == "annotations_2017.skp":
         return ["annotations_2017.skp: skipped 1 text(s) without a 3D position"]
     if fixture_name == "annotations_2021.skp":
-        if "layer" in getattr(openskp.model.Dimension, "__dataclass_fields__", {}):
-            return ["annotations_2021.skp: skipped 1 text(s) without a 3D position"]
-        return [
-            "annotations_2021.skp: skipped 2 2021+ text(s), 1 2021+ component dimension(s) "
-            "(requires a newer openskp release with 2021+ owner-local annotations)"
-        ]
+        return ["annotations_2021.skp: skipped 1 text(s) without a 3D position"]
     if fixture_name == "capilla_quiroz_v17.skp":
         out = []
         unres = importSKP.last_import_stats.get("dimensions_skipped_unresolved", 0)
@@ -452,33 +445,32 @@ def check_partial_read_warning():
         finally:
             App.closeDocument(doc.Name)
 
-        # 3. End-to-end check once a post-openskp#552 release is vendored.
+        # 3. End-to-end check on a truncated classic .skp file (openskp#552).
         openskp.SkpFile.parse = orig_parse
         root_logger.setLevel(saved_root_level)
-        if hasattr(openskp.SkpModel, "unread_root_entities"):
-            builder = openskp.create()
-            builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
-            builder.add_text("First", (0, 0, 0))
-            builder.add_text("Broken", (5, 0, 0))
-            builder.add_face([(20, 0, 0), (30, 0, 0), (30, 10, 0), (20, 10, 0)])
-            raw = bytearray(builder.to_bytes())
-            at = raw.find(b"\x01\xff\xfe\xff\x06B\x00")
-            assert at >= 0
-            raw[at : at + 4] = b"\x00\x00\x00\x00"
-            with tempfile.TemporaryDirectory() as tmp:
-                broken = os.path.join(tmp, "partial.skp")
-                with open(broken, "wb") as f:
-                    f.write(raw)
-                doc = App.newDocument()
-                try:
-                    printed.clear()
-                    importSKP.import_skp(broken, doc, merge=True)
-                    stats = importSKP.last_import_stats
-                    assert stats["unread_root_entities"] > 0, stats
-                    assert any("read only in part" in m for m in stats["warnings"]), stats
-                    assert any("read only in part" in m for m in printed), printed
-                finally:
-                    App.closeDocument(doc.Name)
+        builder = openskp.create()
+        builder.add_face([(0, 0, 0), (10, 0, 0), (10, 10, 0), (0, 10, 0)])
+        builder.add_text("First", (0, 0, 0))
+        builder.add_text("Broken", (5, 0, 0))
+        builder.add_face([(20, 0, 0), (30, 0, 0), (30, 10, 0), (20, 10, 0)])
+        raw = bytearray(builder.to_bytes())
+        at = raw.find(b"\x01\xff\xfe\xff\x06B\x00")
+        assert at >= 0
+        raw[at : at + 4] = b"\x00\x00\x00\x00"
+        with tempfile.TemporaryDirectory() as tmp:
+            broken = os.path.join(tmp, "partial.skp")
+            with open(broken, "wb") as f:
+                f.write(raw)
+            doc = App.newDocument()
+            try:
+                printed.clear()
+                importSKP.import_skp(broken, doc, merge=True)
+                stats = importSKP.last_import_stats
+                assert stats["unread_root_entities"] > 0, stats
+                assert any("read only in part" in m for m in stats["warnings"]), stats
+                assert any("read only in part" in m for m in printed), printed
+            finally:
+                App.closeDocument(doc.Name)
     finally:
         openskp.SkpFile.parse = orig_parse
         root_logger.setLevel(saved_root_level)

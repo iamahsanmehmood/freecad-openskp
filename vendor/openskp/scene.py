@@ -26,9 +26,20 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import _core
-from ._curves import _chain_loose_edges, _solve_run_arc
-from ._face_groups import FaceGroupContext, FaceGroupKey, build_local_face_groups
+from ._curves import (
+    _chain_loose_edges as _chain_loose_edges,
+    _prepare_definition_curves,
+    _solve_run_arc,
+)
+from ._face_groups import (
+    FaceGroupContext,
+    build_local_face_groups,
+    resolve_color,
+    resolve_material,
+    unpainted_style_colors,
+)
 from .errors import SkpParseError
+from .model import Page, _convert_pages
 
 logger = logging.getLogger("openskp.scene")
 
@@ -129,18 +140,27 @@ class GlbPrimitive:
             data - their UVs will be approximate.
         indices: Triangle vertex indices into *positions*/*normals*/*uvs*
             (3 per triangle).
+        back_triangles: Triangle offsets for separately emitted back
+            sides. A primitive can mix front and back triangles when they
+            share a material. Their front counterparts are still present.
         material_index: Index into :attr:`Scene.gltf_materials` for this
             primitive's resolved color.
         geom_name: Matches the corresponding key in
             :attr:`Scene.mesh_index`.
+        unpainted_back: ``True`` for the back copies of faces with no
+            paint on either side (the front copies are in another
+            primitive). They exist only to show the model's back face
+            colour from behind; see :attr:`Scene.surface_primitives`.
     """
 
     positions: array
     normals: array
     uvs: array
     indices: array
+    back_triangles: array = field(default_factory=lambda: array("I"), kw_only=True)
     material_index: int
     geom_name: str
+    unpainted_back: bool = False
 
 
 @dataclass
@@ -248,6 +268,19 @@ class Scene:
     # use this to match SketchUp's own on/off state instead of always
     # defaulting every layer to visible.
     layer_hidden: Dict[str, bool] = field(default_factory=dict)
+    unread_root_entities: int = 0
+    # Saved scenes (SketchUp's "Scenes" tabs), identical to SkpModel.pages.
+    # Camera eye/target/up and ortho_height stay in SketchUp's native Z-up
+    # frame and inches (unlike glb_primitives, which are Y-up metres).
+    pages: List[Page] = field(default_factory=list)
+
+    @property
+    def surface_primitives(self) -> List[GlbPrimitive]:
+        """:attr:`glb_primitives` without the back copies of faces that have
+        no paint on either side: what to use when the two sides of a surface
+        aren't shown separately (printing, CAD and BIM formats, counting or
+        measuring triangles). Every face is still there once."""
+        return [p for p in self.glb_primitives if not p.unpainted_back]
 
 
 def _sniff_image_mime(data: bytes) -> Optional[str]:
@@ -341,6 +374,7 @@ def build_scene(
     name_override_keys: Sequence[str] = ("name", "label", "code"),
     include_curve_sets: bool = True,
     original_textures: bool = False,
+    unpainted_faces: str = "style",
 ) -> Scene:
     """Bake every instance actually placed in ``parsed`` (the output of
     :func:`openskp._core.full_parse` / ``full_parse_legacy``) into
@@ -369,6 +403,8 @@ def build_scene(
             568,177 - that second one being the point: on a curve-only
             model the curve sets *are* the model, and turning them off
             leaves a spatial skeleton with nothing in it.
+        original_textures: See :meth:`SkpFile.build_scene`.
+        unpainted_faces: See :meth:`SkpFile.build_scene`.
 
     Returns:
         A populated :class:`Scene`.
@@ -407,6 +443,7 @@ def build_scene(
     # Per-layer sequence numbers for generated curve-set labels (see the
     # loose-edge block in instantiate()).
     curve_seq: Dict[str, int] = {}
+    prepared_curves_cache: Dict[Any, Any] = {}
 
     # Instance path -> (properties, name) updates, collected in O(1) per
     # instance and applied once after instantiation completes (see the
@@ -418,11 +455,14 @@ def build_scene(
     # more than intended - see openskp#240).
     path_updates: Dict[str, Tuple[Dict[str, str], str, Dict[str, Dict[str, str]]]] = {}
 
-    # Textures deduplicated by bytes: the same image routinely backs
-    # several materials, and re-embedding it per material would multiply
-    # the export size for nothing.
+    # Textures deduplicated by full content: the same image routinely backs
+    # several materials, while equal-size PNGs/TIFFs share their 16-byte
+    # header and must stay distinct. Look up each bytes object by identity
+    # first so per-face calls stay O(1) after the first sight.
     textures: List[SceneTexture] = []
-    texture_index_by_key: Dict[str, int] = {}
+    texture_index_by_id: Dict[int, int] = {}
+    texture_index_by_bytes: Dict[bytes, int] = {}
+    kept_data_refs: List[Any] = []
     skipped_textures: set = set()
 
     def texture_index_for(tex: Optional[Dict[str, Any]], material_name: Optional[str] = None) -> Optional[int]:
@@ -431,6 +471,9 @@ def build_scene(
         data = tex.get("data")
         if not data:
             return None
+        hit = texture_index_by_id.get(id(data))
+        if hit is not None:
+            return hit
         mime_type = _sniff_image_mime(data)
         if mime_type is None and original_textures:
             mime_type = _original_image_mime(data)
@@ -438,18 +481,17 @@ def build_scene(
             # a format glTF cannot carry: leave it out, but say so
             _warn_skipped_texture(logger, skipped_textures, material_name, tex, data)
             return None
-        # length plus a short byte prefix is enough to tell real images
-        # apart without hashing megabytes on every face
-        key = f"{len(data)}:{data[:16].hex()}"
-        hit = texture_index_by_key.get(key)
-        if hit is not None:
-            return hit
-        idx = len(textures)
-        textures.append(SceneTexture(data=data, mime_type=mime_type, filename=tex.get("filename", "")))
-        texture_index_by_key[key] = idx
+        data_bytes = data if isinstance(data, bytes) else bytes(data)
+        idx = texture_index_by_bytes.get(data_bytes)
+        if idx is None:
+            idx = len(textures)
+            textures.append(SceneTexture(data=data_bytes, mime_type=mime_type, filename=tex.get("filename", "")))
+            texture_index_by_bytes[data_bytes] = idx
+        kept_data_refs.append(data)
+        texture_index_by_id[id(data)] = idx
         return idx
 
-    color_to_material_index: Dict[FaceGroupKey, int] = {}
+    color_to_material_index: Dict[Tuple[Any, ...], int] = {}
     gltf_materials: List[Dict[str, Any]] = []
 
     # Definitions currently being instantiated on the active recursion
@@ -461,6 +503,8 @@ def build_scene(
 
     def get_layer_color(name: str) -> Tuple[int, int, int]:
         return layer_colors.get(name, (136, 136, 136))
+
+    style_colors = unpainted_style_colors(parsed, unpainted_faces)
 
     def get_material_index(
         color: Tuple[int, int, int],
@@ -476,7 +520,17 @@ def build_scene(
         # this), and keying on color alone would merge them into one
         # material and lose one of the images. The name is too, so two
         # differently named SketchUp materials stay two materials.
-        key = (color, double_sided, texture_index, transparency, material_name)
+        effective_colorized = bool(colorized) and texture_index is not None
+        effective_colorize_type = int(colorize_type) if effective_colorized else 0
+        key = (
+            color,
+            double_sided,
+            texture_index,
+            transparency,
+            material_name,
+            effective_colorized,
+            effective_colorize_type,
+        )
         if key in color_to_material_index:
             return color_to_material_index[key]
         idx = len(gltf_materials)
@@ -494,9 +548,11 @@ def build_scene(
         mat_dict: Dict[str, Any] = {"pbrMetallicRoughness": pbr}
         if material_name:
             mat_dict["name"] = material_name
-        if colorized:
+        if effective_colorized:
             # See openskp.instanced_scene's get_material_index.
-            mat_dict["extras"] = {"sketchup": {"colorized": True, "colorize_type": colorize_type}}
+            mat_dict["extras"] = {
+                "sketchup": {"colorized": True, "colorize_type": effective_colorize_type}
+            }
         if double_sided:
             mat_dict["doubleSided"] = True
         # glTF's default alphaMode is OPAQUE, which tells a conformant
@@ -520,6 +576,41 @@ def build_scene(
         color_to_material_index[key] = idx
         return idx
 
+    face_layer_summary_cache: Dict[Any, Tuple[Optional[str], Optional[str]]] = {}
+
+    def _face_layer_summary(def_id: Any) -> Tuple[Optional[str], Optional[str]]:
+        hit = face_layer_summary_cache.get(def_id)
+        if hit is not None or def_id in face_layer_summary_cache:
+            return hit  # type: ignore[return-value]
+        d = defs_dict.get(def_id)
+        if d is None or not d["builder"].faces:
+            res: Tuple[Optional[str], Optional[str]] = (None, None)
+            face_layer_summary_cache[def_id] = res
+            return res
+        counts: Dict[Any, int] = {}
+        all_same = True
+        common_name: Optional[str] = None
+        for f in d["builder"].faces.values():
+            lid = f.get("layer")
+            fname = layer_id_to_name.get(lid, "") if lid else ""
+            if fname == "Layer0":
+                fname = ""
+            if fname:
+                counts[lid] = counts.get(lid, 0) + 1
+                if common_name is None:
+                    common_name = fname
+                elif fname != common_name:
+                    all_same = False
+            else:
+                all_same = False
+        uniform_layer = common_name if all_same else None
+        majority_layer = (
+            layer_id_to_name.get(max(counts, key=counts.get)) if counts else None
+        )
+        res = (uniform_layer, majority_layer)
+        face_layer_summary_cache[def_id] = res
+        return res
+
     def instantiate(
         def_id,
         current_matrix,
@@ -532,34 +623,27 @@ def build_scene(
         if d is None:
             return []
         builder = d["builder"]
+        uniform_layer, majority_layer = _face_layer_summary(def_id)
+        mesh_layer = (
+            (uniform_layer if uniform_layer is not None else parent_layer)
+            if parent_layer == "Layer0"
+            else parent_layer
+        )
 
         if builder.faces:
-            # A definition's faces carry their own
-            # layer (legacy drawbase). The inherited `parent_layer` is never
-            # resolvable for legacy instances, so it silently degraded to
-            # "Layer0" for every face - which starved export/ifc.py's
-            # classifier (it types elements by name, then by layer) of the
-            # one signal that was actually present in the file.
-            _lc: Dict[Any, int] = {}
-            for _f in builder.faces.values():
-                _l = _f.get("layer")
-                if _l:
-                    _lc[_l] = _lc.get(_l, 0) + 1
-            if _lc:
-                _top_layer = max(_lc, key=_lc.get)
-                parent_layer = layer_id_to_name.get(_top_layer, parent_layer)
-            # Group faces sharing a resolved (color, double_sided, texture)
-            # identity into one mesh each, in local space - shared with the
-            # instanced builder (openskp#200) via _face_groups.py: a face
-            # whose front/back resolve to the SAME color is emitted once,
-            # with its glTF material marked doubleSided so it's visible from
-            # either side without needing duplicate geometry; a face whose
-            # front/back genuinely differ is emitted as TWO single-sided
-            # triangle sets - one normal-wound using the front material, one
-            # reverse-wound using the back material - so each side renders
-            # its own correct color instead of the front material leaking
-            # onto (or the back vanishing from) the far side.
-            fallback_color = inherited_color if inherited_color is not None else get_layer_color(parent_layer)
+            # An untagged (Layer0) placement's own mesh takes its faces' tag
+            # only when every face of the definition has the same tag (other
+            # than Layer0); tagged placements keep their own or inherited tag,
+            # and child instances never inherit a face's tag. For
+            # unpainted_faces="tag" and files without style face colours, the
+            # majority face tag still supplies the unpainted fallback colour.
+            if inherited_color is not None:
+                fallback_color = fallback_back_color = inherited_color
+            elif style_colors is not None:
+                fallback_color, fallback_back_color = style_colors
+            else:
+                color_layer = majority_layer if majority_layer is not None else parent_layer
+                fallback_color = fallback_back_color = get_layer_color(color_layer)
             face_groups = build_local_face_groups(
                 builder,
                 FaceGroupContext(
@@ -570,10 +654,13 @@ def build_scene(
                     fallback_color=fallback_color,
                     definition_id=def_id,
                     fallback_material=inherited_material,
+                    fallback_back_color=fallback_back_color,
                 ),
             )
 
-            for (face_color, double_sided, tex_index, transparency, material_name), group in face_groups.items():
+            for (
+                face_color, double_sided, tex_index, transparency, material_name, unpainted_back
+            ), group in face_groups.items():
                 local_faces = group["local_faces"]
                 if not local_faces:
                     continue
@@ -588,13 +675,13 @@ def build_scene(
                     f"_{face_color[0]}_{face_color[1]}_{face_color[2]}_{'ds' if double_sided else 'ss'}"
                     if len(face_groups) > 1 else ""
                 )
-                geom_name = f"mesh_{mesh_counter[0]}_{safe_path}_{parent_layer}{color_suffix}"
+                geom_name = f"mesh_{mesh_counter[0]}_{safe_path}_{mesh_layer}{color_suffix}"
                 mesh_counter[0] += 1
 
                 mesh_index[geom_name] = MeshMetadata(
                     name="ROOT" if is_root else (path_name.split(" / ")[-1] or ""),
                     definition_name=d.get("name") or "",
-                    layer=parent_layer,
+                    layer=mesh_layer,
                     position_mm=(round(tx, 2), round(ty, 2), round(tz, 2)),
                     properties={},
                     path=path_name,
@@ -652,8 +739,10 @@ def build_scene(
                         normals=normals,
                         uvs=uvs,
                         indices=indices,
+                        back_triangles=group["back_triangles"],
                         material_index=material_index,
                         geom_name=geom_name,
+                        unpainted_back=unpainted_back,
                     )
                 )
 
@@ -665,60 +754,58 @@ def build_scene(
         # to the scene, so export/ifc.py got an empty primitive list and
         # emitted a spatial skeleton with zero elements (see
         # magnetar_Facade_Drawing.skp: 1776 edges -> 0 products).
-        _edge_layers = getattr(builder, "edge_layers", None) or {}
-        _runs = _chain_loose_edges(builder) if include_curve_sets else ()
-        for _eids, _chain, _closed in _runs:
-            pts = []
-            _complete = True
-            for _vk in _chain:
-                _v = builder.vertices.get(_vk)
-                if _v is None:
-                    _complete = False
-                    break
-                _pt = _core.transform_point(_v, current_matrix)
-                pts.append((round(_pt[0] * INCHES_TO_M, 6),
-                            round(_pt[2] * INCHES_TO_M, 6),
-                            round(-_pt[1] * INCHES_TO_M, 6)))
-            # A dangling vertex key would silently shorten the run, turning a
-            # parsing gap into a plausible-looking polyline. Drop the run
-            # instead - a missing curve is honest, a truncated one is not.
-            if not _complete or len(pts) < 2:
-                continue
-            # A run whose edges disagree on layer resolves to the majority,
-            # same rule the face block above uses for the same reason.
-            _lc: Dict[Any, int] = {}
-            for _eid in _eids:
-                _l = _edge_layers.get(_eid)
-                if _l:
-                    _lc[_l] = _lc.get(_l, 0) + 1
-            run_layer = parent_layer
-            if _lc:
-                run_layer = layer_id_to_name.get(max(_lc, key=_lc.get), parent_layer)
-            # Root-level loose geometry has no name in the file whatsoever -
-            # an edge is just an edge, only components get named. Labelling
-            # all 444 of them "ROOT" would be technically honest and useless,
-            # so a root-level run is labelled with the one signal that does
-            # exist (its layer) plus a sequence number to keep them distinct.
-            # Anything inside a named component keeps its real name.
-            if path_name == "ROOT":
-                _seq = curve_seq.get(run_layer, 0) + 1
-                curve_seq[run_layer] = _seq
-                _cname = "%s_%d" % (run_layer, _seq)
-                _cgen = True
-            else:
-                _cname = path_name.split(" / ")[-1] or ""
-                _cgen = False
-            curve_sets.append(CurveSetMetadata(
-                name=_cname,
-                name_is_generated=_cgen,
-                definition_name=d.get("name") or "",
-                layer=run_layer,
-                path=path_name,
-                points_m=pts,
-                closed=_closed,
-                arc=_solve_run_arc(builder, _eids,
-                                   current_matrix, pts, _closed),
-            ))
+        if include_curve_sets:
+            _cached_curves = prepared_curves_cache.get(def_id)
+            if _cached_curves is None:
+                _cached_curves = _prepare_definition_curves(builder, layer_id_to_name)
+                prepared_curves_cache[def_id] = _cached_curves
+            _prepared_runs, _curve_counts = _cached_curves
+            if _prepared_runs:
+                _fm = _core._fold_scale(current_matrix) if (current_matrix and len(current_matrix) >= 12) else None
+                _def_name_str = d.get("name") or ""
+                _cname_component = "" if path_name == "ROOT" else (path_name.split(" / ")[-1] or "")
+                for _eids, _local_verts, _closed, _explicit_layer in _prepared_runs:
+                    if _fm is None:
+                        pts = [
+                            (round(_v[0] * INCHES_TO_M, 6),
+                             round(_v[2] * INCHES_TO_M, 6),
+                             round(-_v[1] * INCHES_TO_M, 6))
+                            for _v in _local_verts
+                        ]
+                    else:
+                        _m0, _m1, _m2, _m3, _m4, _m5, _m6, _m7, _m8, _m9, _m10, _m11 = _fm[:12]
+                        pts = [
+                            (round((_m0 * _v[0] + _m1 * _v[1] + _m2 * _v[2] + _m9) * INCHES_TO_M, 6),
+                             round((_m6 * _v[0] + _m7 * _v[1] + _m8 * _v[2] + _m11) * INCHES_TO_M, 6),
+                             round(-(_m3 * _v[0] + _m4 * _v[1] + _m5 * _v[2] + _m10) * INCHES_TO_M, 6))
+                            for _v in _local_verts
+                        ]
+                    run_layer = _explicit_layer if _explicit_layer is not None else mesh_layer
+                    # Root-level loose geometry has no name in the file whatsoever -
+                    # an edge is just an edge, only components get named. Labelling
+                    # all 444 of them "ROOT" would be technically honest and useless,
+                    # so a root-level run is labelled with the one signal that does
+                    # exist (its layer) plus a sequence number to keep them distinct.
+                    # Anything inside a named component keeps its real name.
+                    if path_name == "ROOT":
+                        _seq = curve_seq.get(run_layer, 0) + 1
+                        curve_seq[run_layer] = _seq
+                        _cname = "%s_%d" % (run_layer, _seq)
+                        _cgen = True
+                    else:
+                        _cname = _cname_component
+                        _cgen = False
+                    curve_sets.append(CurveSetMetadata(
+                        name=_cname,
+                        name_is_generated=_cgen,
+                        definition_name=_def_name_str,
+                        layer=run_layer,
+                        path=path_name,
+                        points_m=pts,
+                        closed=_closed,
+                        arc=_solve_run_arc(builder, _eids,
+                                           _fm, pts, _closed, _curve_counts),
+                    ))
 
         child_instances_info: List[InstanceNode] = []
         for inst in builder.instances:
@@ -735,8 +822,19 @@ def build_scene(
             # this stays {} for them and gets overwritten below via the
             # D007/DC05 TLV walk instead.
             properties: Dict[str, str] = dict(inst.get("properties") or {})
+            raw_attr_dicts = inst.get("attribute_dictionaries")
             attribute_dicts: Dict[str, Dict[str, str]] = {}
             name_override: Optional[str] = None
+
+            # A classic (pre-2021) instance has no D007: its own tag and paint
+            # were read with it.
+            l_name = layer_id_to_name.get(inst.get("layer_id"), l_name)
+            painted = resolve_material(
+                inst.get("material_id"), material_id_to_name, materials, materials_by_folder
+            )
+            if painted:
+                inst_color = resolve_color(painted)
+                inst_material = painted
 
             d007 = next((c for c in inst["children"] if c["tag"] == "D007"), None)
             if d007:
@@ -757,31 +855,34 @@ def build_scene(
                         inst_material = mat
 
                 try:
-                    all_dicts = _core.extract_attribute_dictionaries(d007)
-                    dynamic = all_dicts.get("dynamic_attributes", {})
+                    raw_attr_dicts = _core.extract_attribute_dictionaries(d007)
+                    dynamic = raw_attr_dicts.get("dynamic_attributes", {})
                     properties = {k: _core._stringify_vff_attr_value(v) for k, v in dynamic.items()}
-                    # Every other dictionary a third-party plugin (BIM
-                    # workflow, steel-detailing tool, ...) attached to
-                    # this specific instance - SU_InstanceSet is
-                    # SketchUp's own always-present, always-empty
-                    # Owner/Status boilerplate, not worth surfacing.
-                    for dict_name, entries in all_dicts.items():
-                        if dict_name in ("dynamic_attributes", "SU_InstanceSet"):
-                            continue
-                        attribute_dicts[dict_name] = {
-                            k: _core._stringify_vff_attr_value(v) for k, v in entries.items()
-                        }
-                        if name_override is None:
-                            for key in name_override_keys:
-                                val = entries.get(key)
-                                if val:
-                                    name_override = str(val)
-                                    break
                 except Exception:
+                    raw_attr_dicts = None
                     logger.debug(
                         "Failed to extract attribute dictionaries for instance %r (ref_idx=%r)",
                         inst.get("name"), ref_idx, exc_info=True,
                     )
+
+            # Every other dictionary a third-party plugin (BIM workflow,
+            # steel-detailing tool, ...) attached to this specific instance -
+            # SU_InstanceSet is SketchUp's own always-present, always-empty
+            # Owner/Status boilerplate, not worth surfacing.
+            if raw_attr_dicts:
+                for dict_name, entries in raw_attr_dicts.items():
+                    if dict_name in ("dynamic_attributes", "SU_InstanceSet"):
+                        continue
+                    attribute_dicts[dict_name] = {
+                        k: _core._stringify_vff_attr_value(v) for k, v in entries.items()
+                    }
+                    if name_override is None:
+                        for key in name_override_keys:
+                            if key in entries and entries[key] is not None:
+                                s = _core._stringify_vff_attr_value(entries[key])
+                                if s:
+                                    name_override = s
+                                    break
 
             # inst_name (never overridden) is what keeps full_path_name -
             # and so path_updates' own keys - locally unique: a plugin's
@@ -816,6 +917,12 @@ def build_scene(
             child_nodes = instantiate(ref_idx, new_matrix, l_name, full_path_name, inst_color, inst_material)
             active_definitions.discard(ref_idx)
 
+            node_layer = l_name
+            if l_name == "Layer0" and not child_nodes and ref_idx in defs_dict:
+                child_uniform, _ = _face_layer_summary(ref_idx)
+                if child_uniform is not None:
+                    node_layer = child_uniform
+
             tx = new_matrix[9] * INCHES_TO_MM if len(new_matrix) > 9 else 0.0
             ty = new_matrix[10] * INCHES_TO_MM if len(new_matrix) > 10 else 0.0
             tz = new_matrix[11] * INCHES_TO_MM if len(new_matrix) > 11 else 0.0
@@ -824,7 +931,7 @@ def build_scene(
                 name=display_name,
                 name_is_generated=name_is_generated,
                 definition_name=def_name,
-                layer=l_name,
+                layer=node_layer,
                 position_mm=(round(tx, 2), round(ty, 2), round(tz, 2)),
                 properties=properties,
                 attribute_dictionaries=attribute_dicts,
@@ -906,4 +1013,6 @@ def build_scene(
         gltf_materials=gltf_materials,
         textures=textures,
         layer_hidden=dict(parsed.get("layer_hidden") or {}),
+        unread_root_entities=int(parsed.get("unread_root_entities", 0)),
+        pages=_convert_pages(parsed),
     )

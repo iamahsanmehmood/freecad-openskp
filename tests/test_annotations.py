@@ -38,12 +38,6 @@ FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture
 MM = importSKP.INCH_TO_MM
 
 
-def _has_offset_vec():
-    import openskp
-
-    return "offset_vector" in getattr(openskp.model.Dimension, "__dataclass_fields__", {})
-
-
 def _scan_fixture_no_private_paths(path):
     """Scans raw bytes (ASCII + UTF-16) and every ZIP entry (including
     meta/meta.dat) for host paths, usernames, temp dirs, and email addresses."""
@@ -139,8 +133,7 @@ def check_hierarchy_annotations(path):
         rdim = root_dims[0]
         _assert_vec_in(rdim.Start, (0.0, 0.0, 0.0), label="root dim Start")
         _assert_vec_in(rdim.End, (36.0, 0.0, 0.0), label="root dim End")
-        if not _has_offset_vec():
-            _assert_vec_in(rdim.Dimline, (18.0, 0.0, 0.0), label="root dim Dimline (no offset on 1.6.0)")
+        _assert_vec_in(rdim.Dimline, (18.0, 0.0, 0.0), label="root dim Dimline (offset_vector=None)")
         _assert_normal_orthogonal(rdim, "root dim")
         assert abs(_measured_mm(rdim) - 36.0 * MM) <= 1e-3, _measured_mm(rdim)
 
@@ -160,8 +153,7 @@ def check_hierarchy_annotations(path):
         bdim = bdims[0]
         _assert_vec_in(bdim.Start, (0.0, 0.0, 0.0), label="Beam local dim Start")
         _assert_vec_in(bdim.End, (24.0, 0.0, 0.0), label="Beam local dim End")
-        if not _has_offset_vec():
-            _assert_vec_in(bdim.Dimline, (12.0, 0.0, 0.0), label="Beam local dim Dimline (no offset on 1.6.0)")
+        _assert_vec_in(bdim.Dimline, (12.0, 0.0, 0.0), label="Beam local dim Dimline (offset_vector=None)")
         _assert_normal_orthogonal(bdim, "Beam dim")
         assert abs(_measured_mm(bdim) - 24.0 * MM) <= 1e-3, _measured_mm(bdim)
 
@@ -215,8 +207,7 @@ def check_merged_annotations(path):
         fdim = fr_dims[0]
         _assert_vec_in(fdim.Start, (40.0, 10.0, 0.0), label="merged Beam world Start")
         _assert_vec_in(fdim.End, (64.0, 10.0, 0.0), label="merged Beam world End")
-        if not _has_offset_vec():
-            _assert_vec_in(fdim.Dimline, (52.0, 10.0, 0.0), label="merged Beam world Dimline (no offset on 1.6.0)")
+        _assert_vec_in(fdim.Dimline, (52.0, 10.0, 0.0), label="merged Beam world Dimline (offset_vector=None)")
         assert abs(_measured_mm(fdim) - 24.0 * MM) <= 1e-3
 
         print("check_merged_annotations: OK (world-space per-tag Annotations groups)")
@@ -237,7 +228,6 @@ def check_real_2021_annotations():
     import openskp
 
     path_2021 = os.path.join(FIXTURES_DIR, "annotations_2021.skp")
-    has_623 = "layer" in getattr(openskp.model.Dimension, "__dataclass_fields__", {})
 
     for merge in (False, True):
         doc = App.newDocument()
@@ -247,28 +237,18 @@ def check_real_2021_annotations():
             dims = [
                 o for o in doc.Objects if getattr(o, "SketchUpAnnotationKind", "") == "linear_dimension"
             ]
-            if has_623:
-                assert stats["dimensions_built"] == 2 and stats["texts_built"] == 1, (merge, stats)
-                assert len(dims) == 2
-                if merge:
-                    beam_d = next(d for d in dims if abs(_measured_mm(d) - 24.0 * MM) <= 1e-2)
-                    _assert_vec_in(beam_d.Start, (40.0, 10.0, 0.0), label="2021 merged Beam Start")
-            else:
-                assert stats["dimensions_built"] == 1, (merge, stats)
-                assert stats["vff_component_dimensions_skipped"] == 1, (merge, stats)
-                assert stats["vff_texts_skipped"] == 2, (merge, stats)
-                assert any("2021+ component dimension" in w for w in stats["warnings"]), stats["warnings"]
-                assert len(dims) == 1
-                _assert_vec_in(dims[0].Start, (0.0, 0.0, 0.0), label="2021 root dim Start")
-                _assert_vec_in(dims[0].End, (36.0, 0.0, 0.0), label="2021 root dim End")
-                _assert_vec_in(dims[0].Dimline, (18.0, 0.0, 0.0), label="2021 root dim Dimline")
-                _assert_normal_orthogonal(dims[0], "2021 root dim")
+            assert stats["dimensions_built"] == 2 and stats["texts_built"] == 1, (merge, stats)
+            assert stats["texts_skipped_no_position"] == 1, (merge, stats)
+            assert len(dims) == 2
+            if merge:
+                beam_d = next(d for d in dims if abs(_measured_mm(d) - 24.0 * MM) <= 1e-2)
+                _assert_vec_in(beam_d.Start, (40.0, 10.0, 0.0), label="2021 merged Beam Start")
         finally:
             App.closeDocument(doc.Name)
 
-    # Axis-constrained 5BD1 VFF dimensions:
-    # - axis=1 (plane X = (1,0,0), parallel to a=(0,0,0)..b=(36,0,0)): imported!
-    # - axis=2 (plane Y = (0,1,0), not parallel to a-b): skipped & counted!
+    # Axis-constrained 5BD1 VFF dimensions (patches root 36 in dim; Beam's 24 in dim stays unconstrained):
+    # - axis=1 (plane X = (1,0,0), parallel to a=(0,0,0)..b=(36,0,0)): both 2 built!
+    # - axis=2 (plane Y = (0,1,0), not parallel to a-b): root dim skipped & counted, 1 built!
     import io
     import struct
     import zipfile
@@ -276,7 +256,7 @@ def check_real_2021_annotations():
     with tempfile.TemporaryDirectory() as tmp:
         raw_2021 = open(path_2021, "rb").read()
         pk_off = raw_2021.index(b"PK\x03\x04")
-        for axis_code, want_built, want_skip in ((1, 1, 0), (2, 0, 1)):
+        for axis_code, want_built, want_skip in ((1, 2, 0), (2, 1, 1)):
             zbuf = io.BytesIO()
             with zipfile.ZipFile(path_2021, "r") as zin, zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
@@ -290,32 +270,30 @@ def check_real_2021_annotations():
             constrained_vff = os.path.join(tmp, f"constrained_axis{axis_code}_2021.skp")
             with open(constrained_vff, "wb") as f:
                 f.write(raw_2021[:pk_off] + zbuf.getvalue())
-            if not has_623:
-                cdoc = App.newDocument()
-                try:
-                    importSKP.import_skp(constrained_vff, cdoc, merge=False)
-                    cst = importSKP.last_import_stats
-                    assert cst["dimensions_built"] == want_built, (axis_code, cst)
-                    assert cst["constrained_dimensions_skipped"] == want_skip, (axis_code, cst)
-                    if want_skip:
-                        assert any("axis-constrained" in w for w in cst["warnings"]), cst["warnings"]
-                finally:
-                    App.closeDocument(cdoc.Name)
+            cdoc = App.newDocument()
+            try:
+                importSKP.import_skp(constrained_vff, cdoc, merge=False)
+                cst = importSKP.last_import_stats
+                assert cst["dimensions_built"] == want_built, (axis_code, cst)
+                assert cst["constrained_dimensions_skipped"] == want_skip, (axis_code, cst)
+                if want_skip:
+                    assert any("axis-constrained" in w for w in cst["warnings"]), cst["warnings"]
+            finally:
+                App.closeDocument(cdoc.Name)
     print("check_real_2021_annotations: OK (real SDK 2021 fixture + 5BD1 check verified)")
 
 
 def check_dimension_planes_and_capilla():
     """Verifies offset rule, unresolved endpoints, '<>' -> '$dim', and #623 screen texts:
-    - With openskp 1.6.0, capilla_quiroz_v17.skp's 26 resolved dimensions sit
-      directly on a-b (zero offset), its 2 unresolved dimensions are counted,
-      its positionless anchored text is skipped, and every Normal is orthogonal.
-    - When Dimension.offset_vector is provided (openskp#621/#623), Dimline uses
-      offset_vector; scalar offset alone gives zero offset.
+    - capilla_quiroz_v17.skp builds 1 positioned leaderless text (openskp#604)
+      and 26 resolved dimensions (20 carrying Dimension.offset_vector, openskp#621),
+      counts its 2 unresolved dimensions, and keeps every Normal orthogonal.
+    - Scalar offset alone (offset_vector=None) sits directly on a-b.
     - openskp#623 screen texts (leader_type == 0 / screen_position with (0,0,0)
       points) are skipped, and '<>' in custom dimension text maps to '$dim'.
     """
     import openskp
-    from openskp.model import Dimension, TextEntity
+    from openskp.model import Dimension
 
     cap_path = os.path.join(FIXTURES_DIR, "capilla_quiroz_v17.skp")
     doc = App.newDocument()
@@ -325,18 +303,19 @@ def check_dimension_planes_and_capilla():
         txts = [
             o for o in doc.Objects if getattr(o, "SketchUpAnnotationKind", "").endswith("text")
         ]
-        if stats["texts_skipped_no_position"]:
-            assert not txts, txts
+        assert len(txts) == 1 and stats["texts_skipped_no_position"] == 0, (txts, stats)
         dims = [
             o for o in doc.Objects if getattr(o, "SketchUpAnnotationKind", "") == "linear_dimension"
         ]
         assert len(dims) == 26, len(dims)
         assert stats["dimensions_skipped_unresolved"] == 2, stats
+        offset_dims = 0
         for idx, d in enumerate(dims):
             _assert_normal_orthogonal(d, f"capilla dim[{idx}]")
-            if not _has_offset_vec():
-                mid = (d.Start + d.End) * 0.5
-                assert (d.Dimline - mid).Length <= 1e-4, (idx, tuple(d.Dimline), tuple(mid))
+            mid = (d.Start + d.End) * 0.5
+            if (d.Dimline - mid).Length > 1.0:
+                offset_dims += 1
+        assert offset_dims == 20, offset_dims
     finally:
         App.closeDocument(doc.Name)
 
@@ -370,30 +349,9 @@ def check_dimension_planes_and_capilla():
         # openskp#623 TextEntity contract: EVERY text carries screen_position
         # ((0,0) on placed texts with leader_type == 2, (u,v) on screen texts
         # with leader_type == 0)
-        from dataclasses import dataclass
-
-        @dataclass
-        class _Real623TextEntity:
-            text: str = ""
-            hidden: bool = False
-            layer: str = ""
-            point: object = None
-            label_point: object = None
-            screen_position: object = (0.0, 0.0)
-            leader_type: int = 2
-            arrow_type: int = 3
-            display_leader: bool = True
-
         ann_17_model = openskp.SkpFile.open(os.path.join(FIXTURES_DIR, "annotations_2017.skp")).parse()
-        for t_raw in ann_17_model.root.texts:
-            rt = _Real623TextEntity(
-                text=t_raw.text,
-                hidden=t_raw.hidden,
-                point=t_raw.point if t_raw.point is not None else (0.0, 0.0, 0.0),
-                label_point=t_raw.label_point if t_raw.label_point is not None else (0.0, 0.0, 0.0),
-                screen_position=(0.0, 0.0) if t_raw.point is not None else (0.2, 0.8),
-                leader_type=2 if t_raw.point is not None else 0,
-            )
+        assert [t.leader_type for t in ann_17_model.root.texts] == [2, 0], ann_17_model.root.texts
+        for rt in ann_17_model.root.texts:
             importSKP._create_draft_text_obj(doc2, rt, None, st)
         assert st["texts_built"] == 1 and st["texts_skipped_no_position"] == 1, st
     finally:
@@ -436,10 +394,10 @@ def check_draft_failure_orphan_cleanup_and_isolation(path):
             stats = importSKP.last_import_stats
             assert stats["faces_built"] == want_cap_faces and want_cap_faces > 0, stats
             assert stats["dimensions_built"] == 0 and stats["texts_built"] == 0, stats
-            assert stats["annotation_failures"] == 26, stats
+            assert stats["annotation_failures"] == 27, stats
             orphans = [o.Name for o in doc.Objects if "Orphan" in o.Name]
             assert not orphans, f"orphan Draft objects left behind: {orphans}"
-            assert sum("failed to create 26 annotation(s)" in w for w in stats["warnings"]) == 1, stats["warnings"]
+            assert sum("failed to create 27 annotation(s)" in w for w in stats["warnings"]) == 1, stats["warnings"]
         finally:
             App.closeDocument(doc.Name)
     finally:

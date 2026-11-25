@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import struct
 import time
 import zipfile
+from bisect import bisect_left, bisect_right
 from typing import Any, Dict, List, Optional
 # material.xml/style.xml come from inside the .skp's ZIP container, which is
 # fully attacker-controlled input - stdlib ElementTree expands internal
@@ -59,6 +61,16 @@ _COMPACT_MODEL_BYTES = 256 * 1024 * 1024
 
 
 # ── TLV Parsing ──────────────────────────────────────────────────────────
+
+_WIN_GUID_ORDER = (3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15)
+
+
+def guid_from_windows_bytes(data: bytes) -> str:
+    """Convert 16 Windows-order GUID bytes into a canonical 32-char uppercase UUID."""
+    if len(data) != 16:
+        raise ValueError("GUID must contain exactly 16 bytes")
+    return bytes(data[i] for i in _WIN_GUID_ORDER).hex().upper()
+
 
 def read_u32(data: bytes, offset: int) -> int:
     return struct.unpack_from('<I', data, offset)[0]
@@ -200,6 +212,7 @@ def _detach_tlv_payloads(nodes):
 # levels deep, which exhausts the stack before anything can be reported, so
 # the parser stops at this depth with a parse error instead.
 _MAX_TLV_DEPTH = 64
+_TLV_WRAP = 1 << 32
 
 
 def _nesting_error(tag, offset):
@@ -209,14 +222,357 @@ def _nesting_error(tag, offset):
     )
 
 
-def parse_tlv_recursive(data, start, end, container_tags=None, depth=0):
+class _Run:
+    __slots__ = ('offset', 'size', 'count')
+
+    def __init__(self, offset: int, size: int, count: int):
+        self.offset = offset
+        self.size = size
+        self.count = count
+
+
+class _Chain:
+    __slots__ = ('runs', 'run_offsets', 'candidates', 'candidate_offsets', 'indexed')
+
+    def __init__(self):
+        self.runs = []
+        self.run_offsets = []
+        self.candidates = []
+        self.candidate_offsets = []
+        self.indexed = False
+
+    def end(self) -> int:
+        r = self.runs[-1]
+        return r.offset + r.count * (r.size + 6)
+
+    def run_at(self, p: int) -> int:
+        return bisect_right(self.run_offsets, p) - 1
+
+    def contains(self, p: int) -> bool:
+        if p < self.runs[0].offset or p >= self.end():
+            return False
+        r = self.runs[self.run_at(p)]
+        return (p - r.offset) % (r.size + 6) == 0
+
+    def clip(self, limit: int) -> int:
+        end = self.end()
+        if limit >= end:
+            return end
+        r = self.runs[self.run_at(limit)]
+        step = r.size + 6
+        return r.offset + ((limit - r.offset) // step) * step
+
+    def append(self, p: int, size: int) -> None:
+        if self.runs and self.runs[-1].size == size and self.end() == p:
+            self.runs[-1].count += 1
+        else:
+            self.runs.append(_Run(p, size, 1))
+            self.run_offsets.append(p)
+
+
+class _Plan:
+    __slots__ = ('views', 'stop')
+
+    def __init__(self, views, stop: int):
+        self.views = views
+        self.stop = stop
+
+
+class _HeaderResolver:
+    """Recover 32-bit wrapped container lengths across >= 4 GiB TLV ranges."""
+
+    def __init__(self, length_fn, container_fn, end: int):
+        self.length = length_fn
+        self.container = container_fn
+        self.limit = end
+        self.attempts = 256
+        self.chains = []
+        self.decisions = {}
+
+    def _chain_at(self, p: int):
+        for chain in reversed(self.chains):
+            if chain.contains(p):
+                return chain
+        return None
+
+    def _ordinary(self, start: int, end: int) -> _Plan:
+        views = []
+        p = start
+        length = self.length
+        while end - p >= 6:
+            cached = self._chain_at(p)
+            if cached is not None:
+                nxt = cached.clip(end)
+                if nxt > p:
+                    views.append((cached, p, nxt))
+                p = nxt
+                if p < cached.end():
+                    return _Plan(views, p)
+                continue
+            chain = _Chain()
+            begin = p
+            probes = 0
+            joined = False
+            while end - p >= 6:
+                if probes and (probes & 1023) == 0 and self._chain_at(p) is not None:
+                    joined = True
+                    break
+                size = length(p)
+                if size > end - p - 6:
+                    break
+                chain.append(p, size)
+                p += 6 + size
+                probes += 1
+            if p > begin:
+                self.chains.append(chain)
+                views.append((chain, begin, p))
+            if not joined:
+                return _Plan(views, p)
+        return _Plan(views, p)
+
+    def _index(self, chain: _Chain) -> None:
+        if chain.indexed:
+            return
+        chain.indexed = True
+        limit = self.limit
+        container = self.container
+        for r in chain.runs:
+            step = r.size + 6
+            for k in range(r.count):
+                p = r.offset + k * step
+                if (limit - p) - step < _TLV_WRAP:
+                    return
+                if container(p):
+                    chain.candidates.append((p, r.size))
+                    chain.candidate_offsets.append(p)
+
+    @staticmethod
+    def _replace(original: _Plan, h_offset: int, size: int, suffix: _Plan, end: int) -> _Plan:
+        views = []
+        for v_chain, v_begin, v_end in original.views:
+            if v_begin >= h_offset:
+                break
+            views.append((v_chain, v_begin, v_end if v_end < h_offset else h_offset))
+            if v_end >= h_offset:
+                break
+        extended = _Chain()
+        extended.append(h_offset, size)
+        views.append((extended, h_offset, h_offset + 6 + size))
+        views.extend(suffix.views)
+        return _Plan(views, end)
+
+    def _solve(self, start: int, end: int, depth: int):
+        normal = self._ordinary(start, end)
+        if normal.stop == end:
+            return normal
+        key = (start, end, depth)
+        if key in self.decisions:
+            return self.decisions[key]
+        for v_chain, v_begin, v_end in normal.views:
+            self._index(v_chain)
+            candidates = v_chain.candidates
+            idx = bisect_left(v_chain.candidate_offsets, v_begin)
+            n_cand = len(candidates)
+            while idx < n_cand:
+                h_offset, h_size = candidates[idx]
+                if h_offset >= v_end:
+                    break
+                idx += 1
+                available = end - h_offset - 6
+                if available - h_size < _TLV_WRAP:
+                    break
+                n = h_size + _TLV_WRAP
+                while n <= available:
+                    if depth >= _MAX_TLV_DEPTH or self.attempts == 0:
+                        raise SkpParseError(
+                            "TLV length recovery exceeded its depth or attempt limit",
+                            stage="tlv_walk", offset=h_offset,
+                        )
+                    self.attempts -= 1
+                    nxt = h_offset + 6 + n
+                    suffix = self._solve(nxt, end, depth + 1)
+                    if suffix is not None and self._solve(h_offset + 6, nxt, depth + 1) is not None:
+                        result = self._replace(normal, h_offset, n, suffix, end)
+                        self.decisions[key] = result
+                        return result
+                    if available - n < _TLV_WRAP:
+                        break
+                    n += _TLV_WRAP
+        self.decisions[key] = None
+        return None
+
+    @staticmethod
+    def _materialize(plan: _Plan):
+        out = []
+        for v_chain, v_begin, v_end in plan.views:
+            i = v_chain.run_at(v_begin)
+            runs = v_chain.runs
+            n_runs = len(runs)
+            while i < n_runs and runs[i].offset < v_end:
+                r = runs[i]
+                i += 1
+                step = r.size + 6
+                r_end = r.offset + r.count * step
+                stop = v_end if v_end < r_end else r_end
+                k0 = 0 if v_begin <= r.offset else (v_begin - r.offset) // step
+                k1 = 0 if stop <= r.offset else (stop - r.offset) // step
+                for k in range(k0, k1):
+                    out.append((r.offset + k * step, r.size))
+        return out
+
+    def headers(self, start: int, end: int):
+        plan = self._solve(start, end, 0)
+        if plan is not None:
+            return self._materialize(plan)
+        return self._materialize(self._ordinary(start, end))
+
+
+def wrapped_model_records(end: int, tag_fn, length_fn):
+    """Disambiguate a >= 4 GiB model.dat whose outer F401 length wrapped."""
+    if end < 6 or end - 6 < _TLV_WRAP or tag_fn(0) != 0x01F4:
+        return None
+    if length_fn(0) != ((end - 6) & 0xFFFFFFFF):
+        return None
+
+    stored_root_end = 6 + length_fn(0)
+    stored_parent_end = stored_root_end
+    contradicts_stored_lengths = False
+    pos = 6
+
+    def checked_length() -> int:
+        nonlocal contradicts_stored_lengths
+        size = length_fn(pos)
+        if (pos <= stored_root_end and stored_root_end - pos >= 6 and size > stored_root_end - pos - 6) or (
+            pos <= stored_parent_end and stored_parent_end - pos >= 6 and size > stored_parent_end - pos - 6
+        ):
+            contradicts_stored_lengths = True
+        return size
+
+    def has(expected: int) -> bool:
+        return end - pos >= 6 and tag_fn(pos) == expected
+
+    def advance() -> bool:
+        nonlocal pos
+        if end - pos < 6:
+            return False
+        size = checked_length()
+        if size > end - pos - 6:
+            return False
+        pos += 6 + size
+        return True
+
+    while not has(0x01F9):
+        if not advance():
+            return None
+    catalog = pos
+    wrappers = []
+    for expected_tag in (0x01F9, 0x1770, 0x1771):
+        if not has(expected_tag):
+            return None
+        wrappers.append(pos)
+        size = checked_length()
+        if pos <= stored_parent_end and stored_parent_end - pos >= 6 and size <= stored_parent_end - pos - 6:
+            stored_parent_end = pos + 6 + size
+        pos += 6
+        if has(0x0063) and not advance():
+            return None
+    definitions = pos
+    while has(0x157C):
+        if not advance():
+            return None
+    entities = pos
+    if definitions == entities or not has(0x01F6):
+        return None
+    for offset in wrappers:
+        if length_fn(offset) != ((entities - offset - 6) & 0xFFFFFFFF):
+            return None
+    stored_parent_end = stored_root_end
+    while pos < end:
+        if not advance():
+            return None
+    if not contradicts_stored_lengths:
+        return None
+
+    records = []
+
+    def append_range(begin: int, stop: int) -> None:
+        p = begin
+        while p < stop:
+            size = length_fn(p)
+            records.append((p, size))
+            p += 6 + size
+
+    append_range(6, catalog)
+    append_range(definitions, entities)
+    append_range(entities, end)
+    return records
+
+
+def tlv_headers(start: int, end: int, length_fn, container_fn):
+    """Scan [start, end) for (offset, size) TLV headers, recovering 32-bit wraps."""
+    if start < 0 or start > end:
+        raise ValueError("invalid TLV range")
+    if end - start >= _TLV_WRAP:
+        return _HeaderResolver(length_fn, container_fn, end).headers(start, end)
+    out = []
+    p = start
+    while end - p >= 6:
+        n = length_fn(p)
+        if n > end - p - 6:
+            break
+        out.append((p, n))
+        p += 6 + n
+    return out
+
+
+def tlv_headers_buffer(data, start: int, end: int, container_tags=None):
     if container_tags is None:
         container_tags = CONTAINER_TAGS
-    pos = start
+    if start < 0 or start > end or end > len(data):
+        raise ValueError("invalid TLV range")
+    unpack_header = _unpack_header
+    if end - start >= _TLV_WRAP:
+        tag_strings = _TAG_STRINGS or _tag_strings()
+        return _HeaderResolver(
+            lambda p: unpack_header(data, p)[1],
+            lambda p: tag_strings[unpack_header(data, p)[0]] in container_tags,
+            end,
+        ).headers(start, end)
+    out = []
+    p = start
+    last_header = end - 6
+    while p <= last_header:
+        _, size = unpack_header(data, p)
+        if p + 6 + size > end:
+            break
+        out.append((p, size))
+        p += 6 + size
+    return out
+
+
+def parse_tlv_recursive(data, start, end, container_tags=None, depth=0):
+    if start < 0 or start > end or end > len(data):
+        raise ValueError("invalid TLV range")
+    if container_tags is None:
+        container_tags = CONTAINER_TAGS
     elements = []
     append = elements.append
     tag_strings = _TAG_STRINGS or _tag_strings()
     unpack_header = _unpack_header
+    if end - start >= _TLV_WRAP:
+        for pos, size in tlv_headers_buffer(data, start, end, container_tags):
+            tag_hex = tag_strings[unpack_header(data, pos)[0]]
+            payload_start = pos + 6
+            payload_end = payload_start + size
+            if size > 0 and tag_hex in container_tags:
+                if depth >= _MAX_TLV_DEPTH:
+                    raise _nesting_error(tag_hex, pos)
+                children = parse_tlv_recursive(data, payload_start, payload_end, container_tags, depth + 1)
+            else:
+                children = []
+            append(_TlvNode(pos, tag_hex, size, children, data, payload_start, payload_end))
+        return elements
+    pos = start
     last_header = end - 6
     while pos <= last_header:
         tag_value, size = unpack_header(data, pos)
@@ -273,6 +629,27 @@ def _parse_tlv_geometry(data, start, end, container_tags, depth=0):
     """
     elements = []
     tag_strings = _TAG_STRINGS or _tag_strings()
+    if end - start >= _TLV_WRAP:
+        for pos, size in tlv_headers_buffer(data, start, end, container_tags):
+            tag = tag_strings[_unpack_header(data, pos)[0]]
+            payload_start = pos + 6
+            payload_end = payload_start + size
+            if tag in ('C409', 'B80B', 'AC0D'):
+                record = _decode_geometry_record(data, payload_start, size, tag)
+                if record is not None:
+                    elements.append(_GeometryRecordNode(
+                        pos, tag, size, record, data, container_tags))
+                    continue
+            if size > 0 and tag in container_tags:
+                if depth >= _MAX_TLV_DEPTH:
+                    raise _nesting_error(tag, pos)
+                parser = parse_tlv_recursive if tag == '6419' else _parse_tlv_geometry
+                children = parser(data, payload_start, payload_end, container_tags, depth + 1)
+            else:
+                children = []
+            elements.append(_TlvNode(pos, tag, size, children, data,
+                                     payload_start, payload_end))
+        return elements
     pos = start
     while pos <= end - 6:
         tag_value, size = _unpack_header(data, pos)
@@ -301,15 +678,20 @@ def _parse_tlv_geometry(data, start, end, container_tags, depth=0):
     return elements
 
 
-def _flat_headers(data, start, end):
+def _flat_headers(data, start, end, container_tags=None):
     """Scan [start, end) for direct-child (tag, offset, size) headers only,
     without recursing into any container - O(sibling count), not
     O(total node count). Used to locate top-level records one at a time so
     full_parse() never has to hold the whole file's TLV tree in memory at
     once (real production files can have 100k+ top-level definitions)."""
+    tag_strings = _TAG_STRINGS or _tag_strings()
+    if end - start >= _TLV_WRAP:
+        return [
+            (tag_strings[_unpack_header(data, pos)[0]], pos, size)
+            for pos, size in tlv_headers_buffer(data, start, end, container_tags)
+        ]
     headers = []
     pos = start
-    tag_strings = _TAG_STRINGS or _tag_strings()
     while pos <= end - 6:
         tag_value, size = _unpack_header(data, pos)
         if pos + 6 + size > end:
@@ -319,7 +701,7 @@ def _flat_headers(data, start, end):
     return headers
 
 
-def _require_complete_top_level(data, start, end):
+def _require_complete_top_level(data, start, end, headers=None):
     """Raise if a top-level record declares more bytes than the data holds.
 
     ``_flat_headers`` stops quietly at such a record, so a ``model.dat`` cut
@@ -330,6 +712,16 @@ def _require_complete_top_level(data, start, end):
     not records, and a strict check there would reject valid models.
     """
     tag_strings = _TAG_STRINGS or _tag_strings()
+    if headers is not None:
+        pos = start if not headers else headers[-1][1] + 6 + headers[-1][2]
+        if end - pos >= 6:
+            tag_value, size = _unpack_header(data, pos)
+            raise SkpParseError(
+                f"model.dat is truncated: the top-level record declares {size} "
+                f"bytes but only {end - pos - 6} remain",
+                stage="tlv_walk", tag=tag_strings[tag_value], offset=pos,
+            )
+        return
     pos = start
     while pos <= end - 6:
         tag_value, size = _unpack_header(data, pos)
@@ -346,7 +738,7 @@ _DEFINITION_LIST_WRAPPER_CHAIN = ('7017', '7117')
 _DEFINITION_TAG = '7C15'
 
 
-def _unwrap_definitions_container(data, offset, size):
+def _unwrap_definitions_container(data, offset, size, container_tags=None):
     """``F901`` wraps the file's whole component/group-definition list
     behind two more single-child containers (``7017``, then ``7117``)
     before reaching the real, independent list of one ``7C15`` per
@@ -358,13 +750,13 @@ def _unwrap_definitions_container(data, offset, size):
     the expected wrapper shape isn't found, so a caller can fall back to
     treating ``F901`` as an ordinary single record rather than risk
     silently mis-parsing a differently-shaped file."""
-    level = _flat_headers(data, offset + 6, offset + 6 + size)
+    level = _flat_headers(data, offset + 6, offset + 6 + size, container_tags)
     for expected_tag in _DEFINITION_LIST_WRAPPER_CHAIN:
         container = next((h for h in level if h[0] == expected_tag), None)
         if container is None:
             return None
         _, c_offset, c_size = container
-        level = _flat_headers(data, c_offset + 6, c_offset + 6 + c_size)
+        level = _flat_headers(data, c_offset + 6, c_offset + 6 + c_size, container_tags)
     defs = [h for h in level if h[0] == _DEFINITION_TAG]
     return defs if defs else None
 
@@ -400,27 +792,53 @@ def iter_top_level_lazy(data, start, end, container_tags=None, *, _geometry=Fals
     if container_tags is None:
         container_tags = CONTAINER_TAGS
 
-    _require_complete_top_level(data, start, end)
-    headers = _flat_headers(data, start, end)
-    if len(headers) == 1 and headers[0][0] == 'F401':
-        _, f401_offset, f401_size = headers[0]
-        headers = _flat_headers(data, f401_offset + 6, f401_offset + 6 + f401_size)
+    try:
+        wrapped = None
+        if start == 0 and end == len(data) and 'F401' in container_tags and end >= 6 and end - 6 >= _TLV_WRAP:
+            wrapped = wrapped_model_records(
+                end,
+                lambda p: _unpack_header(data, p)[0],
+                lambda p: _unpack_header(data, p)[1],
+            )
 
-    expanded = []
-    for tag_hex, offset, size in headers:
-        if tag_hex == 'F901':
-            def_headers = _unwrap_definitions_container(data, offset, size)
-            if def_headers is not None:
-                expanded.extend(def_headers)
-                continue
-        expanded.append((tag_hex, offset, size))
-    headers = expanded
+        if wrapped is not None:
+            tag_strings = _TAG_STRINGS or _tag_strings()
+            headers = [(tag_strings[_unpack_header(data, p)[0]], p, size) for p, size in wrapped]
+        else:
+            headers = _flat_headers(data, start, end, container_tags)
+            _require_complete_top_level(data, start, end, headers)
+            if len(headers) == 1 and headers[0][0] == 'F401':
+                _, f401_offset, f401_size = headers[0]
+                headers = _flat_headers(data, f401_offset + 6, f401_offset + 6 + f401_size, container_tags)
+
+            expanded = []
+            for tag_hex, offset, size in headers:
+                if tag_hex == 'F901':
+                    def_headers = _unwrap_definitions_container(data, offset, size, container_tags)
+                    if def_headers is not None:
+                        expanded.extend(def_headers)
+                        continue
+                expanded.append((tag_hex, offset, size))
+            headers = expanded
+    except (SkpParseError, RecursionError, MemoryError):
+        raise
+    except Exception as e:
+        raise SkpParseError(f"Failed while scanning TLV headers: {e}", stage="tlv_walk") from e
 
     total = len(headers)
     for index, (tag_hex, offset, size) in enumerate(headers):
         record_end = offset + 6 + size
         parser = _parse_tlv_geometry if _geometry else parse_tlv_recursive
-        nodes = parser(data, offset, record_end, container_tags)
+        try:
+            nodes = parser(data, offset, record_end, container_tags)
+        except (SkpParseError, RecursionError, MemoryError):
+            raise
+        except Exception as e:
+            raise SkpParseError(
+                f"Failed while parsing top-level record: {e}",
+                stage="tlv_walk", record_index=index, total_records=total,
+                tag=tag_hex, offset=offset,
+            ) from e
         if nodes:
             yield index, total, nodes[0]
         # Assignment evaluates the next parser call before replacing `nodes`.
@@ -861,97 +1279,798 @@ def _tlv_find(items, tag):
     return None
 
 
+def _length_prefixed_ids(payload):
+    """53FE stores SketchUp's instance path as repeated (u8 length, id bytes),
+    outer placement first."""
+    ids = []
+    off = 0
+    n = len(payload)
+    while off < n:
+        ln = payload[off]
+        if ln == 0 or off + 1 + ln > n:
+            break
+        ids.append(bytes(payload[off + 1:off + 1 + ln]).hex())
+        off += 1 + ln
+    return ids
+
+
+def _dimension_connection_point(block_payload, id2pos, inst_world):
+    if block_payload is None:
+        return None
+    blk = _tlv_find(_tlv_items(block_payload) or [], 0x5208)
+    if blk is None:
+        return None
+    sub = _tlv_items(blk) or []
+    typ = _tlv_find(sub, 0x5209)
+    typ = struct.unpack('<I', typ)[0] if typ and len(typ) == 4 else None
+    if typ == 1:
+        pos = _tlv_find(sub, 0x520A)
+        return struct.unpack('<3d', pos) if pos and len(pos) == 24 else None
+    ref = _tlv_find(sub, 0x520B)
+    f53fc = _tlv_find(_tlv_items(ref) or [], 0x53FC) if ref else None
+    fi = _tlv_items(f53fc) or [] if f53fc else []
+    vid = _tlv_find(fi, 0x53FD)
+    iid = _tlv_find(fi, 0x53FE)
+    if not vid:
+        return None
+    vid_hex = bytes(vid).hex()
+    local = id2pos.get(vid_hex)
+    if local is None:
+        local = id2pos.get(vid_hex.upper())
+    if local is None:
+        return None
+    if iid and len(iid) > 0:
+        path = _length_prefixed_ids(iid)
+        if not path:
+            path = [bytes(iid).hex()]
+        for pid in reversed(path):
+            w = inst_world.get(pid)
+            if w is None:
+                w = inst_world.get(pid.upper())
+            if w:
+                return transform_point(local, w)
+    return local
+
+
+def _flat_tlv_has_fields(buf, begin, end, first=0x5BCD, second=0x5BCE):
+    has_first = False
+    has_second = False
+    off = begin
+    while off < end:
+        if off + 6 > end:
+            return False
+        tag = buf[off] | (buf[off + 1] << 8)
+        ln = struct.unpack_from('<I', buf, off + 2)[0]
+        if tag == 0 or ln > end - off - 6:
+            return False
+        if tag == first:
+            has_first = True
+        if tag == second:
+            has_second = True
+        off += 6 + ln
+    return has_first and has_second
+
+
+def _parse_one_5bcc(model_dat, view, j, id2pos, inst_world):
+    n = len(model_dat)
+    if j + 6 > n:
+        return None
+    ln = struct.unpack_from('<I', model_dat, j + 2)[0]
+    if ln < 40 or j + 6 + ln > n:
+        return None
+    if not _flat_tlv_has_fields(model_dat, j + 6, j + 6 + ln, 0x5BCD, 0x5BCE):
+        return None
+    body = _tlv_items(view[j + 6:j + 6 + ln])
+    if not body:
+        return None
+    tags = [t for t, _ in body]
+    if 0x5BCD not in tags or 0x5BCE not in tags:
+        return None
+    a = _dimension_connection_point(_tlv_find(body, 0x5BCD), id2pos, inst_world)
+    b = _dimension_connection_point(_tlv_find(body, 0x5BCE), id2pos, inst_world)
+    if a is None or b is None:
+        return None
+    layer = ""
+    hidden = False
+    base = _tlv_find(body, 0x59D8)
+    if base is not None:
+        draw = _tlv_find(_tlv_items(base) or [], 0x07D0)
+        if draw is not None:
+            props = _tlv_items(draw) or []
+            layer_b = _tlv_find(props, 0x07D2)
+            if layer_b:
+                layer = str(parse_var_int(bytes(layer_b), 0, len(layer_b)))
+            flags_b = _tlv_find(props, 0x07D3)
+            if flags_b:
+                hidden = bool(flags_b[0] & 0x01)
+    xaxis = _tlv_find(body, 0x5BCF)
+    normal = _tlv_find(body, 0x5BD0)
+    axis_bytes = _tlv_find(body, 0x5BD1)
+    off = _tlv_find(body, 0x5BD2)
+    plane_x_val = (struct.unpack('<3d', xaxis)
+                   if xaxis and len(xaxis) == 24 else None)
+    normal_val = (struct.unpack('<3d', normal)
+                  if normal and len(normal) == 24 else None)
+    offset_val = (struct.unpack('<d', off)[0]
+                  if off and len(off) == 8 else 0.0)
+    offset_vector = None
+    if (axis_bytes and len(axis_bytes) == 4
+            and plane_x_val is not None and normal_val is not None):
+        axis = struct.unpack('<I', axis_bytes)[0]
+        p_norm = plane_x_val
+        p_x = normal_val
+        if axis == 1:
+            offset_vector = (
+                (p_norm[1] * p_x[2] - p_norm[2] * p_x[1]) * offset_val + 0.0,
+                (p_norm[2] * p_x[0] - p_norm[0] * p_x[2]) * offset_val + 0.0,
+                (p_norm[0] * p_x[1] - p_norm[1] * p_x[0]) * offset_val + 0.0,
+            )
+        elif axis == 2:
+            offset_vector = (
+                -p_x[0] * offset_val + 0.0,
+                -p_x[1] * offset_val + 0.0,
+                -p_x[2] * offset_val + 0.0,
+            )
+    return {
+        'a': a, 'b': b,
+        'plane_x': plane_x_val,
+        'normal': normal_val,
+        'offset': offset_val,
+        'offset_vector': offset_vector,
+        'layer': layer,
+        'hidden': hidden,
+        'text': '',
+    }
+
+
+def _parse_vff_text(model_dat, view, j, id2pos, inst_world):
+    ln = struct.unpack_from('<I', model_dat, j + 2)[0]
+    fields = _tlv_items(view[j + 6:j + 6 + ln])
+    if not fields:
+        return None
+    val_b = _tlv_find(fields, 0x55F1)
+    conn_b = _tlv_find(fields, 0x55F4)
+    if val_b is None or conn_b is None:
+        return None
+    text_str = bytes(val_b).decode('utf-8', errors='replace')
+    pt = _dimension_connection_point(conn_b, id2pos, inst_world)
+    lp_b = _tlv_find(fields, 0x55F5)
+    lp = struct.unpack('<3d', lp_b) if lp_b and len(lp_b) == 24 else None
+    sx_b = _tlv_find(fields, 0x55F2)
+    sy_b = _tlv_find(fields, 0x55F3)
+    screen_pos = (
+        (struct.unpack('<d', sx_b)[0], struct.unpack('<d', sy_b)[0])
+        if sx_b and sy_b and len(sx_b) == 8 and len(sy_b) == 8 else None
+    )
+    lt_b = _tlv_find(fields, 0x55FD)
+    leader_type = struct.unpack('<I', lt_b)[0] if lt_b and len(lt_b) == 4 else 2
+    at_b = _tlv_find(fields, 0x55FA)
+    arrow_type = struct.unpack('<I', at_b)[0] if at_b and len(at_b) == 4 else 3
+    dl_b = _tlv_find(fields, 0x55FC)
+    display_leader = (dl_b[0] != 0) if dl_b and len(dl_b) == 1 else True
+    layer = ""
+    hidden = False
+    draw_b = _tlv_find(fields, 0x07D0)
+    if draw_b is not None:
+        props = _tlv_items(draw_b) or []
+        layer_b = _tlv_find(props, 0x07D2)
+        if layer_b:
+            layer = str(parse_var_int(bytes(layer_b), 0, len(layer_b)))
+        flags_b = _tlv_find(props, 0x07D3)
+        if flags_b:
+            hidden = bool(flags_b[0] & 0x01)
+    return {
+        'text': text_str,
+        'hidden': hidden,
+        'layer': layer,
+        'p': pt,
+        'lp': lp,
+        'screen_position': screen_pos,
+        'leader_type': leader_type,
+        'arrow_type': arrow_type,
+        'display_leader': display_leader,
+    }
+
+
+def _tlv_headers_range(md, start, end):
+    out = []
+    p = start
+    while p + 6 <= end:
+        n = struct.unpack_from('<I', md, p + 2)[0]
+        if n > end - p - 6:
+            break
+        out.append((p, n))
+        p += 6 + n
+    return out
+
+
+_DEF_ID_CONTAINERS = frozenset({'8813', 'D007', '8913', '8A13', '8B13', '8C13', '8D13'})
+
+
+def _entity_id_from_tlv_span(md, rec, rec_end, depth=0):
+    if depth > 24 or rec + 6 > rec_end:
+        return None
+    kids = _tlv_headers_range(md, rec + 6, rec_end)
+    for k_off, k_sz in kids:
+        t = f"{md[k_off]:02X}{md[k_off + 1]:02X}"
+        try:
+            if t == 'DE05' and 0 < k_sz <= 8:
+                return parse_var_int(md, k_off + 6, k_sz)
+            if t == 'DC05' and k_sz >= 6 and md[k_off + 6] == 0xDE and md[k_off + 7] == 0x05:
+                z = struct.unpack_from('<I', md, k_off + 8)[0]
+                if 0 < z <= 8 and z <= k_sz - 6:
+                    return parse_var_int(md, k_off + 12, z)
+        except Exception:
+            continue
+    for k_off, k_sz in kids:
+        t = f"{md[k_off]:02X}{md[k_off + 1]:02X}"
+        if t not in _DEF_ID_CONTAINERS:
+            continue
+        found = _entity_id_from_tlv_span(md, k_off, k_off + 6 + k_sz, depth + 1)
+        if found is not None:
+            return found
+    return None
+
+
+def _scan_definition_spans(md, defs_dict):
+    spans = []
+    if len(md) < 6:
+        return spans
+    hs = _tlv_headers_range(md, 0, len(md))
+    if len(hs) == 1 and md[hs[0][0]] == 0xF4 and md[hs[0][0] + 1] == 0x01:
+        hs = _tlv_headers_range(md, hs[0][0] + 6, hs[0][0] + 6 + hs[0][1])
+    for h_off, h_sz in hs:
+        if f"{md[h_off]:02X}{md[h_off + 1]:02X}" != 'F901':
+            continue
+        level = _tlv_headers_range(md, h_off + 6, h_off + 6 + h_sz)
+        ok = True
+        for expected in ('7017', '7117'):
+            match = None
+            for rec_off, rec_sz in level:
+                if f"{md[rec_off]:02X}{md[rec_off + 1]:02X}" == expected:
+                    match = (rec_off, rec_sz)
+                    break
+            if match is None:
+                ok = False
+                break
+            level = _tlv_headers_range(md, match[0] + 6, match[0] + 6 + match[1])
+        if not ok:
+            continue
+        for rec_off, rec_sz in level:
+            if f"{md[rec_off]:02X}{md[rec_off + 1]:02X}" != '7C15':
+                continue
+            did = _entity_id_from_tlv_span(md, rec_off, rec_off + 6 + rec_sz)
+            if did is None or did not in defs_dict:
+                continue
+            spans.append((rec_off, rec_off + 6 + rec_sz, did))
+    return spans
+
+
+def _owning_definition(spans, off):
+    best = None
+    best_len = None
+    for s_begin, s_end, s_id in spans:
+        if off < s_begin or off >= s_end:
+            continue
+        ln = s_end - s_begin
+        if best_len is None or ln < best_len:
+            best_len = ln
+            best = s_id
+    return best
+
+
+def _tlv_contains_tag(buf, begin, end, tag, depth=0):
+    if depth > 64:
+        return False
+    off = begin
+    while off < end:
+        if off + 6 > end:
+            return False
+        t = buf[off] | (buf[off + 1] << 8)
+        ln = struct.unpack_from('<I', buf, off + 2)[0]
+        if t == 0 or ln > end - off - 6:
+            return False
+        off += 6 + ln
+    off = begin
+    while off < end:
+        t = buf[off] | (buf[off + 1] << 8)
+        ln = struct.unpack_from('<I', buf, off + 2)[0]
+        if t == tag or _tlv_contains_tag(buf, off + 6, off + 6 + ln, tag, depth + 1):
+            return True
+        off += 6 + ln
+    return False
+
+
+MAX_EXPANDED_INSTANCES = 50_000_000
+
+
+def _compose_instance_world(root_builder, defs_dict, world, max_visits=MAX_EXPANDED_INSTANCES):
+    visits = 0
+
+    def walk(builder, parent, depth):
+        nonlocal visits
+        if depth > 64 or builder is None or visits >= max_visits:
+            return
+        for inst in getattr(builder, 'instances', ()):
+            if visits >= max_visits:
+                return
+            visits += 1
+            mat = inst.get('matrix')
+            here = multiply_matrices(parent, mat) if mat else parent
+            pid = inst.get('persistent_id')
+            if pid:
+                world[pid] = here
+            ref_idx = inst.get('ref_idx')
+            if ref_idx is None:
+                continue
+            target = defs_dict.get(ref_idx)
+            if target is not None:
+                walk(target.get('builder') if isinstance(target, dict) else getattr(target, 'builder', None), here, depth + 1)
+
+    rb = root_builder.get('builder') if isinstance(root_builder, dict) else getattr(root_builder, 'builder', root_builder)
+    walk(rb, None, 0)
+    return visits
+
+
+class _InstancePathResolver:
+    """Resolves 53FE instance paths lazily using a definition/PID reachability
+    index, capping per-query placement visits at *max_visits*."""
+
+    def __init__(self, root_builder, defs_dict, max_visits=MAX_EXPANDED_INSTANCES):
+        self.root_builder = (
+            root_builder.get('builder')
+            if isinstance(root_builder, dict)
+            else getattr(root_builder, 'builder', root_builder)
+        )
+        self.defs_dict = defs_dict
+        self.max_visits = max_visits
+        self.visits = 0
+        self._by_pid = {}
+        self._resolved = {}
+        self._indexed = False
+        self._holders_of_pid = {}
+        self._parents_of_def = {}
+
+    def _builder_for(self, owner):
+        if owner is None:
+            return self.root_builder
+        target = self.defs_dict.get(owner)
+        if target is None:
+            return None
+        return target.get('builder') if isinstance(target, dict) else getattr(target, 'builder', None)
+
+    def _pid_map(self, owner, builder):
+        if owner in self._by_pid:
+            return self._by_pid[owner]
+        mapping = {}
+        if builder is not None:
+            for inst in getattr(builder, 'instances', ()):
+                pid = inst.get('persistent_id')
+                if pid:
+                    mapping[pid.lower()] = inst
+        self._by_pid[owner] = mapping
+        return mapping
+
+    def _ensure_index(self):
+        if self._indexed:
+            return
+        self._indexed = True
+        owners = [None]
+        owners.extend(self.defs_dict.keys())
+        for def_owner in owners:
+            builder = self._builder_for(def_owner)
+            if builder is None:
+                continue
+            seen_pids = set()
+            seen_refs = set()
+            for inst in getattr(builder, 'instances', ()):
+                pid = inst.get('persistent_id')
+                if pid:
+                    norm_pid = pid.lower()
+                    if norm_pid not in seen_pids:
+                        seen_pids.add(norm_pid)
+                        self._holders_of_pid.setdefault(norm_pid, []).append(def_owner)
+                ref_idx = inst.get('ref_idx')
+                if ref_idx is not None and ref_idx in self.defs_dict and ref_idx not in seen_refs:
+                    seen_refs.add(ref_idx)
+                    self._parents_of_def.setdefault(ref_idx, []).append(def_owner)
+
+    def _walk_exact(self, owner, builder, path, idx, parent_xf, depth, query_state):
+        if depth > 64 or builder is None or query_state[0] >= self.max_visits:
+            return False, None
+        inst = self._pid_map(owner, builder).get(path[idx])
+        if inst is None:
+            return False, None
+        self.visits += 1
+        query_state[0] += 1
+        mat = inst.get('matrix')
+        here = multiply_matrices(parent_xf, mat) if mat else parent_xf
+        if idx + 1 == len(path):
+            return True, here
+        ref_idx = inst.get('ref_idx')
+        if ref_idx is None:
+            return False, None
+        child_builder = self._builder_for(ref_idx)
+        if child_builder is None:
+            return False, None
+        return self._walk_exact(ref_idx, child_builder, path, idx + 1, here, depth + 1, query_state)
+
+    def resolve_path(self, owner, raw_path, fallback_owner=None):
+        norm = tuple(p.lower() for p in raw_path)
+        if not norm:
+            return False, None
+        key = (owner, fallback_owner, norm)
+        if key in self._resolved:
+            return self._resolved[key]
+        query_state = [0]
+        start_builder = self._builder_for(owner)
+        matched, xf = self._walk_exact(owner, start_builder, norm, 0, None, 0, query_state)
+        if matched:
+            self._resolved[key] = (True, xf)
+            return True, xf
+        if query_state[0] >= self.max_visits:
+            return False, None
+
+        self._ensure_index()
+        valid_holders = set()
+        fb_result = None
+        for holder in self._holders_of_pid.get(norm[0], ()):
+            if holder == owner:
+                continue
+            if query_state[0] >= self.max_visits:
+                break
+            ok, h_xf = self._walk_exact(
+                holder, self._builder_for(holder), norm, 0, None, 0, query_state
+            )
+            if ok:
+                valid_holders.add(holder)
+                if fallback_owner is not None and holder == fallback_owner:
+                    fb_result = (True, h_xf)
+
+        if valid_holders and query_state[0] < self.max_visits:
+            can_reach = set(valid_holders)
+            queue = [h for h in valid_holders if h is not None]
+            qi = 0
+            while qi < len(queue):
+                cur = queue[qi]
+                qi += 1
+                for parent_owner in self._parents_of_def.get(cur, ()):
+                    if parent_owner not in can_reach:
+                        can_reach.add(parent_owner)
+                        if parent_owner is not None:
+                            queue.append(parent_owner)
+
+            if owner in can_reach:
+                active_defs = {owner} if owner is not None else set()
+                failed_min_depth = {}
+
+                def walk_to_holder(cur_owner, cur_builder, parent_xf, depth):
+                    if depth > 64 or cur_builder is None or query_state[0] >= self.max_visits:
+                        return False, None
+                    if depth > 0 and cur_owner in valid_holders and depth + len(norm) <= 65:
+                        m_tail, tail_xf = self._walk_exact(
+                            cur_owner, cur_builder, norm, 0, parent_xf, depth, query_state
+                        )
+                        if m_tail or query_state[0] >= self.max_visits:
+                            return m_tail, tail_xf
+                    for inst in getattr(cur_builder, 'instances', ()):
+                        if query_state[0] >= self.max_visits:
+                            return False, None
+                        ref_idx = inst.get('ref_idx')
+                        if ref_idx is None or ref_idx not in can_reach or ref_idx in active_defs:
+                            continue
+                        prev_fail = failed_min_depth.get(ref_idx)
+                        if prev_fail is not None and depth + 1 >= prev_fail:
+                            continue
+                        child_builder = self._builder_for(ref_idx)
+                        if child_builder is None:
+                            continue
+                        self.visits += 1
+                        query_state[0] += 1
+                        mat = inst.get('matrix')
+                        here = multiply_matrices(parent_xf, mat) if mat else parent_xf
+                        active_defs.add(ref_idx)
+                        found, found_xf = walk_to_holder(ref_idx, child_builder, here, depth + 1)
+                        active_defs.remove(ref_idx)
+                        if found:
+                            return True, found_xf
+                        if query_state[0] >= self.max_visits:
+                            return False, None
+                    if cur_owner is not None:
+                        prev = failed_min_depth.get(cur_owner)
+                        if prev is None or depth < prev:
+                            failed_min_depth[cur_owner] = depth
+                    return False, None
+
+                matched, xf = walk_to_holder(owner, start_builder, None, 0)
+
+        if not matched and fallback_owner is not None and fallback_owner != owner:
+            if fb_result is not None:
+                matched, xf = fb_result
+            elif query_state[0] < self.max_visits and fallback_owner in valid_holders:
+                fb_builder = self._builder_for(fallback_owner)
+                matched, xf = self._walk_exact(
+                    fallback_owner, fb_builder, norm, 0, None, 0, query_state
+                )
+
+        if query_state[0] < self.max_visits:
+            self._resolved[key] = (matched, xf)
+        return matched, xf
+
+    def connection_point(self, block_payload, id2pos, owner, fallback_owner=None):
+        if block_payload is None:
+            return None
+        blk = _tlv_find(_tlv_items(block_payload) or [], 0x5208)
+        if blk is None:
+            return None
+        sub = _tlv_items(blk) or []
+        typ = _tlv_find(sub, 0x5209)
+        typ = struct.unpack('<I', typ)[0] if typ and len(typ) == 4 else None
+        if typ == 1:
+            pos = _tlv_find(sub, 0x520A)
+            return struct.unpack('<3d', pos) if pos and len(pos) == 24 else None
+        ref = _tlv_find(sub, 0x520B)
+        f53fc = _tlv_find(_tlv_items(ref) or [], 0x53FC) if ref else None
+        fi = _tlv_items(f53fc) or [] if f53fc else []
+        vid = _tlv_find(fi, 0x53FD)
+        iid = _tlv_find(fi, 0x53FE)
+        if not vid:
+            return None
+        vid_hex = bytes(vid).hex()
+        local = id2pos.get(vid_hex)
+        if local is None:
+            local = id2pos.get(vid_hex.upper())
+        if local is None:
+            return None
+        if iid and len(iid) > 0:
+            path = _length_prefixed_ids(iid)
+            if not path:
+                path = [bytes(iid).hex()]
+            matched, xf = self.resolve_path(owner, path, fallback_owner=fallback_owner)
+            if matched and xf:
+                return transform_point(local, xf)
+        return local
+
+
+_ANNOTATION_TAG_RE = re.compile(rb'\xcc\x5b|\xf0\x55')
+
+
+def _parse_one_5bcc_resolved(model_dat, view, j, id2pos, resolver, owner, fallback_owner=None):
+    n = len(model_dat)
+    if j + 6 > n:
+        return None
+    ln = struct.unpack_from('<I', model_dat, j + 2)[0]
+    if ln < 40 or j + 6 + ln > n:
+        return None
+    if not _flat_tlv_has_fields(model_dat, j + 6, j + 6 + ln, 0x5BCD, 0x5BCE):
+        return None
+    body = _tlv_items(view[j + 6:j + 6 + ln])
+    if not body:
+        return None
+    tags = [t for t, _ in body]
+    if 0x5BCD not in tags or 0x5BCE not in tags:
+        return None
+    a = resolver.connection_point(_tlv_find(body, 0x5BCD), id2pos, owner, fallback_owner)
+    b = resolver.connection_point(_tlv_find(body, 0x5BCE), id2pos, owner, fallback_owner)
+    if a is None or b is None:
+        return None
+    layer = ""
+    hidden = False
+    base = _tlv_find(body, 0x59D8)
+    if base is not None:
+        draw = _tlv_find(_tlv_items(base) or [], 0x07D0)
+        if draw is not None:
+            props = _tlv_items(draw) or []
+            layer_b = _tlv_find(props, 0x07D2)
+            if layer_b:
+                layer = str(parse_var_int(bytes(layer_b), 0, len(layer_b)))
+            flags_b = _tlv_find(props, 0x07D3)
+            if flags_b:
+                hidden = bool(flags_b[0] & 0x01)
+    xaxis = _tlv_find(body, 0x5BCF)
+    normal = _tlv_find(body, 0x5BD0)
+    axis_bytes = _tlv_find(body, 0x5BD1)
+    off = _tlv_find(body, 0x5BD2)
+    plane_x_val = (struct.unpack('<3d', xaxis)
+                   if xaxis and len(xaxis) == 24 else None)
+    normal_val = (struct.unpack('<3d', normal)
+                  if normal and len(normal) == 24 else None)
+    offset_val = (struct.unpack('<d', off)[0]
+                  if off and len(off) == 8 else 0.0)
+    offset_vector = None
+    if (axis_bytes and len(axis_bytes) == 4
+            and plane_x_val is not None and normal_val is not None):
+        axis = struct.unpack('<I', axis_bytes)[0]
+        p_norm = plane_x_val
+        p_x = normal_val
+        if axis == 1:
+            offset_vector = (
+                (p_norm[1] * p_x[2] - p_norm[2] * p_x[1]) * offset_val + 0.0,
+                (p_norm[2] * p_x[0] - p_norm[0] * p_x[2]) * offset_val + 0.0,
+                (p_norm[0] * p_x[1] - p_norm[1] * p_x[0]) * offset_val + 0.0,
+            )
+        elif axis == 2:
+            offset_vector = (
+                -p_x[0] * offset_val + 0.0,
+                -p_x[1] * offset_val + 0.0,
+                -p_x[2] * offset_val + 0.0,
+            )
+    return {
+        'a': a, 'b': b,
+        'plane_x': plane_x_val,
+        'normal': normal_val,
+        'offset': offset_val,
+        'offset_vector': offset_vector,
+        'layer': layer,
+        'hidden': hidden,
+        'text': '',
+    }
+
+
+def _parse_vff_text_resolved(model_dat, view, j, id2pos, resolver, owner):
+    ln = struct.unpack_from('<I', model_dat, j + 2)[0]
+    fields = _tlv_items(view[j + 6:j + 6 + ln])
+    if not fields:
+        return None
+    val_b = _tlv_find(fields, 0x55F1)
+    conn_b = _tlv_find(fields, 0x55F4)
+    if val_b is None or conn_b is None:
+        return None
+    text_str = bytes(val_b).decode('utf-8', errors='replace')
+    pt = resolver.connection_point(conn_b, id2pos, owner)
+    lp_b = _tlv_find(fields, 0x55F5)
+    lp = struct.unpack('<3d', lp_b) if lp_b and len(lp_b) == 24 else None
+    sx_b = _tlv_find(fields, 0x55F2)
+    sy_b = _tlv_find(fields, 0x55F3)
+    screen_pos = (
+        (struct.unpack('<d', sx_b)[0], struct.unpack('<d', sy_b)[0])
+        if sx_b and sy_b and len(sx_b) == 8 and len(sy_b) == 8 else None
+    )
+    lt_b = _tlv_find(fields, 0x55FD)
+    leader_type = struct.unpack('<I', lt_b)[0] if lt_b and len(lt_b) == 4 else 2
+    at_b = _tlv_find(fields, 0x55FA)
+    arrow_type = struct.unpack('<I', at_b)[0] if at_b and len(at_b) == 4 else 3
+    dl_b = _tlv_find(fields, 0x55FC)
+    display_leader = (dl_b[0] != 0) if dl_b and len(dl_b) == 1 else True
+    layer = ""
+    hidden = False
+    draw_b = _tlv_find(fields, 0x07D0)
+    if draw_b is not None:
+        props = _tlv_items(draw_b) or []
+        layer_b = _tlv_find(props, 0x07D2)
+        if layer_b:
+            layer = str(parse_var_int(bytes(layer_b), 0, len(layer_b)))
+        flags_b = _tlv_find(props, 0x07D3)
+        if flags_b:
+            hidden = bool(flags_b[0] & 0x01)
+    return {
+        'text': text_str,
+        'hidden': hidden,
+        'layer': layer,
+        'p': pt,
+        'lp': lp,
+        'screen_position': screen_pos,
+        'leader_type': leader_type,
+        'arrow_type': arrow_type,
+        'display_leader': display_leader,
+    }
+
+
+def _tlv_has_nonempty_tag(buf, begin, end, tag, depth=0):
+    if depth > 64:
+        return False
+    off = begin
+    while off < end:
+        if off + 6 > end:
+            return False
+        t = buf[off] | (buf[off + 1] << 8)
+        ln = struct.unpack_from('<I', buf, off + 2)[0]
+        if t == 0 or ln > end - off - 6:
+            return False
+        off += 6 + ln
+    off = begin
+    while off < end:
+        t = buf[off] | (buf[off + 1] << 8)
+        ln = struct.unpack_from('<I', buf, off + 2)[0]
+        if (t == tag and ln > 0) or _tlv_has_nonempty_tag(buf, off + 6, off + 6 + ln, tag, depth + 1):
+            return True
+        off += 6 + ln
+    return False
+
+
+def _assign_vff_annotations(
+    model_dat,
+    id2pos,
+    root_builder,
+    defs_dict,
+    world_dimensions=None,
+    max_visits=MAX_EXPANDED_INSTANCES,
+):
+    spans = None
+    resolver = _InstancePathResolver(root_builder, defs_dict, max_visits=max_visits)
+    n = len(model_dat)
+    view = memoryview(model_dat)
+    for m in _ANNOTATION_TAG_RE.finditer(model_dat):
+        j = m.start()
+        if j + 6 > n:
+            continue
+        ln = struct.unpack_from('<I', model_dat, j + 2)[0]
+        if ln < 40 or j + 6 + ln > n:
+            continue
+        is_text = model_dat[j] == 0xF0
+        if not _flat_tlv_has_fields(
+            model_dat, j + 6, j + 6 + ln,
+            0x55F1 if is_text else 0x5BCD,
+            0x55F4 if is_text else 0x5BCE,
+        ):
+            continue
+        if spans is None:
+            spans = _scan_definition_spans(model_dat, defs_dict)
+        owner = _owning_definition(spans, j)
+        target_builder = defs_dict[owner]['builder'] if owner is not None else root_builder
+        if is_text:
+            txt = _parse_vff_text_resolved(model_dat, view, j, id2pos, resolver, owner)
+            if txt is not None:
+                target_builder.texts.append(txt)
+        else:
+            dim = _parse_one_5bcc_resolved(model_dat, view, j, id2pos, resolver, owner)
+            if dim is not None:
+                target_builder.dimensions.append(dim)
+            if world_dimensions is not None:
+                if owner is None or not _tlv_has_nonempty_tag(model_dat, j + 6, j + 6 + ln, 0x53FE):
+                    if dim is not None:
+                        world_dimensions.append(dict(dim))
+                else:
+                    wdim = _parse_one_5bcc_resolved(
+                        model_dat, view, j, id2pos, resolver, None, fallback_owner=owner
+                    )
+                    if wdim is not None:
+                        world_dimensions.append(wdim)
+    return resolver.visits
+
+
 def _parse_dimensions(model_dat, id2pos, inst_world):
-    """Linear dimensions (SketchUp's Dimension tool).
-
-    A dimension entity is a ``5BCC`` record (raw bytes ``cc 5b``) holding:
-
-    * ``5BCD`` / ``5BCE`` — the two connection points. Each wraps a ``5208``
-      whose ``5209`` is the connection TYPE (1 = a free explicit point in
-      ``520A``, already world space; 2 = connected to geometry, ``520A`` is
-      zero and ``520B → 53FC`` names the target: ``53FD`` = the vertex by
-      persistent id, ``53FE`` = a length-prefixed persistent id of the
-      INSTANCE holding it — the vertex position is definition-local, so it is
-      lifted to world by that instance's transform).
-    * ``5BCF`` — the dimension plane's NORMAL (SketchUp's
-      ``SUDimensionLinearGetNormal`` equals it); ``5BD0`` — its X axis. Kept in
-      the ``plane_x`` and ``normal`` fields, whose names say the opposite.
-    * ``5BD2`` — the offset distance (inches): how far the dimension line sits
-      from the measured segment, along the in-plane perpendicular.
-
-    The measured value is auto-computed from the two points (no cached text on
-    the samples seen), so callers format it themselves. Endpoints come out in
-    WORLD space (inches). A connection point that cannot be resolved drops the
-    whole dimension (fail-safe)."""
+    """Linear dimensions (SketchUp's Dimension tool). Keeps world-space model
+    compatibility list across all 5BCC records."""
     dims = []
     i = 0
-    n = len(model_dat)
     view = memoryview(model_dat)
     while True:
         j = model_dat.find(b'\xcc\x5b', i)
         if j < 0:
             break
         i = j + 1
-        if j + 6 > n:
-            continue
-        ln = struct.unpack_from('<I', model_dat, j + 2)[0]
-        if ln < 40 or j + 6 + ln > n:
-            continue
-        # A coincidental marker in geometry can advertise hundreds of MB.
-        # Validate candidates through views before copying any payloads.
-        body = _tlv_items(view[j + 6:j + 6 + ln])
-        if body is None:
-            continue
-        tags = [t for t, _ in body]
-        if 0x5BCD not in tags or 0x5BCE not in tags:
-            continue
-
-        def _point(block_payload):
-            blk = _tlv_find(_tlv_items(block_payload) or [], 0x5208)
-            if blk is None:
-                return None
-            sub = _tlv_items(blk) or []
-            typ = _tlv_find(sub, 0x5209)
-            typ = struct.unpack('<I', typ)[0] if typ and len(typ) == 4 else None
-            if typ == 1:
-                pos = _tlv_find(sub, 0x520A)
-                return struct.unpack('<3d', pos) if pos and len(pos) == 24 \
-                    else None
-            # type 2: resolve the geometry reference (vertex + instance).
-            ref = _tlv_find(sub, 0x520B)
-            f53fc = _tlv_find(_tlv_items(ref) or [], 0x53FC) if ref else None
-            fi = _tlv_items(f53fc) or [] if f53fc else []
-            vid = _tlv_find(fi, 0x53FD)
-            iid = _tlv_find(fi, 0x53FE)
-            if not vid:
-                return None
-            local = id2pos.get(vid.hex())
-            if local is None:
-                return None
-            if iid and len(iid) >= 1 and iid[0] > 0 \
-                    and 1 + iid[0] <= len(iid):
-                w = inst_world.get(iid[1:1 + iid[0]].hex())
-                if w:
-                    return transform_point(local, w)
-            return local           # model-root vertex — already world
-
-        a = _point(_tlv_find(body, 0x5BCD))
-        b = _point(_tlv_find(body, 0x5BCE))
-        if a is None or b is None:
-            continue
-        xaxis = _tlv_find(body, 0x5BCF)
-        normal = _tlv_find(body, 0x5BD0)
-        off = _tlv_find(body, 0x5BD2)
-        dims.append({
-            'a': a, 'b': b,
-            'plane_x': struct.unpack('<3d', xaxis)
-            if xaxis and len(xaxis) == 24 else None,
-            'normal': struct.unpack('<3d', normal)
-            if normal and len(normal) == 24 else None,
-            'offset': struct.unpack('<d', off)[0]
-            if off and len(off) == 8 else 0.0,
-        })
+        d = _parse_one_5bcc(model_dat, view, j, id2pos, inst_world)
+        if d is not None:
+            dims.append(d)
     return dims
+
+
+_FACE_FRONT_TAG = b'\x5c\x73\x04\x00\x00\x00'  # 0x735C, 4 bytes
+_FACE_BACK_TAG = b'\x5d\x73\x04\x00\x00\x00'   # 0x735D, 4 bytes
+
+
+def _model_face_colors(model_dat):
+    """``(front, back)``: the model's face colours as SketchUp shows them on
+    an unpainted face's front and back side, each ``(r, g, b)``, or ``None``.
+
+    They are the rendering options' items 0x735C and 0x735D in model.dat, one
+    RGBA each, the first right before the second (openskp#533). Checked
+    against SketchUp's own FaceFrontColor / FaceBackColor on every 2021+ file
+    of the test corpus: the pair occurs once and holds exactly those colours,
+    including in a file whose colours were changed from the default. These
+    are what SketchUp shows, which can differ from every saved style in
+    ``styles`` (a style changed and not saved)."""
+    at = model_dat.find(_FACE_FRONT_TAG)
+    while at >= 0:
+        back_at = at + 10
+        if model_dat[back_at:back_at + 6] == _FACE_BACK_TAG:
+            front = model_dat[at + 6:at + 10]
+            back = model_dat[back_at + 6:back_at + 10]
+            if len(back) == 4:
+                return tuple(front[:3]), tuple(back[:3])
+        at = model_dat.find(_FACE_FRONT_TAG, at + 1)
+    return None
 
 
 def _parse_pages(node):
@@ -966,6 +2085,9 @@ def _parse_pages(node):
       visible height matches the thumbnail framing exactly, while
       perspective scenes carry 01 with a stale 34C3),
       34C3 f64 = visible height when parallel (inches)
+    * 7149 — u32 capture flags: which properties the scene saves (see
+      ``Page.capture_flags``)
+    * 714B — entities hidden in this page, in the runs 7150 uses
     * 7150 — layers hidden in this page: (u8 length, var-int layer id) runs
     """
     if node is None:
@@ -980,6 +2102,17 @@ def _parse_pages(node):
     def vec3(p):
         return struct.unpack('<3d', p) if p is not None and len(p) == 24 \
             else None
+
+    def parse_id_runs(runs):
+        ids = []
+        off = 0
+        while runs and off + 1 <= len(runs):
+            ln = runs[off]
+            if ln == 0 or off + 1 + ln > len(runs):
+                break
+            ids.append(parse_var_int(runs, off + 1, ln))
+            off += 1 + ln
+        return ids
 
     pages = []
     for t60, p60 in _tlv_items(node['payload']) or []:
@@ -996,7 +2129,11 @@ def _parse_pages(node):
                     continue
                 page = {'name': '', 'eye': None, 'target': None, 'up': None,
                         'fov': 35.0, 'parallel': False, 'ortho_height': 0.0,
-                        'hidden_layer_ids': []}
+                        'hidden_layer_ids': [], 'hidden_entity_ids': [],
+                        'capture_flags': None}
+                flags = sub(items, 0x7149)
+                if flags is not None and len(flags) == 4:
+                    page['capture_flags'] = struct.unpack('<I', flags)[0]
                 head = _tlv_items(sub(items, 0x6F54) or b'')
                 name = sub(head, 0x6F55)
                 if name:
@@ -1015,15 +2152,8 @@ def _parse_pages(node):
                     height = sub(cam, 0x34C3)
                     if height is not None and len(height) == 8:
                         page['ortho_height'] = struct.unpack('<d', height)[0]
-                hidden = sub(items, 0x7150)
-                off = 0
-                while hidden and off + 1 <= len(hidden):
-                    ln = hidden[off]
-                    if ln == 0 or off + 1 + ln > len(hidden):
-                        break
-                    page['hidden_layer_ids'].append(
-                        parse_var_int(hidden, off + 1, ln))
-                    off += 1 + ln
+                page['hidden_layer_ids'] = parse_id_runs(sub(items, 0x7150))
+                page['hidden_entity_ids'] = parse_id_runs(sub(items, 0x714B))
                 # A scene that doesn't save its camera ("Camera Location"
                 # unticked) is still a scene: it keeps its name and hidden
                 # layers, with eye/target/up left None.
@@ -1359,7 +2489,7 @@ def _extract_geometry_nodes(elements, builder):
             matrix = []
             guid_node = _find_tag(nodes_to_search, '6819')
             if guid_node and len(guid_node.payload) == 16:
-                guid = guid_node.payload.hex().upper()
+                guid = guid_from_windows_bytes(guid_node.payload)
             def_idx_node = _find_tag(nodes_to_search, '6719')
             if def_idx_node:
                 def_idx = parse_var_int(def_idx_node.payload, 0, len(def_idx_node.payload))
@@ -1386,9 +2516,18 @@ def _extract_geometry_nodes(elements, builder):
             # knowable once the scene graph is actually flattened (see
             # SkpFile.build_scene()'s InstanceNode.layer for that).
             inst_layer_id = None
+            inst_pid = ""
             inst_attribute_dicts = {}
             d007 = _direct_child(el.children, 'D007')
             if d007:
+                dc05 = _direct_child(d007.children, 'DC05')
+                if dc05 and dc05.payload:
+                    p = dc05.payload
+                    if len(p) >= 6 and p[:2] == b'\xde\x05':
+                        idlen = read_u32(p, 2)
+                        if idlen <= len(p) - 6:
+                            p = p[6:6 + idlen]
+                    inst_pid = p.hex()
                 d107 = _direct_child(d007.children, 'D107')
                 if d107:
                     inst_mat_id = parse_var_int(
@@ -1405,9 +2544,12 @@ def _extract_geometry_nodes(elements, builder):
                     inst_hidden = bool(d307.payload[0] & 0x01)
 
             dynamic = inst_attribute_dicts.get('dynamic_attributes', {})
+            inst_id = _entity_id(el)
             _detach_tlv_payloads(el.children)
             builder.instances.append({
+                'persistent_id': inst_pid,
                 'offset': el.offset,
+                'id': inst_id,
                 'ref_guid': guid,
                 'ref_idx': def_idx,
                 'name': name,
@@ -1427,7 +2569,8 @@ def _extract_geometry_nodes(elements, builder):
             # VFF CConstructionLine (list 9113). Same 8-double body as
             # classic CConstructionLine: point + unit direction + start/end
             # params; |param| >= 1e20 is unbounded (SketchUp's own sentinel
-            # is ±1e30).
+            # is ±1e30). 6842 -> D007 holds D307 (display flags, +0x01 hidden)
+            # and D207 (layer entity id).
             body = _find_tag(el.children, '6A42')
             if body and len(body.payload) >= 64:
                 p = body.payload
@@ -1450,20 +2593,41 @@ def _extract_geometry_nodes(elements, builder):
                         point[1] + direction[1] * end_param,
                         point[2] + direction[2] * end_param,
                     )
+                flags_node = _find_tag(el.children, 'D307')
+                cl_hidden = bool(flags_node.payload[0] & 0x01) if flags_node and flags_node.payload else False
+                layer_node = _find_tag(el.children, 'D207')
+                cl_layer_id = (
+                    parse_var_int(layer_node.payload, 0, len(layer_node.payload))
+                    if layer_node and layer_node.payload
+                    else None
+                )
                 builder.construction_lines.append({
                     'point': point,
                     'direction': direction,
                     'start': start,
                     'end': end,
+                    'layer_id': cl_layer_id,
+                    'hidden': cl_hidden,
                 })
 
         elif tag == '6C42':
-            # VFF CConstructionPoint (list 9213): 6D42 position.
+            # VFF CConstructionPoint (list 9213): 6D42 position, 6842 -> D007
+            # drawing-element base (D307 hidden flag + D207 layer id).
             pos = _find_tag(el.children, '6D42')
             if pos and len(pos.payload) >= 24:
                 p = pos.payload
+                flags_node = _find_tag(el.children, 'D307')
+                cp_hidden = bool(flags_node.payload[0] & 0x01) if flags_node and flags_node.payload else False
+                layer_node = _find_tag(el.children, 'D207')
+                cp_layer_id = (
+                    parse_var_int(layer_node.payload, 0, len(layer_node.payload))
+                    if layer_node and layer_node.payload
+                    else None
+                )
                 builder.construction_points.append({
                     'position': (read_f64(p, 0), read_f64(p, 8), read_f64(p, 16)),
+                    'layer_id': cp_layer_id,
+                    'hidden': cp_hidden,
                 })
 
         elif tag == '2C4C':
@@ -1569,12 +2733,12 @@ _PROP_CONTAINER_TAGS = ['DD05', 'B536', 'B136', 'B236', 'B336', 'B036', 'A438', 
 # same way (real bytes, not guessed): AD38 string, AF38 Length, A938
 # plain double - SketchUp genuinely uses two different tags for the same
 # 8-byte float64 encoding depending on whether the value is a Length or a
-# plain Float - A738 int32, B438 Point3d, B538 Vector3d (each 3 x f64,
-# 24 bytes flat, no per-component tags). No native bool/time_t tag has
-# been observed in real data yet -
-# FrameBuilder itself stores booleans as the literal strings "true"/
-# "false" - so those two of legacy's 9 types are not yet decoded here;
-# left safely unrecognized (see _decode_vff_attr_value) rather than
+# plain Float - A738 int32, AA38 bool (one byte), AC38 time_t (u32 unix
+# seconds), B438 Point3d, B538 Vector3d (each 3 x f64, 24 bytes flat, no
+# per-component tags).  The bool and time tags are confirmed against a
+# genuine SketchUp 2025 Ruby-saved file with true/false/Time values; they
+# are the VFF counterparts of legacy's 0x07 and 0x09 types.  Everything
+# else is still left unrecognized (see _decode_vff_attr_value) rather than
 # guessed at.
 _VFF_ATTR_DOUBLE_TAGS = ('AF38', 'A938')
 
@@ -1594,10 +2758,16 @@ def _decode_vff_attr_value(a438_node):
     payload = child['payload']
     if tag == 'AD38':
         return payload.decode('utf-8', errors='replace')
+    if tag == 'AA38' and len(payload) == 1:
+        return payload[0] != 0
     if tag in _VFF_ATTR_DOUBLE_TAGS and len(payload) == 8:
         return struct.unpack('<d', payload)[0]
     if tag == 'A738' and len(payload) == 4:
         return struct.unpack('<i', payload)[0]
+    if tag == 'AC38' and len(payload) == 4:
+        # time_t: the same unsigned 32-bit integer the classic reader
+        # returns for legacy attribute type 0x09.
+        return struct.unpack('<I', payload)[0]
     if tag in ('B438', 'B538') and len(payload) == 24:
         return struct.unpack('<3d', payload)
     if tag == 'AE38':
@@ -1654,9 +2824,13 @@ def extract_attribute_dictionaries(d007):
 def _stringify_vff_attr_value(value):
     """Render an already-typed VFF attribute value as a string, matching
     extract_dynamic_properties' pre-existing Dict[str, str] contract -
-    mirrors legacy._stringify_attr_value exactly."""
+    mirrors legacy._stringify_attr_value exactly.  Bools render as "1"/"0"
+    because the classic reader decodes its equivalent bool tag as an int
+    (0x07 -> u8), so the two containers keep the same string form."""
     if value is None:
         return ''
+    if isinstance(value, bool):
+        return '1' if value else '0'
     if isinstance(value, (list, tuple)):
         return ','.join(_stringify_vff_attr_value(v) for v in value)
     return str(value)
@@ -1904,127 +3078,17 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
         raise SkpParseError(
             "No ZIP container found", stage="zip_extract")
 
-    # ZipFile accounts for a prepended SKP header when locating entries.
-    # Reading the file directly avoids retaining a second, file-sized ZIP
-    # buffer throughout parsing. Close it on malformed members as well.
-    with zipfile.ZipFile(skp_path, 'r') as zf:
-        logger.debug("Opened ZIP container: %d entries", len(zf.namelist()))
-
-        # Materials & layer colors
-        layer_colors = {}
-        # Modern (VFF) files derive layer COLOR from Layer_<name>-prefixed
-        # materials, which carry no visibility flag of their own - real
-        # visibility comes from the model.dat layer manager's own 8E3C byte,
-        # read in collect_layers() below. Seeded to False (visible) here so a
-        # layer that never went through collect_layers (e.g. a layer with no
-        # painted material at all) still gets a sane default.
-        layer_hidden = {}
-        materials = {}
-        materials_by_folder = {}
-        MAT_NS = {'mat': 'http://sketchup.google.com/schemas/sketchup/1.0/material'}
-        for name in zf.namelist():
-            if name.endswith('material.xml') and name.startswith('materials/'):
-                _validate_zip_entry_size(zf, name)
-                xml_data = zf.read(name)
-                try:
-                    root = ET.fromstring(xml_data)
-                    mat_elem = root.find('.//mat:material', MAT_NS)
-                    if mat_elem is not None:
-                        mat_name = mat_elem.get('name', 'unknown')
-                        r = int(mat_elem.get('colorRed', 128))
-                        g = int(mat_elem.get('colorGreen', 128))
-                        b = int(mat_elem.get('colorBlue', 128))
-                        # 'trans' only applies when useTrans="1"; otherwise the
-                        # attribute is a leftover default and the material is
-                        # fully opaque. Without this check most materials read
-                        # as 50% transparent (or fully invisible for trans="0").
-                        # The stored value is a TRANSPARENCY (0 = opaque,
-                        # 1 = fully transparent) — e.g. SketchUp's library
-                        # "Translucent Glass Blue" (70% opacity) stores
-                        # trans="0.3" — so the exposed opacity is 1 - trans.
-                        if mat_elem.get('useTrans') == '1':
-                            trans = 1.0 - float(mat_elem.get('trans', 0.0))
-                            trans = min(max(trans, 0.0), 1.0)
-                        else:
-                            trans = 1.0
-                        folder_name = name.split('/')[1] if len(name.split('/')) > 1 else ''
-                        # type="2" marks a colourized copy ("[Name]1"): the
-                        # shared texture must be re-tinted toward the material
-                        # colour before display. colorizeType 0 = hue shift,
-                        # 1 = tint (greyscale then colour).
-                        colorized = mat_elem.get('type') == '2'
-                        try:
-                            colorize_type = int(mat_elem.get('colorizeType', 0) or 0)
-                        except ValueError:
-                            colorize_type = 0
-                        mat_obj = {'name': mat_name, 'color': {'r': r, 'g': g, 'b': b}, 'transparency': trans,
-                                   'colorized': colorized, 'colorize_type': colorize_type}
-                        tex = _extract_texture(zf, name, mat_elem, MAT_NS)
-                        if tex is not None:
-                            mat_obj['texture'] = tex
-                        materials[mat_name] = mat_obj
-                        if folder_name:
-                            materials_by_folder[folder_name] = mat_obj
-                        if mat_name.startswith('Layer_'):
-                            layer_colors[mat_name[6:]] = (r, g, b)
-                            layer_hidden[mat_name[6:]] = False
-                except Exception:
-                    logger.debug("Failed to parse material.xml %r", name, exc_info=True)
-
-        # Thumbnail
-        thumbnail_data = None
-        if 'meta/model_thumbnail.png' in zf.namelist():
-            _validate_zip_entry_size(zf, 'meta/model_thumbnail.png')
-            thumbnail_data = zf.read('meta/model_thumbnail.png')
-
-        # Units (meta/meta.dat) - VFF-only; legacy files carry no equivalent
-        # container.
-        units = None
-        if 'meta/meta.dat' in zf.namelist():
-            try:
-                _validate_zip_entry_size(zf, 'meta/meta.dat')
-                units = _read_meta_units(zf.read('meta/meta.dat'))
-            except Exception:
-                units = None
-                logger.debug("Failed to read units from meta/meta.dat", exc_info=True)
-
-        # Styles: face colors live in styles/*/style.xml as signed-int32 ABGR
-        # variants — item id 2002 is the front (default) face color, 2003 the
-        # back face color (the 4000-series items are background/sky/ground).
-        # Viewers need them to shade unpainted faces the way SketchUp does (an author may e.g. set a green back color so unpainted
-        # garden faces read as grass).
-        styles = []
-        for name in zf.namelist():
-            if not (name.startswith('styles/') and name.endswith('style.xml')):
-                continue
-            try:
-                _validate_zip_entry_size(zf, name)
-                sroot = ET.fromstring(zf.read(name))
-            except (ET.ParseError, DefusedXmlException):
-                continue
-            STY = '{http://sketchup.google.com/schemas/sketchup/1.0/style}'
-            TYP = '{http://sketchup.google.com/schemas/1.0/types}'
-            style_el = sroot.find(f'{STY}style')
-            if style_el is None:
-                continue
-            colors = {}
-            for item in style_el.findall(f'{STY}item'):
-                iid = item.get('id')
-                var = item.find(f'{TYP}variant')
-                if iid in ('2002', '2003') and var is not None and var.text:
-                    try:
-                        v = int(var.text) & 0xFFFFFFFF
-                    except ValueError:
-                        continue
-                    colors[iid] = (v & 255, (v >> 8) & 255, (v >> 16) & 255)
-            styles.append({'name': style_el.get('name', ''),
-                           'front_color': colors.get('2002'),
-                           'back_color': colors.get('2003')})
-
-        logger.debug("Parsed %d materials, %d styles", len(materials), len(styles))
-
-        _validate_zip_entry_size(zf, 'model.dat')
-        model_dat = zf.read('model.dat')
+    try:
+        (layer_colors, layer_hidden, materials, materials_by_folder,
+         raw_material_entries, thumbnail_data, units, styles,
+         model_dat) = _read_vff_zip(skp_path)
+    except (SkpParseError, FileNotFoundError, PermissionError, IsADirectoryError,
+            RecursionError, MemoryError):
+        raise
+    except Exception as e:
+        raise SkpParseError(
+            f"Invalid or damaged ZIP container: {e}", stage="zip_extract"
+        ) from e
     logger.debug("Read model.dat: %d bytes", len(model_dat))
 
     compact_geometry = len(model_dat) >= _COMPACT_MODEL_BYTES
@@ -2044,7 +3108,6 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
     root_builder = _GeometryBuilder()
     model_attribute_dicts = {}
     vertex_positions = {}
-    instance_world = {}
     page_node = None
 
     def entity_key(payload):
@@ -2055,19 +3118,15 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
             return parse_var_int(payload, 6, de05_len)
         return parse_var_int(payload, 0, len(payload))
 
-    def walk(nodes, parent):
+    def walk(nodes):
         """One pre-order pass over a top-level record's subtree, doing the
-        work that used to take six separate full traversals: layers
-        (993A), materials (C832), component definitions (7C15), vertex
-        positions (C409), instance world transforms (6419, carrying the
-        composed ``parent`` matrix) and the first scenes node (0702).
-        Each output is independent of the others, so folding the passes
-        together changes no result - only how often the tree is walked."""
+        work that used to take separate full traversals: layers (993A),
+        materials (C832), component definitions (7C15), vertex positions
+        (C409), and the first scenes node (0702)."""
         nonlocal page_node
         for el in nodes:
             tag = el.tag
             children = () if isinstance(el, _GeometryRecordNode) else el.children
-            here = parent
 
             if tag == '993A':
                 # Layer ID -> name
@@ -2111,7 +3170,7 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
                 for child in children:
                     ctag = child.tag
                     if ctag == '7D15' and len(child.payload) == 16:
-                        guid = child.payload.hex().upper()
+                        guid = guid_from_windows_bytes(child.payload)
                     elif ctag == '7E15':
                         name = child.payload.decode('utf-8', errors='replace')
                     elif ctag == '581B':
@@ -2173,40 +3232,22 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
                             idb = p
                         vertex_positions[idb.hex()] = struct.unpack('<3d', c509.payload)
 
-            elif tag == '6419':
-                # Instance persistent id (hex) -> WORLD transform (13-float
-                # matrix), composing parent x local at every 6419. A
-                # dimension's connection point is definition-local, so
-                # _parse_dimensions lifts it to world with this. An instance
-                # chain never crosses top-level records.
-                d007 = _find_tag(children, 'D007')
-                dc05 = _find_tag(d007.children, 'DC05') if d007 else None
-                iid = None
-                if dc05:
-                    p = dc05.payload
-                    idb = p[6:6 + read_u32(p, 2)] if p[:2] == b'\xde\x05' else p
-                    iid = idb.hex()
-                m = _find_tag(children, '6619')
-                mat = list(struct.unpack('<13d', m.payload)) \
-                    if m and len(m.payload) == 104 else None
-                here = multiply_matrices(parent, mat) if mat else parent
-                if iid:
-                    instance_world[iid] = here
-
             elif tag == '0702':
                 if page_node is None:
                     page_node = el
 
             if children:
-                walk(children, here)
+                walk(children)
 
     for index, total, el in iter_top_level_lazy(
             model_dat, 0, len(model_dat), CONTAINER_TAGS, _geometry=True):
         try:
-            walk([el], None)
+            walk([el])
             if el.tag == 'F601':
                 _extract_geometry_nodes(el.children, root_builder)
                 model_attribute_dicts = entity_attribute_dictionaries(el.children)
+        except (SkpParseError, RecursionError, MemoryError):
+            raise
         except Exception as e:
             raise SkpParseError(
                 f"Failed while processing top-level record: {e}",
@@ -2224,6 +3265,18 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
         skp_path, len(defs_dict), time.monotonic() - t0,
     )
 
+    real_material_folders = set(material_id_to_name.values())
+    for folder_name, mat_obj, rgb in raw_material_entries:
+        mat_name = mat_obj['name']
+        if mat_name.startswith('Layer_') and folder_name not in real_material_folders:
+            tag_name = mat_name[6:]
+            layer_colors[tag_name] = rgb
+            layer_hidden.setdefault(tag_name, False)
+        else:
+            materials[mat_name] = mat_obj
+            if folder_name:
+                materials_by_folder[folder_name] = mat_obj
+
     if 1 not in layer_id_to_name:
         layer_id_to_name[1] = 'Layer0'
     if 'Layer0' not in layer_colors:
@@ -2231,10 +3284,34 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
     if 'Layer0' not in layer_hidden:
         layer_hidden['Layer0'] = False
 
+    dimensions = []
+    try:
+        _assign_vff_annotations(model_dat, vertex_positions, root_builder, defs_dict, dimensions)
+    except (RecursionError, MemoryError):
+        raise
+    except Exception:
+        logger.debug("Failed to parse annotations", exc_info=True)
+        dimensions = []
+
     if compact_geometry:
         root_builder._compact_geometry()
     defs_dict['ROOT'] = {'guid': 'ROOT', 'name': 'ROOT_MODEL', 'builder': root_builder,
                          'attribute_dictionaries': model_attribute_dicts}
+
+    try:
+        pages = _parse_pages(page_node)
+    except (RecursionError, MemoryError):
+        raise
+    except Exception:
+        logger.debug("Failed to parse pages", exc_info=True)
+        pages = []
+    try:
+        face_colors = _model_face_colors(model_dat)
+    except (RecursionError, MemoryError):
+        raise
+    except Exception:
+        logger.debug("Failed to parse model face colours", exc_info=True)
+        face_colors = None
 
     return {
         'model_attribute_dictionaries': model_attribute_dicts,
@@ -2242,15 +3319,138 @@ def full_parse(skp_path: str) -> Dict[str, Any]:
         'layer_colors': layer_colors,
         'layer_hidden': layer_hidden,
         'layer_id_to_name': layer_id_to_name,
-        'pages': _parse_pages(page_node),
-        'dimensions': _parse_dimensions(
-            model_dat, vertex_positions, instance_world),
+        'pages': pages,
+        'dimensions': dimensions,
         'material_id_to_name': material_id_to_name,
         'materials': materials,
         'materials_by_folder': materials_by_folder,
         'defs_dict': defs_dict,
         'thumbnail_data': thumbnail_data,
         'styles': styles,
+        'face_colors': face_colors,
+        'unread_root_entities': 0,
         'units': units,
     }
 
+
+def _read_vff_zip(skp_path: str):
+    """Extract materials, styles, thumbnail, units, and model.dat from a VFF ZIP."""
+    # ZipFile accounts for a prepended SKP header when locating entries.
+    # Reading the file directly avoids retaining a second, file-sized ZIP
+    # buffer throughout parsing. Close it on malformed members as well.
+    with zipfile.ZipFile(skp_path, 'r') as zf:
+        logger.debug("Opened ZIP container: %d entries", len(zf.namelist()))
+
+        # Materials & layer colors
+        layer_colors = {}
+        # Modern (VFF) files derive layer COLOR from Layer_<name>-prefixed
+        # materials, which carry no visibility flag of their own - real
+        # visibility comes from the model.dat layer manager's own 8E3C byte,
+        # read in collect_layers() below. Seeded to False (visible) here so a
+        # layer that never went through collect_layers (e.g. a layer with no
+        # painted material at all) still gets a sane default.
+        layer_hidden = {}
+        materials = {}
+        materials_by_folder = {}
+        raw_material_entries = []
+        MAT_NS = {'mat': 'http://sketchup.google.com/schemas/sketchup/1.0/material'}
+        for name in zf.namelist():
+            if name.endswith('material.xml') and name.startswith('materials/'):
+                _validate_zip_entry_size(zf, name)
+                xml_data = zf.read(name)
+                try:
+                    root = ET.fromstring(xml_data)
+                    mat_elem = root.find('.//mat:material', MAT_NS)
+                    if mat_elem is not None:
+                        mat_name = mat_elem.get('name', 'unknown')
+                        r = int(mat_elem.get('colorRed', 128))
+                        g = int(mat_elem.get('colorGreen', 128))
+                        b = int(mat_elem.get('colorBlue', 128))
+                        # 'trans' only applies when useTrans="1"; otherwise the
+                        # attribute is a leftover default and the material is
+                        # fully opaque. Without this check most materials read
+                        # as 50% transparent (or fully invisible for trans="0").
+                        # The stored value is a TRANSPARENCY (0 = opaque,
+                        # 1 = fully transparent) — e.g. SketchUp's library
+                        # "Translucent Glass Blue" (70% opacity) stores
+                        # trans="0.3" — so the exposed opacity is 1 - trans.
+                        if mat_elem.get('useTrans') == '1':
+                            trans = 1.0 - float(mat_elem.get('trans', 0.0))
+                            trans = min(max(trans, 0.0), 1.0)
+                        else:
+                            trans = 1.0
+                        folder_name = name.split('/')[1] if len(name.split('/')) > 1 else ''
+                        # type="2" marks a colourized copy ("[Name]1"): the
+                        # shared texture must be re-tinted toward the material
+                        # colour before display. colorizeType 0 = hue shift,
+                        # 1 = tint (greyscale then colour).
+                        colorized = mat_elem.get('type') == '2'
+                        try:
+                            colorize_type = int(mat_elem.get('colorizeType', 0) or 0)
+                        except ValueError:
+                            colorize_type = 0
+                        mat_obj = {'name': mat_name, 'color': {'r': r, 'g': g, 'b': b}, 'transparency': trans,
+                                   'colorized': colorized, 'colorize_type': colorize_type}
+                        tex = _extract_texture(zf, name, mat_elem, MAT_NS)
+                        if tex is not None:
+                            mat_obj['texture'] = tex
+                        raw_material_entries.append((folder_name, mat_obj, (r, g, b)))
+                except Exception:
+                    logger.debug("Failed to parse material.xml %r", name, exc_info=True)
+
+        # Thumbnail
+        thumbnail_data = None
+        if 'meta/model_thumbnail.png' in zf.namelist():
+            _validate_zip_entry_size(zf, 'meta/model_thumbnail.png')
+            thumbnail_data = zf.read('meta/model_thumbnail.png')
+
+        # Units (meta/meta.dat) - VFF-only; legacy files carry no equivalent
+        # container.
+        units = None
+        if 'meta/meta.dat' in zf.namelist():
+            try:
+                _validate_zip_entry_size(zf, 'meta/meta.dat')
+                units = _read_meta_units(zf.read('meta/meta.dat'))
+            except Exception:
+                units = None
+                logger.debug("Failed to read units from meta/meta.dat", exc_info=True)
+
+        # Styles: face colors live in styles/*/style.xml as signed-int32 ABGR
+        # variants — item id 2002 is the front (default) face color, 2003 the
+        # back face color (the 4000-series items are background/sky/ground).
+        # Viewers need them to shade unpainted faces the way SketchUp does (an author may e.g. set a green back color so unpainted
+        # garden faces read as grass).
+        styles = []
+        for name in zf.namelist():
+            if not (name.startswith('styles/') and name.endswith('style.xml')):
+                continue
+            try:
+                _validate_zip_entry_size(zf, name)
+                sroot = ET.fromstring(zf.read(name))
+            except (ET.ParseError, DefusedXmlException):
+                continue
+            STY = '{http://sketchup.google.com/schemas/sketchup/1.0/style}'
+            TYP = '{http://sketchup.google.com/schemas/1.0/types}'
+            style_el = sroot.find(f'{STY}style')
+            if style_el is None:
+                continue
+            colors = {}
+            for item in style_el.findall(f'{STY}item'):
+                iid = item.get('id')
+                var = item.find(f'{TYP}variant')
+                if iid in ('2002', '2003') and var is not None and var.text:
+                    try:
+                        v = int(var.text) & 0xFFFFFFFF
+                    except ValueError:
+                        continue
+                    colors[iid] = (v & 255, (v >> 8) & 255, (v >> 16) & 255)
+            styles.append({'name': style_el.get('name', ''),
+                           'front_color': colors.get('2002'),
+                           'back_color': colors.get('2003')})
+
+        logger.debug("Parsed %d materials, %d styles", len(materials), len(styles))
+
+        _validate_zip_entry_size(zf, 'model.dat')
+        model_dat = zf.read('model.dat')
+    return (layer_colors, layer_hidden, materials, materials_by_folder,
+            raw_material_entries, thumbnail_data, units, styles, model_dat)

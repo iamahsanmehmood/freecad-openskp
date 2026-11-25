@@ -25,8 +25,34 @@ import pathlib
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
+from .errors import SkpParseError
+
 if TYPE_CHECKING:
     from . import instanced_scene, scene
+
+
+def _convert_pages(parsed: Dict[str, Any]) -> List["Page"]:
+    """Convert raw parsed scene records into :class:`Page` objects."""
+    layer_id_to_name = parsed.get("layer_id_to_name", {})
+    return [
+        Page(
+            name=pg.get("name", ""),
+            eye=pg.get("eye"),
+            target=pg.get("target"),
+            up=pg.get("up"),
+            fov=pg.get("fov", 35.0),
+            parallel=pg.get("parallel", False),
+            ortho_height=pg.get("ortho_height", 0.0),
+            hidden_layers=[
+                layer_id_to_name[i]
+                for i in pg.get("hidden_layer_ids", [])
+                if i in layer_id_to_name
+            ],
+            hidden_entity_ids=list(pg.get("hidden_entity_ids", [])),
+            capture_flags=pg.get("capture_flags"),
+        )
+        for pg in (parsed.get("pages") or [])
+    ]
 
 
 # ── TLV node (raw parse tree) ─────────────────────────────────────────────
@@ -109,6 +135,7 @@ class Edge:
     hidden: bool = False
     layer: Optional[int] = None
     curve_id: Optional[int] = None
+    persistent_id: int = 0
 
 
 @dataclass
@@ -172,6 +199,7 @@ class Face:
     uv_projected_back: bool = False
     hidden: bool = False
     layer: Optional[int] = None
+    persistent_id: int = 0
 
 
 # ── Layers & Materials ────────────────────────────────────────────────────
@@ -372,6 +400,7 @@ class Instance:
     attribute_dictionaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     material_id: Optional[int] = None
     hidden: bool = False
+    id: Optional[int] = None
 
 
 @dataclass
@@ -384,46 +413,60 @@ class SectionPlane:
 
 @dataclass
 class TextEntity:
-    """A leader-text label (SketchUp's Text tool).
+    """A leader-text or screen-text label (SketchUp's Text tool).
 
     Attributes:
         text: The displayed string.
         hidden: Whether the label is hidden.
-        point: Anchor point ``(x, y, z)`` in inches (world space for
-            model-root texts), or ``None`` when the record anchors to
-            geometry instead of a free point (not resolved yet).
-        label_point: Where the label text floats (the leader line joins
-            it to ``point``), or ``None`` for screen texts / unknown.
+        point: Anchor point ``(x, y, z)`` in owner-local inches (world space
+            for model-root texts), or ``None`` when unresolved.
+        label_point: Where the label text floats in owner-local inches, or
+            ``None`` when unresolved.
+        layer: Explicit tag name, or ``""`` for the default tag (Layer0).
+        screen_position: Normalized screen fractions ``(x, y)`` (used when
+            ``leader_type == 0``), or ``None``.
+        leader_type: SketchUp leader type (``0`` screen, ``1`` view, ``2`` pushpin).
+        arrow_type: Leader arrow type (``0``..``4``, default ``3``).
+        display_leader: Independent leader visibility switch.
     """
 
     text: str = ""
     hidden: bool = False
     point: Optional[Tuple[float, float, float]] = None
     label_point: Optional[Tuple[float, float, float]] = None
+    layer: str = ""
+    screen_position: Optional[Tuple[float, float]] = None
+    leader_type: int = 2
+    arrow_type: int = 3
+    display_leader: bool = True
 
 
 @dataclass
 class Dimension:
     """A linear dimension (SketchUp's Dimension tool).
 
-    The legacy (pre-2021) reader recovers only ``text``/``hidden``. The VFF
-    reader (2021+) recovers the full geometry — see :attr:`SkpModel.dimensions`
-    for the model-level, world-space list.
+    Both VFF (2021+) and legacy (pre-2021) readers expose owner-local geometry
+    and drawing properties on ``root.dimensions`` and ``Definition.dimensions``;
+    :attr:`SkpModel.dimensions` also retains the world-space VFF compatibility list.
 
     Attributes:
         text: The displayed text. Empty when the dimension shows its
             auto-computed measured value (the caller formats ``|b − a|``).
         hidden: Whether the dimension is hidden.
-        a: First measured point ``(x, y, z)`` in inches (world space), or
-            ``None`` when only the text was recovered.
+        a: First measured point ``(x, y, z)`` in inches, or ``None`` when
+            unresolved.
         b: Second measured point.
         offset: Offset distance (inches) — how far the dimension line sits
             from the ``a``–``b`` segment, along the in-plane perpendicular.
         plane_x: Historical name: for a VFF dimension this is tag ``5BCF``, which
             is the plane NORMAL (SketchUp's ``SUDimensionLinearGetNormal``
-            equals it), or ``None``.
+            equals it); for a legacy dimension this is the plane's X axis, or ``None``.
         normal: Historical name: for a VFF dimension this is tag ``5BD0``, the
-            plane's X axis, or ``None``.
+            plane's X axis; for a legacy dimension this is the plane normal, or ``None``.
+        offset_vector: Explicit offset vector (inches) for legacy or VFF dimensions
+            constrained to a plane axis, preserving the side of the line
+            independently of endpoint ordering, or ``None``.
+        layer: Explicit tag name, or ``""`` for the default tag (Layer0).
     """
 
     text: str = ""
@@ -433,6 +476,8 @@ class Dimension:
     offset: float = 0.0
     plane_x: Optional[Tuple[float, float, float]] = None
     normal: Optional[Tuple[float, float, float]] = None
+    offset_vector: Optional[Tuple[float, float, float]] = None
+    layer: str = ""
 
 
 @dataclass
@@ -449,6 +494,17 @@ class Page:
             projection; ``fov`` still holds the stored perspective angle.
         ortho_height: Visible height in inches when ``parallel``.
         hidden_layers: Names of the layers this scene hides.
+        hidden_entity_ids: Persistent ids of the entities this scene hides
+            (see ``Instance.id``, ``Edge.persistent_id`` and
+            ``Face.persistent_id``).
+        capture_flags: Which properties the scene saves (the boxes ticked
+            under "Properties to save" in SketchUp's Scenes panel), as the
+            u32 the file stores, or ``None`` when the reader found none
+            (or, in the classic fallback scan, a word with bits above
+            ``0x1FF``, which are not these flags).
+            The ``use_*`` properties below read its bits. It tells an empty
+            ``hidden_entity_ids`` that means "this scene hides nothing" from
+            one that means "this scene leaves hidden objects alone".
     """
 
     name: str = ""
@@ -459,6 +515,87 @@ class Page:
     parallel: bool = False
     ortho_height: float = 0.0
     hidden_layers: List[str] = field(default_factory=list)
+    hidden_entity_ids: List[int] = field(default_factory=list)
+    capture_flags: Optional[int] = None
+
+    def _flag(self, bit: int) -> Optional[bool]:
+        if self.capture_flags is None:
+            return None
+        return bool(self.capture_flags & bit)
+
+    @property
+    def use_camera(self) -> Optional[bool]:
+        """The scene saves its camera ("Camera Location"), ``0x001``."""
+        return self._flag(PAGE_USE_CAMERA)
+
+    @property
+    def use_rendering_options(self) -> Optional[bool]:
+        """The scene saves its style ("Style and Fog"), ``0x002``."""
+        return self._flag(PAGE_USE_RENDERING_OPTIONS)
+
+    @property
+    def use_shadow_info(self) -> Optional[bool]:
+        """The scene saves its shadows ("Shadow Settings"), ``0x004``."""
+        return self._flag(PAGE_USE_SHADOW_INFO)
+
+    @property
+    def use_axes(self) -> Optional[bool]:
+        """The scene saves the axes ("Axes Location"), ``0x008``."""
+        return self._flag(PAGE_USE_AXES)
+
+    @property
+    def use_hidden_layers(self) -> Optional[bool]:
+        """The scene saves which layers it hides ("Visible Tags"),
+        ``0x020``."""
+        return self._flag(PAGE_USE_HIDDEN_LAYERS)
+
+    @property
+    def use_section_planes(self) -> Optional[bool]:
+        """The scene saves the active section ("Active Section Planes"),
+        ``0x040``."""
+        return self._flag(PAGE_USE_SECTION_PLANES)
+
+    def _hidden(self, bit: int) -> Optional[bool]:
+        # Since SketchUp 2020.1 a scene saves hidden geometry and hidden
+        # objects separately (0x080, 0x100). A file with neither bit has
+        # only the older combined one (0x010), which then covers both.
+        flags = self.capture_flags
+        if flags is None:
+            return None
+        if flags & (PAGE_USE_HIDDEN_GEOMETRY | PAGE_USE_HIDDEN_OBJECTS):
+            return bool(flags & bit)
+        return bool(flags & PAGE_USE_HIDDEN)
+
+    @property
+    def use_hidden_geometry(self) -> Optional[bool]:
+        """The scene saves which edges and faces it hides ("Hidden
+        Geometry"), ``0x080``."""
+        return self._hidden(PAGE_USE_HIDDEN_GEOMETRY)
+
+    @property
+    def use_hidden_objects(self) -> Optional[bool]:
+        """The scene saves which groups and components it hides ("Hidden
+        Objects"), ``0x100``. When ``True``, an empty
+        ``hidden_entity_ids`` means every object is shown."""
+        return self._hidden(PAGE_USE_HIDDEN_OBJECTS)
+
+
+# Bits of ``Page.capture_flags``, named after SketchUp's public Ruby API
+# (``Sketchup::Page#use_camera?`` and so on). Checked on the fixtures in
+# tests/test_scene_capture_flags.py and one flag at a time on a model
+# written with SketchUp's library (#660, #661): hidden geometry alone is
+# 0x090, hidden objects alone 0x110, the older combined 0x010 set with
+# either. Over 592 files (#660), every value is known and agrees with the
+# camera.
+PAGE_USE_CAMERA = 0x001
+PAGE_USE_RENDERING_OPTIONS = 0x002
+PAGE_USE_SHADOW_INFO = 0x004
+PAGE_USE_AXES = 0x008
+PAGE_USE_HIDDEN = 0x010          # before SketchUp 2020.1: geometry + objects
+PAGE_USE_HIDDEN_LAYERS = 0x020
+PAGE_USE_SECTION_PLANES = 0x040
+PAGE_USE_HIDDEN_GEOMETRY = 0x080
+PAGE_USE_HIDDEN_OBJECTS = 0x100
 
 
 @dataclass
@@ -488,6 +625,8 @@ class ConstructionLine:
     direction: Tuple[float, float, float] = (1.0, 0.0, 0.0)
     start: Optional[Tuple[float, float, float]] = None
     end: Optional[Tuple[float, float, float]] = None
+    layer: str = ""
+    hidden: bool = False
 
 
 @dataclass
@@ -540,9 +679,14 @@ class ConstructionPoint:
 
     Attributes:
         position: The point's position, in inches (world space).
+        layer: Name of the layer (tag) the guide is assigned to, or ``""``
+            for the default layer (Layer0).
+        hidden: Whether the guide itself is hidden.
     """
 
     position: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    layer: str = ""
+    hidden: bool = False
 
 
 @dataclass
@@ -687,6 +831,14 @@ class SkpModel:
             the join table for :attr:`Face.material_id`.  Several IDs may
             alias the same :class:`Material` object.
         styles: List of :class:`Style` objects found in the file.
+        face_front_color: The colour SketchUp shows on the front side of
+            a face with no paint on that side, ``(r, g, b)`` 0-255: the
+            model's current rendering options, which is what SketchUp
+            displays even when the style was changed and not saved (so it
+            can differ from every entry in :attr:`styles`). Read from 2021+
+            files and from classic files of SketchUp 4 to 2020; ``None``
+            when the file does not give it (SketchUp 3).
+        face_back_color: The same for the back side of a face.
         attribute_dictionaries: The model entity's own attribute
             dictionaries (2021+ files; not read from classic files yet). A
             component saved as its own file keeps its Dynamic Components
@@ -695,6 +847,13 @@ class SkpModel:
             read from ``meta/meta.dat`` in modern (VFF) files.  ``None``
             for legacy (pre-2021 MFC) files, which carry no equivalent
             container, or when the tag isn't found.
+        unread_root_entities: How many top-level entities of a classic
+            (pre-2021) file the reader couldn't read. It keeps what it
+            read before the first root record it can't parse and drops
+            that record and everything after it, so a nonzero count means
+            the model lost geometry, components, groups, text or
+            dimensions. Phantom entries the root count includes but the
+            file never writes are not counted. Always ``0`` for VFF files.
 
     Note:
         The resolved, world-space scene graph (with baked instance
@@ -713,7 +872,10 @@ class SkpModel:
     materials: List[Material] = field(default_factory=list)
     materials_by_id: Dict[int, Material] = field(default_factory=dict)
     styles: List[Style] = field(default_factory=list)
+    face_front_color: Optional[Tuple[int, int, int]] = None
+    face_back_color: Optional[Tuple[int, int, int]] = None
     units: Optional[str] = None
+    unread_root_entities: int = 0
     attribute_dictionaries: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
@@ -819,9 +981,25 @@ class SkpFile:
         model = SkpModel()
         model.version = parsed.get("version", "unknown")
         model.units = parsed.get("units")
+        model.unread_root_entities = parsed.get("unread_root_entities", 0)
         model.attribute_dictionaries = parsed.get("model_attribute_dictionaries") or {}
 
         layer_id_to_name = parsed.get("layer_id_to_name", {})
+
+        def _resolve_annotation_layer(raw_layer: Any, raw_layer_id: Any = None) -> str:
+            if raw_layer_id is not None and raw_layer_id != 0:
+                return layer_id_to_name.get(raw_layer_id, str(raw_layer_id))
+            if not raw_layer:
+                return ""
+            if isinstance(raw_layer, int):
+                return layer_id_to_name.get(raw_layer, str(raw_layer)) if raw_layer != 0 else ""
+            try:
+                lid = int(raw_layer)
+            except (ValueError, TypeError):
+                return str(raw_layer)
+            if lid == 0:
+                return ""
+            return layer_id_to_name.get(lid, str(raw_layer))
 
         # Convert defs_dict to Definition dataclasses
         for def_id, d in parsed["defs_dict"].items():
@@ -838,7 +1016,8 @@ class SkpFile:
             )
             # Completed VFF builders can retain dense private tables. Iterate
             # those directly; their public accessors still return cached dicts.
-            if isinstance(builder, _core._GeometryBuilder):
+            is_vff = isinstance(builder, _core._GeometryBuilder)
+            if is_vff:
                 vertices, edges, faces = builder._geometry_tables()
             else:
                 vertices, edges, faces = builder.vertices, builder.edges, builder.faces
@@ -849,6 +1028,7 @@ class SkpFile:
             flags_map = getattr(builder, "edge_flags", {})
             edge_layers_map = getattr(builder, "edge_layers", None) or {}
             edge_curves_map = getattr(builder, "edge_curves", None) or {}
+            edge_pids_map = getattr(builder, "edge_pids", None) or {}
             for e_id, (v1, v2) in edges.items():
                 flags = flags_map.get(e_id, 0)
                 defn.edges[e_id] = Edge(id=e_id, v1_id=v1 or 0, v2_id=v2 or 0,
@@ -856,7 +1036,8 @@ class SkpFile:
                                         smooth=bool(flags & 0x10),
                                         hidden=bool(flags & 0x01),
                                         layer=edge_layers_map.get(e_id),
-                                        curve_id=edge_curves_map.get(e_id))
+                                        curve_id=edge_curves_map.get(e_id),
+                                        persistent_id=e_id if is_vff else edge_pids_map.get(e_id, 0))
             # Populate faces
             for f_id, f_data in faces.items():
                 defn.faces[f_id] = Face(
@@ -871,6 +1052,7 @@ class SkpFile:
                     uv_projected=f_data.get("uv_projected", False),
                     uv_projected_back=f_data.get("uv_projected_back", False),
                     hidden=f_data.get("hidden", False),
+                    persistent_id=f_id if is_vff else f_data.get("persistent_id", 0),
                 )
             # Populate instances
             for inst in builder.instances:
@@ -885,6 +1067,7 @@ class SkpFile:
                     layer=layer_id_to_name.get(layer_id, "") if layer_id is not None else "",
                     properties=inst.get("properties", {}),
                     attribute_dictionaries=inst.get("attribute_dictionaries", {}),
+                    id=inst.get("id"),
                 ))
             # Populate section planes
             for sp in getattr(builder, "section_planes", []):
@@ -898,23 +1081,44 @@ class SkpFile:
             for txt in getattr(builder, "texts", []):
                 defn.texts.append(TextEntity(
                     text=txt.get("text", ""),
-                    hidden=txt.get("hidden", False),
-                    point=tuple(txt["p"]) if txt.get("p") else None,
-                    label_point=tuple(txt["lp"]) if txt.get("lp") else None,
+                    hidden=bool(txt.get("hidden", False)),
+                    layer=_resolve_annotation_layer(txt.get("layer"), txt.get("layer_id")),
+                    point=tuple(txt["p"]) if txt.get("p") is not None else None,
+                    label_point=tuple(txt["lp"]) if txt.get("lp") is not None else None,
+                    screen_position=(
+                        tuple(txt["screen_position"])
+                        if txt.get("screen_position") is not None else None
+                    ),
+                    leader_type=txt.get("leader_type", 2),
+                    arrow_type=txt.get("arrow_type", 3),
+                    display_leader=txt.get("display_leader", True),
                 ))
             # Populate dimensions
             for dim in getattr(builder, "dimensions", []):
                 defn.dimensions.append(Dimension(
                     text=dim.get("text", ""),
-                    hidden=dim.get("hidden", False),
+                    hidden=bool(dim.get("hidden", False)),
+                    a=tuple(dim["a"]) if dim.get("a") is not None else None,
+                    b=tuple(dim["b"]) if dim.get("b") is not None else None,
+                    offset=dim.get("offset", 0.0),
+                    plane_x=tuple(dim["plane_x"]) if dim.get("plane_x") is not None else None,
+                    normal=tuple(dim["normal"]) if dim.get("normal") is not None else None,
+                    offset_vector=(
+                        tuple(dim["offset_vector"])
+                        if dim.get("offset_vector") is not None else None
+                    ),
+                    layer=_resolve_annotation_layer(dim.get("layer"), dim.get("layer_id")),
                 ))
             # Populate construction lines/points
             for cl in getattr(builder, "construction_lines", []):
+                cl_layer_id = cl.get("layer_id")
                 defn.construction_lines.append(ConstructionLine(
                     point=cl.get("point", (0.0, 0.0, 0.0)),
                     direction=cl.get("direction", (1.0, 0.0, 0.0)),
                     start=cl.get("start"),
                     end=cl.get("end"),
+                    layer=layer_id_to_name.get(cl_layer_id, "") if cl_layer_id is not None else "",
+                    hidden=cl.get("hidden", False),
                 ))
             for curve_id, frame in (getattr(builder, "arc_curves", None) or {}).items():
                 defn.arcs[curve_id] = ArcCurve(
@@ -922,8 +1126,11 @@ class SkpFile:
                     x_axis=tuple(frame["x_axis"]), y_axis=tuple(frame["y_axis"]),
                     start_angle=frame["start_angle"], end_angle=frame["end_angle"])
             for cp in getattr(builder, "construction_points", []):
+                cp_layer_id = cp.get("layer_id")
                 defn.construction_points.append(ConstructionPoint(
                     position=cp.get("position", (0.0, 0.0, 0.0)),
+                    layer=layer_id_to_name.get(cp_layer_id, "") if cp_layer_id is not None else "",
+                    hidden=cp.get("hidden", False),
                 ))
             if def_id == "ROOT":
                 model.root = defn
@@ -939,19 +1146,7 @@ class SkpFile:
 
         # Convert pages (saved scenes) — hidden layer ids resolve to names;
         # unknown ids (stale refs) are dropped.
-        for pg in parsed.get("pages") or []:
-            model.pages.append(Page(
-                name=pg.get("name", ""),
-                eye=pg.get("eye"),
-                target=pg.get("target"),
-                up=pg.get("up"),
-                fov=pg.get("fov", 35.0),
-                parallel=pg.get("parallel", False),
-                ortho_height=pg.get("ortho_height", 0.0),
-                hidden_layers=[layer_id_to_name[i]
-                               for i in pg.get("hidden_layer_ids", [])
-                               if i in layer_id_to_name],
-            ))
+        model.pages = _convert_pages(parsed)
 
         # Convert model-level linear dimensions (VFF; world space).
         for dm in parsed.get("dimensions") or []:
@@ -959,7 +1154,10 @@ class SkpFile:
                 a=tuple(dm["a"]), b=tuple(dm["b"]),
                 offset=dm.get("offset", 0.0),
                 plane_x=dm.get("plane_x"), normal=dm.get("normal"),
+                offset_vector=dm.get("offset_vector"),
                 text=dm.get("text", ""),
+                hidden=bool(dm.get("hidden", False)),
+                layer=_resolve_annotation_layer(dm.get("layer"), dm.get("layer_id")),
             ))
 
         # Convert materials
@@ -1008,6 +1206,10 @@ class SkpFile:
                 back_color=st.get("back_color"),
             ))
 
+        face_colors = parsed.get("face_colors")
+        if face_colors:
+            model.face_front_color, model.face_back_color = face_colors
+
         # Store raw parsed data for export use
         self._parsed = parsed
 
@@ -1018,6 +1220,7 @@ class SkpFile:
         name_override_keys: Sequence[str] = ("name", "label", "code"),
         include_curve_sets: bool = True,
         original_textures: bool = False,
+        unpainted_faces: str = "style",
     ) -> "scene.Scene":
         """Bake every instance actually placed in the model into
         world-space, triangulated mesh data - SketchUp's component/group
@@ -1057,6 +1260,17 @@ class SkpFile:
                 a consumer that assumes every texture is PNG or JPEG (a
                 glTF writer of its own) would break on the others. The
                 GLB exporters need no change: they decode through Pillow.
+            unpainted_faces: Colour of a face side with no paint on it or on
+                anything that contains it. ``"style"`` (the default) is what
+                SketchUp shows: the model's front face colour on the front
+                and its back face colour on the back
+                (:attr:`SkpModel.face_front_color` / ``face_back_color``).
+                Where the two differ, as they do in SketchUp's own styles,
+                such a face is emitted as two single-sided sets and the back
+                one is marked ``unpainted_back``. ``"tag"`` gives both sides
+                the colour of the face's tag, in one double-sided set, as
+                openskp did up to 1.6.0. A file whose face colours can't be
+                read (SketchUp 3) always uses the tag colour.
 
         Returns:
             A populated :class:`openskp.scene.Scene`.
@@ -1064,18 +1278,30 @@ class SkpFile:
         from . import _core
         from . import scene as _scene
 
+        if unpainted_faces not in ("style", "tag"):
+            raise ValueError(f'unpainted_faces must be "style" or "tag", not {unpainted_faces!r}')
         parsed = _core.full_parse(str(self.path))
-        return _scene.build_scene(
-            parsed,
-            name_override_keys=name_override_keys,
-            include_curve_sets=include_curve_sets,
-            original_textures=original_textures,
-        )
+        try:
+            return _scene.build_scene(
+                parsed,
+                name_override_keys=name_override_keys,
+                include_curve_sets=include_curve_sets,
+                original_textures=original_textures,
+                unpainted_faces=unpainted_faces,
+            )
+        except (SkpParseError, RecursionError, MemoryError):
+            raise
+        except Exception as e:
+            raise SkpParseError(
+                f"Failed while building scene: {e}", stage="build_scene"
+            ) from e
 
     def build_instanced_scene(
         self,
         name_override_keys: Sequence[str] = ("name", "label", "code"),
         original_textures: bool = False,
+        unpainted_faces: str = "style",
+        include_curve_sets: bool = True,
     ) -> "instanced_scene.InstancedScene":
         """Build the placed scene graph with SketchUp's component/group
         INSTANCING PRESERVED, instead of baked into world-space vertex data.
@@ -1097,6 +1323,8 @@ class SkpFile:
             original_textures: Keep a texture that is not PNG or JPEG in
                 its own format, with its real MIME type; see
                 :meth:`build_scene`.
+            unpainted_faces: ``"style"`` (the default) or ``"tag"``; see
+                :meth:`build_scene`.
 
         Returns:
             A populated :class:`openskp.instanced_scene.InstancedScene`.
@@ -1104,8 +1332,21 @@ class SkpFile:
         from . import _core
         from . import instanced_scene
 
+        if unpainted_faces not in ("style", "tag"):
+            raise ValueError(f'unpainted_faces must be "style" or "tag", not {unpainted_faces!r}')
         parsed = _core.full_parse(str(self.path))
-        return instanced_scene.build_instanced_scene(
-            parsed, name_override_keys=name_override_keys, original_textures=original_textures
-        )
+        try:
+            return instanced_scene.build_instanced_scene(
+                parsed,
+                name_override_keys=name_override_keys,
+                original_textures=original_textures,
+                unpainted_faces=unpainted_faces,
+                include_curve_sets=include_curve_sets,
+            )
+        except (SkpParseError, RecursionError, MemoryError):
+            raise
+        except Exception as e:
+            raise SkpParseError(
+                f"Failed while building scene: {e}", stage="build_scene"
+            ) from e
 

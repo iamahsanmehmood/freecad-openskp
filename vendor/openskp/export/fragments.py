@@ -104,12 +104,14 @@ Example::
 from __future__ import annotations
 
 import json
+import logging
 import math
 import pathlib
-import warnings
 import zlib
 from array import array
 from typing import TYPE_CHECKING, Any, Dict, List, Tuple, Union
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..instanced_scene import InstancedScene, LocalPrimitive
@@ -562,6 +564,8 @@ def to_fragments(scene: "InstancedScene", *, raw: bool = False) -> bytes:
         if res is not None:
             pos, x_dir, y_dir, scale, mirrored = _decompose_trs(world_matrix)
             for prim_idx, prim in enumerate(res.primitives):
+                if prim.unpainted_back:
+                    continue  # a shell has one colour: the front copy carries it
                 material_index = get_material_index(prim.material_index)
                 # Normally exactly one shell; more than one only when the
                 # primitive's own triangle count exceeded what a single
@@ -1041,11 +1045,11 @@ def from_fragments(data: bytes) -> "InstancedScene":
             rep_class = representation.RepresentationClass() if representation is not None else 1
             if rep_class not in _SUPPORTED_REPRESENTATION_CLASSES:
                 if not warned_unsupported:
-                    warnings.warn(
+                    logger.warning(
                         "openskp.export.fragments.from_fragments: skipping a "
-                        f"sample with unsupported RepresentationClass={rep_class} "
+                        "sample with unsupported RepresentationClass=%s "
                         "(only SHELL is read today - see module docstring).",
-                        stacklevel=2,
+                        rep_class,
                     )
                     warned_unsupported = True
                 continue
