@@ -14,18 +14,24 @@ An unpainted face side inherits the material painted on its enclosing
 group/component (``FaceGroupContext.fallback_material``) as a whole -
 colour, texture, transparency and name - the way SketchUp renders it, not
 just that material's colour. Only when nothing up the instance path is
-painted does it fall back to the plain ``fallback_color`` (the layer's
-colour). Before this, a group painted with a textured or translucent
-material (a wood floor, a glass pane) imported as a flat, opaque average
-colour.
+painted does it fall back to a plain colour: what SketchUp shows on an
+unpainted face, the model's front face colour on one side
+(``fallback_color``) and its back face colour on the other
+(``fallback_back_color``, openskp#533). Without the first rule, a group
+painted with a textured or translucent material (a wood floor, a glass pane)
+imports as a flat, opaque average colour.
 
 Faces are grouped by (color, double_sided, texture, transparency, material
 name): two differently named materials that happen to share a colour stay
-separate groups, so a consumer can keep the SketchUp material names.
+separate groups, so a consumer can keep the SketchUp material names. The
+back copies of faces with no paint on either side form groups of their own
+(``unpainted_back``), so an output that shows one colour per face can leave
+them out.
 """
 
 from __future__ import annotations
 
+from array import array
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -160,8 +166,9 @@ def resolve_transparency(mat: Optional[Dict[str, Any]]) -> float:
     return color_alpha * mat.get("transparency", 1.0)
 
 
-# Key: (color, double_sided, texture_index, transparency, material_name).
-FaceGroupKey = Tuple[Tuple[int, int, int], bool, Optional[int], float, Optional[str]]
+# Key: (color, double_sided, texture_index, transparency, material_name,
+# unpainted_back).
+FaceGroupKey = Tuple[Tuple[int, int, int], bool, Optional[int], float, Optional[str], bool]
 
 
 @dataclass
@@ -175,9 +182,9 @@ class FaceGroupContext:
     # (texture, material name) -> index into the scene's textures, or None
     # when the texture is left out (a format glTF cannot carry)
     texture_index_for: Callable[..., Optional[int]]
-    # Color an unpainted face falls back to (already resolved by the
-    # caller: the instance's inherited paint color, or the effective
-    # layer's color when nothing is inherited).
+    # Color an unpainted face side falls back to (already resolved by the
+    # caller: the instance's inherited paint color, or, when nothing is
+    # inherited, the model's front face color or the layer's color).
     fallback_color: Tuple[int, int, int]
     # Identifies the definition in a triangulation failure.
     definition_id: Any
@@ -185,6 +192,21 @@ class FaceGroupContext:
     # (texture, transparency, name) by every unpainted face side. ``None``
     # when nothing up the instance path is painted.
     fallback_material: Optional[Dict[str, Any]] = None
+    # The same as fallback_color for a face's back side, where it differs
+    # (the model's back face color). ``None`` means ``fallback_color``.
+    fallback_back_color: Optional[Tuple[int, int, int]] = None
+
+
+def unpainted_style_colors(
+    parsed: Dict[str, Any], unpainted_faces: str
+) -> Optional[Tuple[Tuple[int, int, int], Tuple[int, int, int]]]:
+    """(front, back) color of a face side with no paint on it or up its
+    instance path, or ``None`` to use its layer's color: the caller asked
+    for that, or the file's face colors couldn't be read."""
+    if unpainted_faces not in ("style", "tag"):
+        raise ValueError(f'unpainted_faces must be "style" or "tag", not {unpainted_faces!r}')
+    colors = parsed.get("face_colors") if unpainted_faces == "style" else None
+    return (tuple(colors[0]), tuple(colors[1])) if colors else None
 
 
 def _add_face_side(
@@ -200,6 +222,7 @@ def _add_face_side(
     xr: Tuple[float, float, float],
     yr: Tuple[float, float, float],
     texture_index_for: Callable[..., Optional[int]],
+    unpainted_back: bool = False,
 ) -> None:
     tex = mat.get("texture") if mat else None
     material_name = mat.get("name") if mat else None
@@ -208,7 +231,9 @@ def _add_face_side(
     # the same average color end up in one group with one image
     tex_index = texture_index_for(tex, material_name)
     transparency = resolve_transparency(mat)
-    key = (color, double_sided, tex_index, transparency, material_name)
+    colorized = bool(mat.get("colorized")) if mat and tex_index is not None else False
+    colorize_type = int(mat.get("colorize_type") or 0) if mat and colorized else 0
+    key = (color, double_sided, tex_index, transparency, material_name, unpainted_back)
     group = face_groups.get(key)
     if group is None:
         group = {
@@ -217,12 +242,13 @@ def _add_face_side(
             "double_sided": double_sided,
             "texture_index": tex_index,
             "material_name": material_name,
-            "colorized": bool(mat.get("colorized")) if mat and tex_index is not None else False,
-            "colorize_type": int(mat.get("colorize_type") or 0) if mat else 0,
+            "colorized": colorized,
+            "colorize_type": colorize_type,
             "local_verts": [],
             "local_uvs": [],
             "normals_accum": [],
             "local_faces": [],
+            "back_triangles": array("I"),
             "local_v_map": {},
         }
         face_groups[key] = group
@@ -267,6 +293,8 @@ def _add_face_side(
                 face_local_map[v_id] = idx
             face_indices.append(idx)
         if len(face_indices) == 3:
+            if reverse:
+                group["back_triangles"].append(len(group["local_faces"]))
             group["local_faces"].append(face_indices)
 
 
@@ -280,6 +308,7 @@ def build_local_face_groups(builder: Any, ctx: FaceGroupContext) -> Dict[FaceGro
     reverse-wound back) so each side keeps its own color.
     """
     face_groups: Dict[FaceGroupKey, Dict[str, Any]] = {}
+    fallback_back_color = ctx.fallback_back_color if ctx.fallback_back_color is not None else ctx.fallback_color
 
     for f_id, f_data in builder.faces.items():
         front_mat = resolve_material(
@@ -289,7 +318,7 @@ def build_local_face_groups(builder: Any, ctx: FaceGroupContext) -> Dict[FaceGro
             f_data.get("back_material_id"), ctx.material_id_to_name, ctx.materials, ctx.materials_by_folder
         ) or ctx.fallback_material
         front_color = resolve_color(front_mat) or ctx.fallback_color
-        back_color = resolve_color(back_mat) or ctx.fallback_color
+        back_color = resolve_color(back_mat) or fallback_back_color
 
         loops = []
         for loop in f_data["loops"]:
@@ -310,13 +339,23 @@ def build_local_face_groups(builder: Any, ctx: FaceGroupContext) -> Dict[FaceGro
         fn = f_data["normal"]
         xr, yr = face_uv_basis(fn)
 
-        if front_color == back_color:
+        front_col = bool(front_mat.get("colorized")) if front_mat else False
+        back_col = bool(back_mat.get("colorized")) if back_mat else False
+        front_ctype = int(front_mat.get("colorize_type") or 0) if front_mat and front_col else 0
+        back_ctype = int(back_mat.get("colorize_type") or 0) if back_mat and back_col else 0
+        same_colorization = (
+            (front_col == back_col and front_ctype == back_ctype)
+            if (front_mat is not None and back_mat is not None)
+            else True
+        )
+        if front_color == back_color and same_colorization:
             _add_face_side(face_groups, builder, triangles, fn, front_color, True, False, front_mat,
                            f_data.get("uv_transform"), xr, yr, ctx.texture_index_for)
         else:
             _add_face_side(face_groups, builder, triangles, fn, front_color, False, False, front_mat,
                            f_data.get("uv_transform"), xr, yr, ctx.texture_index_for)
             _add_face_side(face_groups, builder, triangles, fn, back_color, False, True, back_mat,
-                           f_data.get("uv_transform_back"), xr, yr, ctx.texture_index_for)
+                           f_data.get("uv_transform_back"), xr, yr, ctx.texture_index_for,
+                           unpainted_back=front_mat is None and back_mat is None)
 
     return face_groups

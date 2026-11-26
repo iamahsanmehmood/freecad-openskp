@@ -311,13 +311,10 @@ def _resolve_face_color(face, model, inherited_material_id):
     unpainted face's color), else a neutral default.
 
     Deliberately front-material only (back_material_id is ignored) and
-    deliberately skips the layer-color fallback build_instanced_scene()
-    also has: FreeCAD's Face.layer is a layer ID with no public id->color
-    lookup exposed by openskp yet, and the vast majority of painted real
-    files resolve through material_id long before that fallback would
-    ever matter - a reasonable, documented scope cut for the same
-    "solid colors first" pass as the Blender addon's import, not an
-    oversight.
+    deliberately skips Color-by-Tag per-face layer colours: the vast majority
+    of painted real files resolve through material_id long before a tag-colour
+    fallback would matter - a documented scope cut matching the solid-colour
+    import design.
     """
     mat_id = face.material_id if face.material_id is not None else inherited_material_id
     if mat_id is None:
@@ -4589,73 +4586,29 @@ def _draft_available():
         return False
 
 
-def _tlv_headers_in_range(buf, start, end):
-    import struct
-
-    out = []
-    pos = start
-    while pos + 6 <= end:
-        ln = struct.unpack_from("<I", buf, pos + 2)[0]
-        if ln > end - pos - 6:
-            break
-        out.append((pos, ln))
-        pos += 6 + ln
-    return out
-
-
 _MAX_IMPORTED_ANNOTATIONS = 2000
 
 
-def _inspect_vff_annotations_tlv(filepath, model, include_components=False):
-    """Inspects ``model.dat`` inside a 2021+ VFF ``.skp`` ZIP container (#29):
-    - Classifies ``5BCC`` dimension records into component/nested-path vs root,
-      detects tag ``0x5BD1 != 0`` axis-constrained dimensions, and counts ``5BCC``
-      records whose endpoints did not resolve into ``model.dimensions``.
-    - Counts ``55F0`` VFF text records when ``openskp <= 1.6.0`` has not yet
-      parsed them.
-    """
+def _vff_raw_5bcc_by_owner(filepath, skp_parsed):
+    """Reads ``5BCC`` linear-dimension records per owning definition from a
+    2021+ VFF ``model.dat`` so ``0x5BD1`` axis-constrained dimensions and
+    records with unresolved endpoints are detected per definition (#29)."""
     import struct
     import zipfile
     from openskp import _core
 
-    model_dims = [d for d in (getattr(model, "dimensions", None) or ()) if d.a is not None and d.b is not None]
     if not filepath or not os.path.isfile(filepath):
-        return [], (0 if include_components else len(model_dims)), 0, 0, 0
+        return None
     try:
         with zipfile.ZipFile(filepath, "r") as zf:
             md = zf.read("model.dat")
     except Exception:
-        return [], (0 if include_components else len(model_dims)), 0, 0, 0
+        return None
 
-    def_spans = []
-    hs = _tlv_headers_in_range(md, 0, len(md))
-    if len(hs) == 1 and md[hs[0][0]] == 0xF4 and md[hs[0][0] + 1] == 0x01:
-        hs = _tlv_headers_in_range(md, hs[0][0] + 6, hs[0][0] + 6 + hs[0][1])
-    for h_off, h_sz in hs:
-        if md[h_off] == 0xF9 and md[h_off + 1] == 0x01:
-            lvl = _tlv_headers_in_range(md, h_off + 6, h_off + 6 + h_sz)
-            for tag_lo, tag_hi in ((0x70, 0x17), (0x71, 0x17)):
-                nxt = next(((o, s) for o, s in lvl if md[o] == tag_lo and md[o + 1] == tag_hi), None)
-                lvl = _tlv_headers_in_range(md, nxt[0] + 6, nxt[0] + 6 + nxt[1]) if nxt else []
-            for r_off, r_sz in lvl:
-                if md[r_off] == 0x7C and md[r_off + 1] == 0x15:
-                    def_spans.append((r_off, r_off + 6 + r_sz))
-
-    def _has_multi_instance_path(conn_payload):
-        if not conn_payload:
-            return False
-        blk = _core._tlv_find(_core._tlv_items(conn_payload) or [], 0x5208)
-        sub = _core._tlv_items(blk) or [] if blk else []
-        ref = _core._tlv_find(sub, 0x520B)
-        f53fc = _core._tlv_find(_core._tlv_items(ref) or [], 0x53FC) if ref else None
-        fi = _core._tlv_items(f53fc) or [] if f53fc else []
-        iid = _core._tlv_find(fi, 0x53FE)
-        if not iid or len(iid) == 0:
-            return False
-        return 1 + iid[0] < len(iid)
-
+    defs_dict = (skp_parsed or {}).get("defs_dict") or {}
+    spans = _core._scan_definition_spans(md, defs_dict)
     view = memoryview(md)
-    raw_5bcc = []
+    by_owner = {}
     pos = 0
     n = len(md)
     while True:
@@ -4674,10 +4627,8 @@ def _inspect_vff_annotations_tlv(filepath, model, include_components=False):
         tags = [t for t, _ in body]
         if 0x5BCD not in tags or 0x5BCE not in tags:
             continue
-        in_def = any(s <= j < e for s, e in def_spans)
-        multi = _has_multi_instance_path(_core._tlv_find(body, 0x5BCD)) or _has_multi_instance_path(
-            _core._tlv_find(body, 0x5BCE)
-        )
+        owner = _core._owning_definition(spans, j)
+        owner_key = "ROOT" if owner is None else owner
         xaxis = _core._tlv_find(body, 0x5BCF)
         normal = _core._tlv_find(body, 0x5BD0)
         axis_bytes = _core._tlv_find(body, 0x5BD1)
@@ -4686,76 +4637,8 @@ def _inspect_vff_annotations_tlv(filepath, model, include_components=False):
         nm_val = struct.unpack("<3d", normal) if normal and len(normal) == 24 else None
         off_val = struct.unpack("<d", off_bytes)[0] if off_bytes and len(off_bytes) == 8 else 0.0
         axis_val = struct.unpack("<I", axis_bytes)[0] if axis_bytes and len(axis_bytes) == 4 else 0
-        raw_5bcc.append((in_def, multi, axis_val, (px_val, nm_val, off_val)))
-
-    vff_texts = 0
-    pos = 0
-    while True:
-        j = md.find(b"\xf0\x55", pos)
-        if j < 0:
-            break
-        pos = j + 1
-        if j + 6 > n:
-            continue
-        ln = struct.unpack_from("<I", md, j + 2)[0]
-        if ln < 10 or j + 6 + ln > n:
-            continue
-        body = _core._tlv_items(view[j + 6 : j + 6 + ln])
-        if not body:
-            continue
-        tags = [t for t, _ in body]
-        if 0x55F1 in tags and 0x55F4 in tags:
-            vff_texts += 1
-
-    matched = []
-    unresolved_count = 0
-    r_idx = 0
-    for d in model_dims:
-        sig = (
-            tuple(d.plane_x) if d.plane_x is not None else None,
-            tuple(d.normal) if d.normal is not None else None,
-            float(d.offset or 0.0),
-        )
-        found = None
-        scan = r_idx
-        while scan < len(raw_5bcc):
-            if raw_5bcc[scan][3] == sig:
-                found = scan
-                break
-            scan += 1
-        if found is None and r_idx < len(raw_5bcc):
-            found = r_idx
-        if found is not None:
-            for skipped_idx in range(r_idx, found):
-                s_in_def, s_multi, _, _ = raw_5bcc[skipped_idx]
-                if include_components or (not s_in_def and not s_multi):
-                    unresolved_count += 1
-            matched.append((d, raw_5bcc[found]))
-            r_idx = found + 1
-        else:
-            matched.append((d, (False, False, 0, sig)))
-    for skipped_idx in range(r_idx, len(raw_5bcc)):
-        s_in_def, s_multi, _, _ = raw_5bcc[skipped_idx]
-        if include_components or (not s_in_def and not s_multi):
-            unresolved_count += 1
-
-    kept_dims = []
-    skipped_comp = 0
-    skipped_constrained = 0
-    for d, (in_def, multi, axis_val, _) in matched:
-        if not include_components and (in_def or multi):
-            skipped_comp += 1
-            continue
-        if (
-            axis_val != 0
-            and not hasattr(d, "measured_direction")
-            and _is_vff_axis_misaligned(d.a, d.b, axis_val, d.plane_x, d.normal)
-        ):
-            skipped_constrained += 1
-            continue
-        kept_dims.append(d)
-
-    return kept_dims, skipped_comp, skipped_constrained, unresolved_count, vff_texts
+        by_owner.setdefault(owner_key, []).append((axis_val, (px_val, nm_val, off_val)))
+    return by_owner
 
 
 def _is_unpositioned_text(t) -> bool:
@@ -4822,57 +4705,37 @@ def _is_misaligned_constrained_dim(dim, is_vff=False) -> bool:
 
 
 def _tag_dimension(dim, is_vff, extra=None):
-    """Copies ``dim`` with ``_is_vff`` (and optional builder fields) attached so
+    """Copies ``dim`` with ``_is_vff`` (and optional override fields) attached so
     plane/normal conventions never collide between classic and VFF dimensions."""
     from openskp.model import Dimension
 
-    kwargs = {
-        "text": getattr(dim, "text", "") or "",
-        "hidden": bool(getattr(dim, "hidden", False)),
-        "a": tuple(dim.a) if getattr(dim, "a", None) is not None else None,
-        "b": tuple(dim.b) if getattr(dim, "b", None) is not None else None,
-        "offset": float(getattr(dim, "offset", 0.0) or 0.0),
-        "plane_x": tuple(dim.plane_x) if getattr(dim, "plane_x", None) is not None else None,
-        "normal": tuple(dim.normal) if getattr(dim, "normal", None) is not None else None,
-    }
-    fields = getattr(Dimension, "__dataclass_fields__", {})
-    if "offset_vector" in fields:
-        ov = getattr(dim, "offset_vector", None)
-        kwargs["offset_vector"] = tuple(ov) if ov is not None else None
-    if "layer" in fields:
-        kwargs["layer"] = getattr(dim, "layer", "") or ""
-    wrapped = Dimension(**kwargs)
+    ov = getattr(dim, "offset_vector", None)
+    wrapped = Dimension(
+        text=getattr(dim, "text", "") or "",
+        hidden=bool(getattr(dim, "hidden", False)),
+        a=tuple(dim.a) if getattr(dim, "a", None) is not None else None,
+        b=tuple(dim.b) if getattr(dim, "b", None) is not None else None,
+        offset=float(getattr(dim, "offset", 0.0) or 0.0),
+        plane_x=tuple(dim.plane_x) if getattr(dim, "plane_x", None) is not None else None,
+        normal=tuple(dim.normal) if getattr(dim, "normal", None) is not None else None,
+        offset_vector=tuple(ov) if ov is not None else None,
+        layer=getattr(dim, "layer", "") or "",
+    )
     wrapped._is_vff = bool(is_vff)
     if extra:
         for k, v in extra.items():
-            if v is not None and not hasattr(wrapped, k):
+            if v is not None and not getattr(wrapped, k, None):
                 setattr(wrapped, k, v)
     return wrapped
 
 
 def _extract_model_annotations(model, skp_parsed, filepath=None, stats=None):
     """Collects positioned texts and linear dimensions per definition (including
-    ``model.root``), plus verified root-only VFF ``model.dimensions`` when
-    running against an ``openskp`` release older than ``openskp#623`` (#29).
-    """
+    ``model.root``) (#29)."""
     import zipfile
-    from openskp.model import Dimension
 
     is_vff = bool(filepath and os.path.isfile(filepath) and zipfile.is_zipfile(filepath))
-    defs_dict = (skp_parsed or {}).get("defs_dict") or {}
-    layer_id_to_name = (skp_parsed or {}).get("layer_id_to_name") or {}
-
-    dim_fields = getattr(Dimension, "__dataclass_fields__", {})
-    has_vff_owner_annotations = "layer" in dim_fields
-    has_model_def_dims = (
-        has_vff_owner_annotations
-        or "offset_vector" in dim_fields
-        or any(
-            d.a is not None and d.b is not None
-            for defn in [model.root, *model.definitions.values()]
-            for d in (getattr(defn, "dimensions", None) or ())
-        )
-    )
+    vff_raw_by_owner = _vff_raw_5bcc_by_owner(filepath, skp_parsed) if is_vff else None
 
     by_def_id = {}
     all_entries = [("ROOT", model.root), *list(model.definitions.items())]
@@ -4888,77 +4751,63 @@ def _extract_model_annotations(model, skp_parsed, filepath=None, stats=None):
             texts.append(t)
 
         dims = []
-        if has_model_def_dims and (not is_vff or has_vff_owner_annotations):
-            for d in getattr(defn, "dimensions", None) or ():
-                if d.a is None or d.b is None:
+        resolved_dims = []
+        for d in getattr(defn, "dimensions", None) or ():
+            if d.a is None or d.b is None:
+                if stats is not None:
+                    stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+                continue
+            resolved_dims.append(d)
+
+        if vff_raw_by_owner is not None:
+            raw_list = vff_raw_by_owner.get(raw_key, ())
+            r_idx = 0
+            unresolved_here = 0
+            for d in resolved_dims:
+                sig = (
+                    tuple(d.plane_x) if d.plane_x is not None else None,
+                    tuple(d.normal) if d.normal is not None else None,
+                    float(d.offset or 0.0),
+                )
+                found = None
+                scan = r_idx
+                while scan < len(raw_list):
+                    if raw_list[scan][1] == sig:
+                        found = scan
+                        break
+                    scan += 1
+                if found is None and r_idx < len(raw_list):
+                    found = r_idx
+                axis_val = 0
+                if found is not None:
+                    unresolved_here += found - r_idx
+                    axis_val = raw_list[found][0]
+                    r_idx = found + 1
+                if (
+                    axis_val != 0
+                    and not hasattr(d, "measured_direction")
+                    and _is_vff_axis_misaligned(d.a, d.b, axis_val, d.plane_x, d.normal)
+                ) or _is_misaligned_constrained_dim(d, is_vff=True):
                     if stats is not None:
-                        stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+                        stats["constrained_dimensions_skipped"] = stats.get("constrained_dimensions_skipped", 0) + 1
                     continue
+                dims.append(_tag_dimension(d, True))
+            unresolved_here += len(raw_list) - r_idx
+            if unresolved_here > 0 and stats is not None:
+                stats["dimensions_skipped_unresolved"] = (
+                    stats.get("dimensions_skipped_unresolved", 0) + unresolved_here
+                )
+        else:
+            for d in resolved_dims:
                 if _is_misaligned_constrained_dim(d, is_vff=is_vff):
                     if stats is not None:
                         stats["constrained_dimensions_skipped"] = stats.get("constrained_dimensions_skipped", 0) + 1
                     continue
                 dims.append(_tag_dimension(d, is_vff))
-        elif not is_vff:
-            raw_entry = defs_dict.get(raw_key)
-            builder = raw_entry.get("builder") if isinstance(raw_entry, dict) else None
-            b_dims = getattr(builder, "dimensions", None) or ()
-            if b_dims:
-                for bd in b_dims:
-                    if not isinstance(bd, dict):
-                        continue
-                    if bd.get("a") is None or bd.get("b") is None:
-                        if stats is not None:
-                            stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
-                        continue
-                    raw_lid = bd.get("layer_id", bd.get("layer"))
-                    resolved_layer = ""
-                    if isinstance(raw_lid, int) and raw_lid != 0:
-                        resolved_layer = layer_id_to_name.get(raw_lid, "")
-                    elif isinstance(raw_lid, str):
-                        resolved_layer = raw_lid
-                    base_d = Dimension(
-                        text=bd.get("text", ""),
-                        hidden=bool(bd.get("hidden", False)),
-                        a=tuple(bd["a"]),
-                        b=tuple(bd["b"]),
-                        offset=float(bd.get("offset", 0.0)),
-                        plane_x=tuple(bd["plane_x"]) if bd.get("plane_x") is not None else None,
-                        normal=tuple(bd["normal"]) if bd.get("normal") is not None else None,
-                    )
-                    ov = tuple(bd["offset_vector"]) if bd.get("offset_vector") is not None else None
-                    tagged = _tag_dimension(base_d, False, {"offset_vector": ov, "layer": resolved_layer})
-                    if _is_misaligned_constrained_dim(tagged):
-                        if stats is not None:
-                            stats["constrained_dimensions_skipped"] = stats.get("constrained_dimensions_skipped", 0) + 1
-                        continue
-                    dims.append(tagged)
-            else:
-                for d in getattr(defn, "dimensions", None) or ():
-                    if d.a is None or d.b is None:
-                        if stats is not None:
-                            stats["dimensions_skipped_unresolved"] = stats.get("dimensions_skipped_unresolved", 0) + 1
+
         by_def_id[id(defn)] = (texts, dims)
 
-    vff_world_dims = []
-    if is_vff and not has_vff_owner_annotations:
-        root_vff, skipped_comp_dims, skipped_constrained, skipped_unres, skipped_vff_txts = (
-            _inspect_vff_annotations_tlv(filepath, model, include_components=False)
-        )
-        if stats is not None:
-            stats["vff_component_dimensions_skipped"] = (
-                stats.get("vff_component_dimensions_skipped", 0) + skipped_comp_dims
-            )
-            stats["constrained_dimensions_skipped"] = (
-                stats.get("constrained_dimensions_skipped", 0) + skipped_constrained
-            )
-            stats["dimensions_skipped_unresolved"] = (
-                stats.get("dimensions_skipped_unresolved", 0) + skipped_unres
-            )
-            stats["vff_texts_skipped"] = stats.get("vff_texts_skipped", 0) + skipped_vff_txts
-        vff_world_dims = [_tag_dimension(d, True) for d in root_vff]
-
-    return by_def_id, vff_world_dims
+    return by_def_id
 
 
 def _transform_inch_point(pt, m13):
@@ -5478,15 +5327,15 @@ class _HierarchyImport:
         self.components = None
         if self.annotations:
             try:
-                self.annots_by_def, self.vff_world_dims = _extract_model_annotations(
+                self.annots_by_def = _extract_model_annotations(
                     model, skp_parsed, filepath=filepath, stats=stats
                 )
                 self.defs_with_annots = _build_subtree_has_annots(model, self.annots_by_def)
             except Exception as exc:
                 _record_annotation_failure(stats, exc)
-                self.annots_by_def, self.vff_world_dims, self.defs_with_annots = {}, [], set()
+                self.annots_by_def, self.defs_with_annots = {}, set()
         else:
-            self.annots_by_def, self.vff_world_dims, self.defs_with_annots = {}, [], set()
+            self.annots_by_def, self.defs_with_annots = {}, set()
 
     # -- helpers ---------------------------------------------------------
 
@@ -5894,7 +5743,7 @@ class _HierarchyImport:
                     hide = self.layer_hidden.get(t_layer, False)
                     tobj = _create_draft_text_obj(self.doc, txt, None, self.stats, force_hidden=hide)
                     _attach_annotation_obj(self.doc, lambda l=t_layer: tag_annotations_group(l), tobj, self.stats, "texts_built")
-                for dim in [*root_dims, *self.vff_world_dims]:
+                for dim in root_dims:
                     if self.stats["texts_built"] + self.stats["dimensions_built"] >= _MAX_IMPORTED_ANNOTATIONS:
                         self.stats["annotations_capped"] = self.stats.get("annotations_capped", 0) + 1
                         continue
@@ -5999,15 +5848,9 @@ class _capture_library_warnings:
 
 
 def _reconcile_partial_read_warnings(model, filepath, library_warnings):
-    """Returns ``unread_root_entities`` (0 with an openskp release older than
-    openskp#552, where ``SkpModel`` has no such attribute) and ensures
-    ``library_warnings`` starts with a clear partial-read message whenever any
-    root entities were dropped."""
-    unread = (
-        int(model.unread_root_entities)
-        if hasattr(model, "unread_root_entities") and model.unread_root_entities
-        else 0
-    )
+    """Returns ``unread_root_entities`` and ensures ``library_warnings`` starts
+    with a clear partial-read message whenever any root entities were dropped."""
+    unread = int(model.unread_root_entities or 0)
     if not unread:
         for message in library_warnings:
             if "read only in part" in message:
@@ -6186,8 +6029,6 @@ def import_skp(
         "import_annotations": bool(annotations),
         "texts_built": 0, "dimensions_built": 0,
         "texts_skipped_no_position": 0,
-        "vff_component_dimensions_skipped": 0,
-        "vff_texts_skipped": 0,
         "constrained_dimensions_skipped": 0,
         "dimensions_skipped_unresolved": 0,
         "annotations_capped": 0,
@@ -6301,18 +6142,6 @@ def import_skp(
                 pass
 
     base_file = os.path.basename(filepath)
-    vff_skipped_parts = []
-    if stats["vff_texts_skipped"]:
-        vff_skipped_parts.append(f"{stats['vff_texts_skipped']} 2021+ text(s)")
-    if stats["vff_component_dimensions_skipped"]:
-        vff_skipped_parts.append(f"{stats['vff_component_dimensions_skipped']} 2021+ component dimension(s)")
-    if vff_skipped_parts:
-        msg = (
-            f"{base_file}: skipped {', '.join(vff_skipped_parts)} "
-            "(requires a newer openskp release with 2021+ owner-local annotations)"
-        )
-        stats["warnings"].append(msg)
-        App.Console.PrintWarning(f"openskp: {msg}\n")
     if stats["constrained_dimensions_skipped"]:
         msg = f"{base_file}: skipped {stats['constrained_dimensions_skipped']} axis-constrained dimension(s)"
         stats["warnings"].append(msg)
@@ -6378,8 +6207,6 @@ def import_skp(
         )
     annot_skipped_total = (
         stats["texts_skipped_no_position"]
-        + stats["vff_component_dimensions_skipped"]
-        + stats["vff_texts_skipped"]
         + stats["constrained_dimensions_skipped"]
         + stats["dimensions_skipped_unresolved"]
         + stats["annotations_capped"]
@@ -6464,7 +6291,7 @@ def _import_merged(doc, model, stats, progress, annotations=False, skp_parsed=No
 
     if annotations:
         try:
-            annots_by_def, vff_world_dims = _extract_model_annotations(
+            annots_by_def = _extract_model_annotations(
                 model, skp_parsed, filepath=filepath, stats=stats
             )
             defs_with_annots = _build_subtree_has_annots(model, annots_by_def)
@@ -6482,13 +6309,6 @@ def _import_merged(doc, model, stats, progress, annotations=False, skp_parsed=No
                 counter,
                 stats,
             )
-            for dim in vff_world_dims:
-                if counter[0] >= _MAX_IMPORTED_ANNOTATIONS:
-                    stats["annotations_capped"] = stats.get("annotations_capped", 0) + 1
-                    continue
-                d_layer = getattr(dim, "layer", "") or "Layer0"
-                annot_buckets.setdefault(d_layer, ([], []))[1].append((dim, None))
-                counter[0] += 1
             for layer_name, (t_items, d_items) in annot_buckets.items():
                 if not t_items and not d_items:
                     continue
@@ -7177,48 +6997,29 @@ def _export_texture_bytes_and_ext(raw_bytes, mat_info):
 def _builder_add_texture_material_bytes(
     builder, name, bare_fn, img_bytes, applied_width=1.0, applied_height=1.0, opacity=None
 ):
-    """Registers an image-textured material directly from in-memory PNG/JPEG
-    ``img_bytes`` with a neutral bare filename ``bare_fn`` (writing zero temporary
-    files and embedding zero host paths into ``CMaterial``)."""
-    import inspect
-    from openskp.create import SkpWriteError, _detect_image_subtype
+    """Registers an image-textured material from in-memory PNG/JPEG ``img_bytes``
+    using public ``SkpBuilder.add_texture_material(..., filename=bare_fn)``
+    (openskp#667) so ``CMaterial`` stores only ``bare_fn`` and zero host paths."""
+    import tempfile
 
-    if hasattr(builder, "add_texture_material"):
-        sig = inspect.signature(builder.add_texture_material)
-        if "image_bytes" in sig.parameters:
-            return builder.add_texture_material(
-                name,
-                bare_fn,
-                image_bytes=img_bytes,
-                applied_width=applied_width,
-                applied_height=applied_height,
-                opacity=opacity,
-            )
-    if builder._geometry_writer is not None:
-        raise SkpWriteError("add_texture_material must be called before any add_face calls")
-    if builder._layer_writer is not None:
-        raise SkpWriteError("add_texture_material must be called before any add_layer calls")
-    if builder._definition_writer is not None:
-        raise SkpWriteError("add_texture_material must be called before any add_component_definition calls")
-    if name in builder.materials_by_name:
-        return builder.materials_by_name[name]
-    subtype = _detect_image_subtype(img_bytes)
-    slot = builder._material_writer.write_textured_material(
-        name,
-        img_bytes,
-        bare_fn,
-        subtype=subtype,
-        applied_width=applied_width,
-        applied_height=applied_height,
-        opacity=opacity,
-    )
-    builder.materials_by_name[name] = slot
-    builder._applied_sizes[slot] = (
-        1.0 if applied_width is None else float(applied_width),
-        1.0 if applied_height is None else float(applied_height),
-    )
-    builder._material_count += 1
-    return slot
+    ext = os.path.splitext(bare_fn or "")[1] or ".png"
+    fd, tmp_path = tempfile.mkstemp(suffix=ext)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(img_bytes)
+        return builder.add_texture_material(
+            name,
+            tmp_path,
+            applied_width=applied_width,
+            applied_height=applied_height,
+            opacity=opacity,
+            filename=bare_fn,
+        )
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
 
 
 def _register_export_object_faces(obj, builder, material_handle_by_key, used_mat_names, stats=None):

@@ -124,9 +124,8 @@ Edit parameters, `BaseApp/Preferences/Mod/OpenSKP`, Boolean) or
 
 **Annotations — texts and dimensions** (`ImportAnnotations`, on by default):
 SketchUp positioned texts (`Definition.texts`) and linear dimensions
-(`Definition.dimensions` in classic files; root `SkpModel.dimensions` or
-owner-local `Definition.dimensions` in 2021+ VFF files) import as FreeCAD Draft
-`Text` and `LinearDimension` objects (#29):
+(`Definition.dimensions` in both classic and 2021+ VFF files) import as FreeCAD
+Draft `Text` and `LinearDimension` objects (#29):
 
 - In the component hierarchy, root annotations sit in an **Annotations** group
   inside their tag's group, and annotations owned by a component or group
@@ -135,20 +134,15 @@ owner-local `Definition.dimensions` in 2021+ VFF files) import as FreeCAD Draft
   placements transform nested annotations into their enclosing scope).
 - In the merged layout, annotations are transformed into world space and
   grouped per SketchUp tag (`Annotations` / `Annotations (<tag>)`).
-- With OpenSKP 1.6.0, dimension lines sit directly on `a`–`b` without an offset;
-  when the library provides `Dimension.offset_vector` (openskp#621/#623), the
-  offset vector and plane normal are applied, with a guaranteed non-parallel
-  fallback `Normal` for vertical and unplaned dimensions, and `"<>"` in custom
-  dimension text maps to Draft's `"$dim"` measured-value token.
+- Dimensions carrying `Dimension.offset_vector` apply their offset vector and
+  plane normal (with a guaranteed non-parallel fallback `Normal` for vertical
+  and unplaned dimensions), while dimensions without an `offset_vector` sit
+  directly on `a`–`b`; `"<>"` in custom dimension text maps to Draft's `"$dim"`
+  measured-value token.
 - **What is skipped and reported:** screen texts (`leader_type == 0`), texts
-  with no 3D position (such as classic leader texts anchored to geometry whose
-  coordinates OpenSKP 1.6.0 leaves `None`), 2021+ VFF axis-constrained
-  dimensions (`5BD1`) whose `a`–`b` segment is not parallel to the constraint
-  axis, dimensions with unresolved endpoints, 2021+ VFF texts, and 2021+
-  dimensions inside components (until openskp#623 is vendored) are skipped
-  rather than misplaced and counted in the console report (with OpenSKP 1.6.0,
-  an axis-constrained dimension in a classic pre-2021 file shows the `a`–`b`
-  distance because the library does not give the constraint axis), and leader
+  with no 3D position, axis-constrained dimensions whose `a`–`b` segment is not
+  parallel to the constraint axis, and dimensions with unresolved endpoints are
+  skipped rather than misplaced and counted in the console report, and leader
   texts are placed at `label_point` without drawing a separate leader arrow line
   (`SketchUpAnchorPoint` records the anchor). Errors anywhere in the annotation
   pass are caught without leaving orphan Draft objects behind and reported once
@@ -264,8 +258,7 @@ paint, or whatever an ancestor group/component painted itself with when the
 face has none, or a neutral default when nothing was ever painted — matching
 SketchUp's own paint-inheritance rule. Solid colours and opacity are applied by
 default (and texture images when `ImportTextures` / `textures=True` is enabled;
-see above). Deliberately skips a face's individual layer-colour fallback, since
-that needs a layer id → colour lookup `openskp` does not expose publicly yet;
+see above). Deliberately skips a face's Color-by-Tag layer colour fallback, as
 real painted files resolve through `material_id` long before that fallback
 would matter. `ViewObject.DiffuseColor` is applied under the real GUI
 (`ViewObject` does not exist under headless `freecadcmd`), while the underlying

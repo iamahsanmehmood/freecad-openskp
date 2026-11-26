@@ -102,6 +102,7 @@ happens at import time, write time, or any other runtime path.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import math
 import re
@@ -116,11 +117,29 @@ from . import legacy
 from ._face_groups import face_uv_basis
 
 __all__ = [
-    "SkpWriteError", "SkpBuilder", "ComponentDefinitionBuilder", "create",
+    "SkpWriteError", "DocumentOptions", "SkpBuilder", "ComponentDefinitionBuilder", "create",
     "Point3d", "Vector3d", "Length", "Timestamp",
 ]
 
 Point3 = Tuple[float, float, float]
+
+
+class _DefaultOffset(float):
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "10.0"
+
+
+_DEFAULT_OFFSET = _DefaultOffset(10.0)
+
+
+def _is_offset_sequence(value: object) -> bool:
+    if isinstance(value, (str, bytes)):
+        return False
+    if isinstance(value, Sequence):
+        return True
+    return hasattr(value, "__getitem__") and getattr(value, "ndim", None) == 1
 
 
 class Point3d(NamedTuple):
@@ -739,6 +758,26 @@ _DIM_B42 = bytes.fromhex("00000000000000000000020000000400000000000000"
                          "0000000000000000000000000000000000000000")
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _archive_uuid(value: Optional[str] = None) -> bytes:
+    """Parse a canonical UUID string (32 hex digits or 8-4-4-4-12) into 16
+    Windows-order GUID bytes, or generate a new v4 UUID when empty/None."""
+    if not value:
+        return uuid.uuid4().bytes_le
+    if len(value) == 32:
+        hex_str = value
+    elif (len(value) == 36 and value[8] == "-" and value[13] == "-"
+          and value[18] == "-" and value[23] == "-"):
+        hex_str = value[:8] + value[9:13] + value[14:18] + value[19:23] + value[24:]
+    else:
+        raise SkpWriteError("GUID must contain 32 hex digits or use 8-4-4-4-12 notation")
+    if len(hex_str) != 32 or not all(ch in _HEX_DIGITS for ch in hex_str):
+        raise SkpWriteError("GUID contains a non-hex digit")
+    return uuid.UUID(hex=hex_str).bytes_le
+
+
 def _f64(v: float) -> bytes:
     return struct.pack("<d", v)
 
@@ -1175,9 +1214,15 @@ class _ArchiveWriter:
     def _write_str(self, s: str) -> None:
         encoded = s.encode("utf-16-le")
         n = len(encoded) // 2
-        if n >= 0xFF:
-            raise SkpWriteError("string too long to encode (255 char limit)")
-        self.buf += b"\xff\xfe\xff" + struct.pack("<B", n) + encoded
+        if n >= 0xFFFFFFFF:
+            raise SkpWriteError("string too long to encode")
+        if n < 0xFF:
+            header = b"\xff\xfe\xff" + struct.pack("<B", n)
+        elif n < 0xFFFE:
+            header = b"\xff\xfe\xff\xff" + struct.pack("<H", n)
+        else:
+            header = b"\xff\xfe\xff\xff\xff\xff" + struct.pack("<I", n)
+        self.buf += header + encoded
 
     def write_material(self, name: str, rgba: Tuple[int, int, int, int],
                        opacity: Optional[float] = None) -> int:
@@ -1249,18 +1294,13 @@ class _ArchiveWriter:
         self.buf += _f64(1.0 if applied_height is None else float(applied_height))
         self._write_str(texture_path)
         # avg color (RGBA + pad + RGBA repeated, per legacy.py's _read_material
-        # comment) - neutral near-opaque white rather than a real image
-        # average, since this project doesn't depend on an image library to
-        # compute one. Ground truth confirms real SketchUp reads texture
-        # pixels directly for rendering; avg only feeds the material
-        # browser's thumbnail/tint preview. Alpha is 254, not a fully-opaque
-        # 255: legacy.py's own reader treats alpha=255 here as one of its
-        # two "this material is colorized" signals (`avg[3] == 0xFF`,
-        # alongside the blob flag below) - a real SketchUp-authored
-        # colorized material's stored average apparently always has full
-        # alpha, but a PLAIN one's placeholder must not, or every plain
-        # texture this writer creates reads back as falsely colorized.
-        self.buf += bytes([255, 255, 255, 254, 0, 255, 255, 255, 254])
+        # comment) - neutral opaque white rather than a real image average,
+        # since this project doesn't depend on an image library to compute one.
+        # Ground truth confirms real SketchUp reads texture pixels directly for
+        # rendering, writes alpha=255 in both color slots, and gates
+        # colorization on the u32 material-type field below (1=textured,
+        # 2=colorized texture).
+        self.buf += bytes([255, 255, 255, 255, 0, 255, 255, 255, 255])
         self._write_str("")  # second name field - empty in ground truth
         self.buf += struct.pack("<I", 1) + struct.pack("<I", 0)  # blob (colorize-related, ground truth: 1, 0)
         # Opacity, and the u8 that GATES it. The stored f64 is TRANSPARENCY
@@ -1360,7 +1400,10 @@ class _ArchiveWriter:
         self.buf += _u32(0)  # placeholder entity count, patched by the caller
         return slot, count_patch_pos
 
-    def write_definition_tail(self, name: str, behavior: int = 0, is_group: bool = False) -> int:
+    def write_definition_tail(
+        self, name: str, behavior: int = 0, is_group: bool = False,
+        guid: Optional[bytes] = None,
+    ) -> int:
         """Close out a ``CComponentDefinition`` record: relationship count,
         GUID, name, timestamp, behavior flags, and a default thumbnail.
 
@@ -1376,7 +1419,7 @@ class _ArchiveWriter:
         component can be flagged later, when it is placed as a group."""
         self.buf += _u32(0)  # nrel: CRelationship count - always 0, not supported
         self.buf += struct.pack("<H", 0)
-        self.buf += uuid.uuid4().bytes
+        self.buf += guid if guid is not None else _archive_uuid()
         self._write_str(name)
         self._write_str("")  # description - empty in ground truth
         self._write_str("")  # second name field - empty in ground truth
@@ -1957,15 +2000,141 @@ def _write_face_or_triangulate(
         )
     if front_uv is not None or back_uv is not None:
         raise SkpWriteError("auto_triangulate cannot be combined with front_uv/back_uv positioning")
-    total = 0
+    for p in points:
+        for c in p:
+            if not math.isfinite(float(c)):
+                raise SkpWriteError("face contains non-finite coordinates")
+    triangles: List[List[Point3]] = []
     for i in range(1, len(points) - 1):
+        tri = [points[0], points[i], points[i + 1]]
+        try:
+            _plane_from_polygon(tri)
+        except SkpWriteError:
+            continue
+        triangles.append(tri)
+    if not triangles:
+        raise SkpWriteError("triangulation has no non-degenerate faces")
+    total = 0
+    for tri in triangles:
         total += writer.write_face(
-            [points[0], points[i], points[i + 1]], vertex_slots, edge_registry,
+            tri, vertex_slots, edge_registry,
             material, layer, back_material,
             hidden, soft_edges, smooth_edges, hidden_edges,
             None, None, attribute_dicts,
         )
     return total
+
+
+@dataclasses.dataclass
+class DocumentOptions:
+    """Display settings supported by the legacy v17 document scaffold.
+
+    Attributes:
+        length_unit: Native ``UnitsOptions`` values: ``0`` = inches, ``1`` = feet,
+            ``2`` = mm, ``3`` = cm, ``4`` = metres, ``5`` = yards.
+        length_precision: Decimal display precision ``0``..``6``.
+        style_items: Native style item IDs mapped to scalar values (colours are
+            packed ABGR ``uint32`` values). Only items present in the bundled
+            legacy style are updated; newer items are ignored.
+    """
+
+    length_unit: int = 0
+    length_precision: int = 3
+    style_items: Dict[int, float] = dataclasses.field(default_factory=dict)
+
+
+_RENDERING_OPTION_FIELDS: Tuple[Tuple[int, int, bool], ...] = (
+    (1000, 3173, False), (1001, 3279, False), (1002, 3197, False), (1004, 3201, True),
+    (1005, 3202, False), (1006, 3206, True),  (1007, 3207, False), (1008, 3211, True),
+    (1009, 3212, False), (1010, 3216, True),  (1011, 3217, False), (1012, 3172, True),
+    (1014, 3181, False), (1015, 3353, True),  (2001, 3166, False), (2002, 3227, False),
+    (2003, 3231, False), (2004, 3170, True),  (2005, 3171, True),  (2006, 3326, False),
+    (2007, 3196, True),  (4000, 3177, False), (4001, 3287, False), (4002, 3299, True),
+    (4003, 3295, False), (4004, 3300, True),  (4005, 3302, False), (4006, 3301, True),
+    (4007, 3291, False), (5000, 3344, True),  (7000, 3185, False), (7001, 3340, False),
+    (7002, 3189, False), (7003, 3306, False), (7004, 3310, False), (7005, 3314, False),
+    (7008, 3283, True),  (7010, 3222, True),  (7011, 3195, True),  (7012, 3286, True),
+    (7014, 3318, False),
+)
+
+
+def _patch_document_prefix(prefix: bytearray, options: DocumentOptions) -> None:
+    struct.pack_into("<I", prefix, 2327, options.length_precision)
+    struct.pack_into("<I", prefix, 2360, 0)  # LengthFormat: decimal
+    struct.pack_into("<I", prefix, 2389, options.length_unit)
+    struct.pack_into("<I", prefix, 2689, options.length_unit)  # AreaUnit
+    struct.pack_into("<I", prefix, 2718, options.length_unit)  # VolumeUnit
+    for item_id, offset, is_bool in _RENDERING_OPTION_FIELDS:
+        if item_id not in options.style_items:
+            continue
+        v = options.style_items[item_id]
+        if is_bool:
+            prefix[offset] = 1 if v != 0.0 else 0
+        else:
+            struct.pack_into("<I", prefix, offset, int(v) & 0xFFFFFFFF)
+
+
+def _patch_style_items(tail: bytearray, pos: int, options: DocumentOptions) -> None:
+    for _ in range(56):
+        item_id = struct.unpack_from("<I", tail, pos)[0]
+        valid = struct.unpack_from("<I", tail, pos + 4)[0] != 0
+        pos += 8
+        if not valid:
+            continue
+        kind = struct.unpack_from("<I", tail, pos)[0]
+        pos += 4
+        size = 1 if kind == 1 else (8 if kind == 7 else 4)
+        if item_id in options.style_items:
+            v = options.style_items[item_id]
+            if kind == 1:
+                tail[pos] = 1 if v != 0.0 else 0
+            elif kind == 4:
+                struct.pack_into("<I", tail, pos, int(v) & 0xFFFFFFFF)
+            elif kind == 6:
+                struct.pack_into("<f", tail, pos, v)
+            elif kind == 7:
+                struct.pack_into("<d", tail, pos, v)
+        pos += size
+
+
+def _finite_point3(value: object, caller: str) -> Point3:
+    if isinstance(value, (str, bytes, bytearray)):
+        raise SkpWriteError(f"{caller}: expected a 3-coordinate point or vector")
+    try:
+        items = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise SkpWriteError(f"{caller}: expected a 3-coordinate point or vector") from exc
+    if len(items) != 3:
+        raise SkpWriteError(f"{caller}: expected 3 coordinates, got {len(items)}")
+    try:
+        pt = (float(items[0]), float(items[1]), float(items[2]))
+    except (TypeError, ValueError) as exc:
+        raise SkpWriteError(f"{caller}: coordinates must be numeric") from exc
+    if not all(math.isfinite(c) for c in pt):
+        raise SkpWriteError(f"{caller}: coordinates must be finite")
+    return pt
+
+
+def _resolve_construction_line_params(
+    point: Point3,
+    point2: Optional[Point3],
+    direction: Optional[Point3],
+) -> Tuple[Point3, Point3, float, float]:
+    p = _finite_point3(point, "add_construction_line")
+    if (point2 is None) == (direction is None):
+        raise SkpWriteError("add_construction_line: pass exactly one of point2 or direction")
+    if point2 is not None:
+        p2 = _finite_point3(point2, "add_construction_line")
+        dx, dy, dz = p2[0] - p[0], p2[1] - p[1], p2[2] - p[2]
+        length = math.hypot(dx, dy, dz)
+        if not math.isfinite(length) or length == 0.0:
+            raise SkpWriteError("add_construction_line: point and point2 coincide")
+        return p, (dx / length, dy / length, dz / length), 0.0, length
+    d = _finite_point3(direction, "add_construction_line")
+    dlen = math.hypot(d[0], d[1], d[2])
+    if not math.isfinite(dlen) or dlen == 0.0:
+        raise SkpWriteError("add_construction_line: direction must be finite and nonzero")
+    return p, (d[0] / dlen, d[1] / dlen, d[2] / dlen), -_CLINE_INFINITE, _CLINE_INFINITE
 
 
 class ComponentDefinitionBuilder:
@@ -1988,6 +2157,7 @@ class ComponentDefinitionBuilder:
         self._skp = skp
         self.slot = slot
         self.name = name
+        self._guid: bytes = _archive_uuid()
         #: SketchUp's behavior byte, set by `SkpBuilder.add_component_definition`
         #: (bit 0 always-faces-camera, bit 1 shadows-face-sun).
         self.behavior = 0
@@ -2276,51 +2446,97 @@ class ComponentDefinitionBuilder:
         if definition._group_flag_pos is not None:
             struct.pack_into("<I", self._skp._definition_writer.buf, definition._group_flag_pos, 1)
 
-    def add_text(self, text: str, point: Point3,
-                 leader: Point3 = (15.0, 15.0, 15.0)) -> None:
-        """Add a leader text (SketchUp's Text tool) anchored at ``point``
-        (inches, local to this definition), with the label floating at
-        ``point + leader`` and a leader line joining them - same
-        signature and behavior as :meth:`SkpBuilder.add_text`, so it
-        belongs to the group/instance the way SketchUp's own Text tool
-        lets it when drawn while editing a component in place
-        (openskp#380)."""
-        self._check_writable("text")
-        writer = self._skp._definition_writer
-        p = (float(point[0]), float(point[1]), float(point[2]))
-        lb = tuple(p[i] + float(leader[i]) for i in range(3))
-        writer._new_of_known_class("CText", schema=9)
-        writer._preamble()
-        writer.buf += _DIM_DRAWBASE
-        if self._skp._dim_font_slot is None:
-            self._skp._dim_font_slot = writer._new_of_known_class("CSkFont", schema=1)
-            writer.buf += _DIM_FONT_PAYLOAD
-        else:
-            writer._backref(self._skp._dim_font_slot)
-        writer.buf += _f64(0.0) + _f64(0.0)  # screen-fraction slot (unused)
-        writer.buf += _u32(1) + _u32(4)      # free connection + constant
-        writer.buf += _f64(p[0]) + _f64(p[1]) + _f64(p[2])
-        writer.buf += bytes(12)
-        writer.buf += _f64(lb[0]) + _f64(lb[1]) + _f64(lb[2])  # label position
-        writer.buf += bytes(16)
-        writer.buf += _f64(1.0)
-        writer.buf += _u32(2)                # leader type: pushpin
-        writer.buf += _TEXT_DELIM
-        writer._write_str(text)
-        writer.buf += bytes(5)
+    def add_dimension(
+        self,
+        p1: Point3,
+        p2: Point3,
+        offset: Union[float, Point3] = _DEFAULT_OFFSET,
+        *,
+        offset_vector: Optional[Point3] = None,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+    ) -> None:
+        """Add a FREE linear dimension between two explicit points (inches,
+        local to this definition) - same signature and behavior as
+        :meth:`SkpBuilder.add_dimension`."""
+        self._check_writable("dimensions")
+        self._skp._check_layer_handle(layer)
+        prepared = self._skp._prepare_dimension(p1, p2, offset=offset, offset_vector=offset_vector)
+        self._skp._emit_dimension(self._skp._definition_writer, *prepared, layer=layer, hidden=hidden)
         self._new_entity_count += 1
 
-    def add_construction_point(self, position: Point3) -> None:
+    def add_text(
+        self,
+        text: str,
+        point: Point3,
+        leader: Point3 = (15.0, 15.0, 15.0),
+        *,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+        leader_type: int = 2,
+        arrow_type: int = 3,
+        screen_position: Optional[Tuple[float, float]] = None,
+        display_leader: bool = True,
+    ) -> None:
+        """Add a leader or screen text anchored at ``point`` (inches, local
+        to this definition) - same signature and behavior as
+        :meth:`SkpBuilder.add_text`."""
+        self._check_writable("text")
+        self._skp._check_layer_handle(layer)
+        self._skp._write_text(
+            self._skp._definition_writer,
+            text,
+            point,
+            leader=leader,
+            layer=layer,
+            hidden=hidden,
+            leader_type=leader_type,
+            arrow_type=arrow_type,
+            screen_position=screen_position,
+            display_leader=display_leader,
+        )
+        self._new_entity_count += 1
+
+    def add_construction_line(
+        self,
+        point: Point3,
+        point2: Optional[Point3] = None,
+        direction: Optional[Point3] = None,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+    ) -> None:
+        """Add a construction/guide line (SketchUp's Construction Line tool) in
+        this definition's local coordinates (inches) - same signature and
+        behavior as :meth:`SkpBuilder.add_construction_line`."""
+        self._check_writable("construction lines")
+        self._skp._check_layer_handle(layer)
+        p, dirv, start_param, end_param = _resolve_construction_line_params(point, point2, direction)
+        w = self._skp._definition_writer
+        w._new_of_known_class("CConstructionLine", schema=1)
+        w._preamble()
+        w._drawbase(layer=layer or 0, hidden=hidden)
+        for v in (p[0], p[1], p[2], dirv[0], dirv[1], dirv[2], start_param, end_param):
+            w.buf += _f64(v)
+        w.buf += bytes(4)
+        self._new_entity_count += 1
+
+    def add_construction_point(
+        self,
+        position: Point3,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+    ) -> None:
         """Add a construction/guide point (SketchUp's Construction Point
         tool) at ``position`` (inches, local to this definition) - same
         signature and behavior as :meth:`SkpBuilder.add_construction_point`
         (openskp#380)."""
         self._check_writable("construction points")
+        self._skp._check_layer_handle(layer)
+        p = _finite_point3(position, "add_construction_point")
         writer = self._skp._definition_writer
-        p = (float(position[0]), float(position[1]), float(position[2]))
         writer._new_of_known_class("CConstructionPoint", schema=0)
         writer._preamble()
-        writer.buf += _DIM_DRAWBASE
+        writer._drawbase(layer=layer or 0, hidden=hidden)
         for v in (p[0], p[1], p[2], 0.0, 0.0, 0.0):
             writer.buf += _f64(v)
         writer.buf += bytes(1)
@@ -2337,7 +2553,8 @@ class ComponentDefinitionBuilder:
         writer = self._skp._definition_writer
         struct.pack_into("<I", writer.buf, self._count_patch_pos, self._new_entity_count)
         self._group_flag_pos = writer.write_definition_tail(
-            self.name, behavior=self.behavior, is_group=self._group_placement is not None)
+            self.name, behavior=self.behavior, is_group=self._group_placement is not None,
+            guid=self._guid)
         self._closed = True
         self._skp._open_definition = None
         if self._group_placement is not None:
@@ -2413,14 +2630,10 @@ class SkpBuilder:
         # Materials always start allocating at `base`, the same slot the
         # (possibly absent) material section would have occupied.
         # Persistent IDs run in ONE sequence across every section of the
-        # file, continuing from the scaffold's own counter (u32 at
-        # _PID_COUNTER_POS). Each section's writer used to start at 1 again,
-        # so a definition, a root instance and a material could all carry
-        # pid 1: SketchUp loads such a file, renumbers the duplicates, and
-        # then fails to SAVE it (SUModelSaveToFile -> SU_ERROR_SERIALIZATION,
-        # "Guardado fallido" in SketchUp Web) once the model is big enough
-        # or a definition happens to come first - measured on real exports.
-        self._pid_start = struct.unpack_from("<I", data, _PID_COUNTER_POS)[0] + 1
+        # file, starting at the scaffold's own next-free-ID counter (u64 at
+        # _PID_COUNTER_POS, which is 18 in blank_v17.skp - verified via
+        # SUEntityGetPersistentID on SketchUp's C SDK).
+        self._pid_start = struct.unpack_from("<Q", data, _PID_COUNTER_POS)[0]
         self._material_writer = _ArchiveWriter(next_slot=base, class_slot={}, next_pid=self._pid_start)
         #: Every material registered so far, by name - populated by
         #: `add_material`/`add_texture_material` as a side effect (they
@@ -2463,6 +2676,55 @@ class SkpBuilder:
         self._new_entity_count = 0
         self._face_count = 0
         self._dim_font_slot: Optional[int] = None
+        self._document_options: Optional[DocumentOptions] = None
+        self._model_guid: Optional[bytes] = None
+
+    def set_document_options(
+        self,
+        options: Optional[DocumentOptions] = None,
+        *,
+        length_unit: int = 0,
+        length_precision: int = 3,
+        style_items: Optional[Dict[int, float]] = None,
+    ) -> None:
+        """Set decimal display units and working/saved style values without
+        scaling geometry."""
+        opts = (
+            DocumentOptions(
+                length_unit=options.length_unit,
+                length_precision=options.length_precision,
+                style_items=dict(options.style_items),
+            )
+            if options is not None
+            else DocumentOptions(
+                length_unit=length_unit,
+                length_precision=length_precision,
+                style_items=dict(style_items) if style_items is not None else {},
+            )
+        )
+        if (
+            isinstance(opts.length_unit, bool)
+            or isinstance(opts.length_precision, bool)
+            or not hasattr(opts.length_unit, "__index__")
+            or not hasattr(opts.length_precision, "__index__")
+            or not (0 <= opts.length_unit <= 5)
+            or not (0 <= opts.length_precision <= 6)
+        ):
+            raise SkpWriteError("invalid decimal display units or precision")
+        normalized_items: Dict[int, float] = {}
+        for k, raw_v in opts.style_items.items():
+            fv = float(raw_v)
+            if not math.isfinite(fv) or fv < -2_147_483_648.0 or fv > 4_294_967_295.0:
+                raise SkpWriteError("style scalar is out of range")
+            normalized_items[int(k)] = fv
+        opts.style_items = normalized_items
+        self._document_options = opts
+
+    def set_guid(self, guid: str) -> None:
+        """Set the file/model UUID (also its identity when imported as a
+        component). Accepts 32 hex digits or 8-4-4-4-12, case-insensitive;
+        empty generates a new UUID; invalid values raise :class:`SkpWriteError`."""
+        self._model_guid = _archive_uuid(guid)
 
     @contextlib.contextmanager
     def definitions(self) -> Iterator["SkpBuilder"]:
@@ -2541,6 +2803,7 @@ class SkpBuilder:
         applied_width: Optional[float] = None,
         applied_height: Optional[float] = None,
         opacity: Optional[float] = None,
+        filename: Optional[str] = None,
     ) -> int:
         """Register an image-textured material from a local PNG or JPEG
         file and return a handle to pass as `add_face`'s ``material``
@@ -2554,6 +2817,10 @@ class SkpBuilder:
         pins in tiles of the image regardless of it (`add_face` scales
         them by this size, since SketchUp stores and reads the per-face
         matrix in inches of texture space - see `_scale_pins`).
+
+        ``filename``, if given, overrides the stored ``CTexture`` path
+        (including ``""`` for a texture with no file name); ``None`` keeps
+        ``image_path``.
 
         The format is detected from the file's own magic bytes, not its
         extension - PNG and JPEG are the only two this project has
@@ -2575,8 +2842,9 @@ class SkpBuilder:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
         subtype = _detect_image_subtype(image_bytes)
+        stored_path = image_path if filename is None else filename
         slot = self._material_writer.write_textured_material(
-            name, image_bytes, image_path, subtype=subtype,
+            name, image_bytes, stored_path, subtype=subtype,
             applied_width=applied_width, applied_height=applied_height,
             opacity=opacity,
         )
@@ -2731,6 +2999,7 @@ class SkpBuilder:
         attribute_dicts: Sequence[Tuple[str, Dict[str, object]]] = (),
         always_faces_camera: bool = False,
         shadows_face_sun: bool = False,
+        guid: Optional[str] = None,
     ) -> "ComponentDefinitionBuilder":
         """Start a new reusable component definition. Use the returned
         object as a context manager, adding its geometry via `.add_face`
@@ -2761,9 +3030,11 @@ class SkpBuilder:
         several dictionaries at once - real SketchUp entities routinely
         carry more than one. Passing both raises.
         """
+        resolved_guid = _archive_uuid(guid)
         resolved_attribute_dicts = _resolve_attribute_dicts(attributes, attribute_dict_name, attribute_dicts)
         db = self._start_definition(name, "add_component_definition", attribute_dicts=resolved_attribute_dicts)
         db.behavior = (1 if always_faces_camera else 0) | (2 if shadows_face_sun else 0)
+        db._guid = resolved_guid
         return db
 
     def add_group(
@@ -2904,6 +3175,7 @@ class SkpBuilder:
         rotation: Optional[Tuple[Tuple[float, float, float], float]] = None,
         layer: Optional[int] = None,
         hidden: bool = False,
+        filename: Optional[str] = None,
     ) -> None:
         """Place a SketchUp Image entity (File > Import > Image) - a
         picture placed as its own object, distinct from painting a texture
@@ -2919,6 +3191,7 @@ class SkpBuilder:
         (matching every other `add_face` example in this file); rotate it
         to stand upright (e.g. on a wall) the same way you would any other
         placement. ``layer``, if given, is a handle from `add_layer`.
+        ``filename``, if given, overrides the stored ``CTexture`` path.
 
         >>> painting = builder.add_material  # (not used directly here)
         >>> builder.add_image("photo.jpg", width=48, height=36,
@@ -2948,7 +3221,9 @@ class SkpBuilder:
         this, and please report back what you find either way.
         """
         self._check_layer_handle(layer)
-        mat = self.add_texture_material(f"__openskp_image_{self._material_count}", image_path)
+        mat = self.add_texture_material(
+            f"__openskp_image_{self._material_count}", image_path, filename=filename
+        )
         with self.add_component_definition(f"Image{self._definition_count}") as image_def:
             # Standard (0,0)-at-bottom-left, V increasing upward - no
             # vertical flip. Every other UV-related fact in this file is
@@ -3351,7 +3626,12 @@ class SkpBuilder:
         _STYLE_OBJECT_TAIL_REL.
         """
         w = _ArchiveWriter(next_slot=first_slot, class_slot={}, next_pid=next_pid)
-        rendering = self._data[_RENDERING_OPTIONS_OFFSET:_RENDERING_OPTIONS_OFFSET + _RENDERING_OPTIONS_LEN]
+        # The scene carries its own copy of the rendering options, so it needs
+        # the document options set on the model too.
+        data = bytearray(self._data[: self._material_insert_pos])
+        if self._document_options is not None:
+            _patch_document_prefix(data, self._document_options)
+        rendering = bytes(data[_RENDERING_OPTIONS_OFFSET:_RENDERING_OPTIONS_OFFSET + _RENDERING_OPTIONS_LEN])
         shadow = tail[_PAGE_LIST_TAIL_REL - _SHADOW_INFO_LEN:_PAGE_LIST_TAIL_REL]
         style_object = tail[_STYLE_OBJECT_TAIL_REL:_STYLE_TAIL_REFS[0]]
         # The same guard _SCAFFOLD_SHA256 gives the other offsets, spelled out
@@ -3398,27 +3678,75 @@ class SkpBuilder:
         return _SceneBlock(bytes(w.buf), w.next_slot - first_slot, first_scene_slot,
                            style_slot, style_class_slot, w.next_pid)
 
-    def add_dimension(self, p1: Point3, p2: Point3, offset: float = 10.0) -> None:
-        """Add a FREE linear dimension between two explicit points (inches,
-        world space). ``offset`` is the dimension line's offset from the
-        measured segment, in inches (signed).
+    def _prepare_dimension(
+        self,
+        p1: Point3,
+        p2: Point3,
+        offset: Union[float, Point3] = _DEFAULT_OFFSET,
+        offset_vector: Optional[Point3] = None,
+    ) -> Tuple[Point3, Point3, Point3, Point3, float, bool]:
+        if offset_vector is not None and offset is not _DEFAULT_OFFSET:
+            raise SkpWriteError("pass either offset or offset_vector, not both")
+        if _is_offset_sequence(offset):
+            offset_vector = offset  # type: ignore[assignment]
+            scalar_offset = 0.0
+        else:
+            try:
+                scalar_offset = float(offset)  # type: ignore[arg-type]
+            except (TypeError, ValueError) as exc:
+                raise SkpWriteError(f"invalid dimension offset: {offset!r}") from exc
 
-        The record layout is the byte-exact one the REAL SketchUp SDK
-        writes for free dimensions (generated via SketchUpAPI and
-        harvested — see docs/dimension-record-notes.md): connection type 1
-        with the point stored inline in each connection block and null
-        object refs. Free dimensions render in any orientation; anchored
-        (type 2) dimensions are a future refinement.
-        """
-        self._ensure_geometry_writer()
-        w = self._geometry_writer
-        k1 = (float(p1[0]), float(p1[1]), float(p1[2]))
-        k2 = (float(p2[0]), float(p2[1]), float(p2[2]))
-        if k1 == k2:
-            raise SkpWriteError("add_dimension endpoints coincide")
+        k1 = _finite_point3(p1, "add_dimension")
+        k2 = _finite_point3(p2, "add_dimension")
+        if offset_vector is not None:
+            ov = _finite_point3(offset_vector, "add_dimension")
+            if k1 == k2:
+                raise SkpWriteError("add_dimension endpoints coincide")
+            dx, dy, dz = k2[0] - k1[0], k2[1] - k1[1], k2[2] - k1[2]
+            length = math.hypot(dx, dy, dz)
+            if not math.isfinite(length) or length == 0.0:
+                raise SkpWriteError("add_dimension segment length must be finite and nonzero")
+            xaxis = (dx / length, dy / length, dz / length)
+            nx = xaxis[1] * ov[2] - xaxis[2] * ov[1]
+            ny = xaxis[2] * ov[0] - xaxis[0] * ov[2]
+            nz = xaxis[0] * ov[1] - xaxis[1] * ov[0]
+            scalar_offset = math.hypot(nx, ny, nz)
+            if not math.isfinite(scalar_offset):
+                raise SkpWriteError("add_dimension offset must be finite")
+            if scalar_offset > 0.0:
+                normal = (nx / scalar_offset, ny / scalar_offset, nz / scalar_offset)
+            else:
+                seed = (0.0, 0.0, 1.0) if abs(xaxis[2]) < 0.9 else (0.0, 1.0, 0.0)
+                cx = xaxis[1] * seed[2] - xaxis[2] * seed[1]
+                cy = xaxis[2] * seed[0] - xaxis[0] * seed[2]
+                cz = xaxis[0] * seed[1] - xaxis[1] * seed[0]
+                clen = math.hypot(cx, cy, cz)
+                normal = (cx / clen, cy / clen, cz / clen)
+        else:
+            if not math.isfinite(scalar_offset):
+                raise SkpWriteError("add_dimension coordinates must be finite")
+            if k1 == k2:
+                raise SkpWriteError("add_dimension endpoints coincide")
+            normal = (0.0, 0.0, 1.0)
+            xaxis = (1.0, 0.0, 0.0)
+        return k1, k2, normal, xaxis, scalar_offset, offset_vector is not None
+
+    def _emit_dimension(
+        self,
+        w: _ArchiveWriter,
+        k1: Point3,
+        k2: Point3,
+        normal: Point3,
+        xaxis: Point3,
+        scalar_offset: float,
+        has_vector: bool,
+        *,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+    ) -> None:
         w._new_of_known_class("CDimensionLinear", schema=6)
         w._preamble()
-        w.buf += _DIM_DRAWBASE
+        w._drawbase(mat=0, layer=layer or 0, hidden=hidden)
         w._write_str("")                     # auto-computed measurement text
         if self._dim_font_slot is None:
             # one CSkFont per file, serialized INLINE at the first
@@ -3436,52 +3764,181 @@ class SkpBuilder:
         w.buf += bytes(10) + _u32(1) + _u32(4)
         w.buf += _f64(k2[0]) + _f64(k2[1]) + _f64(k2[2])
         w.buf += struct.pack("<H", 0)
-        # placement block: SDK free-dimension defaults + our offset
-        w.buf += bytes(2)
-        for val in (0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0):
+        # placement block: SDK free-dimension defaults or constrained plane + offset
+        w.buf += bytes(2) + _f64(0.0)
+        for val in (*normal, *xaxis):
             w.buf += _f64(val)
-        w.buf += _u32(0)
-        w.buf += _f64(float(offset)) + _f64(0.0) + _u32(1)
-        self._new_entity_count += 1
-        self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
+        w.buf += _u32(1 if has_vector else 0)
+        w.buf += _f64(scalar_offset) + _f64(0.0) + _u32(1)
 
-    def add_text(self, text: str, point: Point3,
-                 leader: Point3 = (15.0, 15.0, 15.0)) -> None:
-        """Add a leader text (SketchUp's Text tool) anchored at ``point``
-        (inches, world space), with the label floating at ``point +
-        leader`` and a leader line joining them.
+    def _prepare_text(
+        self,
+        text: str,
+        point: Point3,
+        leader: Point3 = (15.0, 15.0, 15.0),
+        leader_type: int = 2,
+        arrow_type: int = 3,
+        screen_position: Optional[Tuple[float, float]] = None,
+        display_leader: bool = True,
+    ) -> Tuple[str, Point3, Point3, Tuple[float, float], int, int, bool]:
+        if not isinstance(text, str):
+            raise SkpWriteError("add_text: text must be a str")
+        try:
+            encoded = text.encode("utf-16-le")
+        except UnicodeEncodeError as exc:
+            raise SkpWriteError("add_text: text contains an unpaired UTF-16 surrogate") from exc
+        if len(encoded) // 2 >= 0xFFFFFFFF:
+            raise SkpWriteError("string too long to encode")
+        p = _finite_point3(point, "add_text")
+        ld = _finite_point3(leader, "add_text")
+        lb = (p[0] + ld[0], p[1] + ld[1], p[2] + ld[2])
+        if not all(math.isfinite(c) for c in lb):
+            raise SkpWriteError("add_text coordinates must be finite")
+        if (
+            isinstance(leader_type, bool)
+            or not isinstance(leader_type, int)
+            or isinstance(arrow_type, bool)
+            or not isinstance(arrow_type, int)
+            or leader_type < 0
+            or leader_type > 2
+            or arrow_type < 0
+            or arrow_type > 4
+        ):
+            raise SkpWriteError("add_text invalid leader or arrow type")
+        screen = (0.0, 0.0)
+        if screen_position is not None:
+            if isinstance(screen_position, (str, bytes, bytearray)):
+                raise SkpWriteError("add_text screen_position must have 2 elements")
+            try:
+                sp_items = tuple(screen_position)
+            except TypeError as exc:
+                raise SkpWriteError("add_text screen_position must have 2 elements") from exc
+            if len(sp_items) != 2:
+                raise SkpWriteError(f"add_text screen_position must have 2 elements, got {len(sp_items)}")
+            try:
+                sx, sy = float(sp_items[0]), float(sp_items[1])
+            except (TypeError, ValueError) as exc:
+                raise SkpWriteError("add_text screen position must be numeric") from exc
+            if not (math.isfinite(sx) and math.isfinite(sy) and 0.0 <= sx <= 1.0 and 0.0 <= sy <= 1.0):
+                raise SkpWriteError("add_text screen position must be between zero and one")
+            screen = (sx, sy)
+        eff_leader_type = (
+            0 if screen_position is not None else (2 if leader_type == 0 else leader_type)
+        )
+        eff_display_leader = bool(
+            display_leader and (screen_position is not None or leader_type != 0)
+        )
+        return text, p, lb, screen, eff_leader_type, arrow_type, eff_display_leader
 
-        The record mirrors human-drawn leader texts harvested from real
-        files (the SDK's own create only produces SCREEN texts — its
-        two 0.5 doubles are screen fractions and SketchUp renders them
-        superimposed at view centre): screen slot zeroed, the free-
-        connection block dimensions use ([u32 1][u32 4][point3d]), the
-        label's world position in the placement tail, and leader type 2
-        (pushpin) before the arrow delimiter.
-        """
-        self._ensure_geometry_writer()
-        w = self._geometry_writer
-        p = (float(point[0]), float(point[1]), float(point[2]))
-        lb = tuple(p[i] + float(leader[i]) for i in range(3))
+    def _emit_text(
+        self,
+        w: _ArchiveWriter,
+        text: str,
+        p: Point3,
+        lb: Point3,
+        screen: Tuple[float, float],
+        eff_leader_type: int,
+        arrow_type: int,
+        eff_display_leader: bool,
+        *,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+    ) -> None:
         w._new_of_known_class("CText", schema=9)
         w._preamble()
-        w.buf += _DIM_DRAWBASE
+        w._drawbase(mat=0, layer=layer or 0, hidden=hidden)
         if self._dim_font_slot is None:
             self._dim_font_slot = w._new_of_known_class("CSkFont", schema=1)
             w.buf += _DIM_FONT_PAYLOAD
         else:
             w._backref(self._dim_font_slot)
-        w.buf += _f64(0.0) + _f64(0.0)       # screen-fraction slot (unused)
-        w.buf += _u32(1) + _u32(4)           # free connection + constant
+        w.buf += _f64(screen[0]) + _f64(screen[1])
+        w.buf += _u32(1) + _u32(4)
         w.buf += _f64(p[0]) + _f64(p[1]) + _f64(p[2])
         w.buf += bytes(12)
-        w.buf += _f64(lb[0]) + _f64(lb[1]) + _f64(lb[2])   # label position
+        w.buf += _f64(lb[0]) + _f64(lb[1]) + _f64(lb[2])
         w.buf += bytes(16)
         w.buf += _f64(1.0)
-        w.buf += _u32(2)                     # leader type: pushpin
-        w.buf += _TEXT_DELIM
+        w.buf += _u32(eff_leader_type)
+        w.buf += _u32(1) + struct.pack("<H", 1) + _u32(arrow_type) + bytes([1 if eff_display_leader else 0])
         w._write_str(text)
         w.buf += bytes(5)
+
+    def _write_text(
+        self,
+        w: _ArchiveWriter,
+        text: str,
+        point: Point3,
+        leader: Point3 = (15.0, 15.0, 15.0),
+        layer: Optional[int] = None,
+        hidden: bool = False,
+        leader_type: int = 2,
+        arrow_type: int = 3,
+        screen_position: Optional[Tuple[float, float]] = None,
+        display_leader: bool = True,
+    ) -> None:
+        prepared = self._prepare_text(
+            text,
+            point,
+            leader=leader,
+            leader_type=leader_type,
+            arrow_type=arrow_type,
+            screen_position=screen_position,
+            display_leader=display_leader,
+        )
+        self._emit_text(w, *prepared, layer=layer, hidden=hidden)
+
+    def add_dimension(
+        self,
+        p1: Point3,
+        p2: Point3,
+        offset: Union[float, Point3] = _DEFAULT_OFFSET,
+        *,
+        offset_vector: Optional[Point3] = None,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+    ) -> None:
+        """Add a FREE linear dimension between two explicit points (inches,
+        world space). ``offset`` is either a signed scalar distance in inches
+        or a 3D offset vector (whose component perpendicular to ``p1 -> p2``
+        determines the plane and side of the dimension line); ``offset_vector``
+        can also be passed by keyword.
+        """
+        self._check_layer_handle(layer)
+        prepared = self._prepare_dimension(p1, p2, offset=offset, offset_vector=offset_vector)
+        self._ensure_geometry_writer()
+        self._emit_dimension(self._geometry_writer, *prepared, layer=layer, hidden=hidden)
+        self._new_entity_count += 1
+        self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
+
+    def add_text(
+        self,
+        text: str,
+        point: Point3,
+        leader: Point3 = (15.0, 15.0, 15.0),
+        *,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+        leader_type: int = 2,
+        arrow_type: int = 3,
+        screen_position: Optional[Tuple[float, float]] = None,
+        display_leader: bool = True,
+    ) -> None:
+        """Add a leader or screen text anchored at ``point`` (inches, world
+        space), with the label floating at ``point + leader`` and a leader
+        line joining them."""
+        self._check_layer_handle(layer)
+        prepared = self._prepare_text(
+            text,
+            point,
+            leader=leader,
+            leader_type=leader_type,
+            arrow_type=arrow_type,
+            screen_position=screen_position,
+            display_leader=display_leader,
+        )
+        self._ensure_geometry_writer()
+        self._emit_text(self._geometry_writer, *prepared, layer=layer, hidden=hidden)
         self._new_entity_count += 1
         self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
 
@@ -3489,6 +3946,8 @@ class SkpBuilder:
         self, point: Point3,
         point2: Optional[Point3] = None,
         direction: Optional[Point3] = None,
+        layer: Optional[int] = None,
+        hidden: bool = False,
     ) -> None:
         """Add a construction/guide line (SketchUp's Construction Line
         tool). Pass exactly one of ``point2`` (a bounded segment between
@@ -3515,36 +3974,25 @@ class SkpBuilder:
         this one - real SketchUp rejected the result as an unrecognized
         file).
         """
+        self._check_layer_handle(layer)
+        p, dirv, start_param, end_param = _resolve_construction_line_params(point, point2, direction)
         self._ensure_geometry_writer()
         w = self._geometry_writer
-        p = (float(point[0]), float(point[1]), float(point[2]))
-        if (point2 is None) == (direction is None):
-            raise SkpWriteError("add_construction_line: pass exactly one of point2 or direction")
-        if point2 is not None:
-            p2 = (float(point2[0]), float(point2[1]), float(point2[2]))
-            dx, dy, dz = p2[0] - p[0], p2[1] - p[1], p2[2] - p[2]
-            length = math.sqrt(dx * dx + dy * dy + dz * dz)
-            if length == 0.0:
-                raise SkpWriteError("add_construction_line: point and point2 coincide")
-            dirv = (dx / length, dy / length, dz / length)
-            start_param, end_param = 0.0, length
-        else:
-            d = (float(direction[0]), float(direction[1]), float(direction[2]))
-            dlen = math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2])
-            if dlen == 0.0:
-                raise SkpWriteError("add_construction_line: direction must be nonzero")
-            dirv = (d[0] / dlen, d[1] / dlen, d[2] / dlen)
-            start_param, end_param = -_CLINE_INFINITE, _CLINE_INFINITE
         w._new_of_known_class("CConstructionLine", schema=1)
         w._preamble()
-        w.buf += _DIM_DRAWBASE
+        w._drawbase(layer=layer or 0, hidden=hidden)
         for v in (p[0], p[1], p[2], dirv[0], dirv[1], dirv[2], start_param, end_param):
             w.buf += _f64(v)
         w.buf += bytes(4)  # trailer - see docstring
         self._new_entity_count += 1
         self._face_count += 1  # reuses the "at least one root entity" check in to_bytes
 
-    def add_construction_point(self, position: Point3) -> None:
+    def add_construction_point(
+        self,
+        position: Point3,
+        layer: Optional[int] = None,
+        hidden: bool = False,
+    ) -> None:
         """Add a construction/guide point (SketchUp's Construction Point
         tool) at ``position`` (inches, world space).
 
@@ -3554,12 +4002,13 @@ class SkpBuilder:
         ``Sketchup::ConstructionPoint`` property exists to name them
         after), written as zero to match every real-file sample seen.
         """
+        self._check_layer_handle(layer)
+        p = _finite_point3(position, "add_construction_point")
         self._ensure_geometry_writer()
         w = self._geometry_writer
-        p = (float(position[0]), float(position[1]), float(position[2]))
         w._new_of_known_class("CConstructionPoint", schema=0)
         w._preamble()
-        w.buf += _DIM_DRAWBASE
+        w._drawbase(layer=layer or 0, hidden=hidden)
         for v in (p[0], p[1], p[2], 0.0, 0.0, 0.0):
             w.buf += _f64(v)
         w.buf += bytes(1)
@@ -3627,6 +4076,9 @@ class SkpBuilder:
         scenes = None
         if self._scenes:
             patched_tail = bytearray(self._data[self._tail_pos :])
+            if self._document_options is not None:
+                _patch_style_items(patched_tail, 4070 - self._tail_pos, self._document_options)
+                _patch_style_items(patched_tail, 4951 - self._tail_pos, self._document_options)
             for pos, patch in _ISO_CAMERA_TAIL_PATCHES:
                 patched_tail[pos : pos + len(patch)] = patch
             scenes = self._write_scenes(self._scaffold_next_slot + total_tail_shift,
@@ -3642,12 +4094,15 @@ class SkpBuilder:
         # authored files (an earlier version of this method double-counted
         # this field as a fresh insertion, corrupting every offset after it).
         prefix = bytearray(self._data[: self._material_insert_pos - 4])
-        # The model's pid counter: the last pid handed out, in every
-        # section. A 32-bit field (the two bytes after the old u16 are part
-        # of it - a counter of 2 000 000 round-trips through the SDK), so a
-        # model with more than 65 535 entities keeps a truthful counter.
-        last_pid = (scenes.next_pid if scenes else self._next_pid()) - 1
-        struct.pack_into("<I", prefix, _PID_COUNTER_POS, last_pid)
+        if self._model_guid is not None:
+            prefix[52:68] = self._model_guid
+        if self._document_options is not None:
+            _patch_document_prefix(prefix, self._document_options)
+        # The model's 64-bit next-persistent-ID counter: the next unused pid
+        # after every section has allocated its entities (verified against
+        # SketchUp's C SDK: 18 in blank_v17.skp, 27 after one 9-pid quad face).
+        next_pid = scenes.next_pid if scenes else self._next_pid()
+        struct.pack_into("<Q", prefix, _PID_COUNTER_POS, next_pid)
         prefix[_ISO_CAMERA_PREFIX_OFFSET : _ISO_CAMERA_PREFIX_OFFSET + len(_ISO_CAMERA_PREFIX_PATCH)] = (
             _ISO_CAMERA_PREFIX_PATCH
         )
@@ -3686,6 +4141,9 @@ class SkpBuilder:
         out += self._geometry_writer.buf
 
         tail = bytearray(self._data[self._tail_pos :])
+        if self._document_options is not None:
+            _patch_style_items(tail, 4070 - self._tail_pos, self._document_options)
+            _patch_style_items(tail, 4951 - self._tail_pos, self._document_options)
         # _TAIL_REF_POSITIONS and _ISO_CAMERA_TAIL_PATCHES's positions both
         # index into this same tail buffer. A ref-shift that widens to the
         # 6-byte escape form (see _shift_ref) grows the buffer at that

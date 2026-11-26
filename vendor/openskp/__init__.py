@@ -17,10 +17,11 @@ Example::
 
 from __future__ import annotations
 
+import logging
 from importlib.metadata import PackageNotFoundError, version as _version
 
 from .codegen import to_python_code
-from .create import ComponentDefinitionBuilder, SkpBuilder, SkpWriteError, create
+from .create import ComponentDefinitionBuilder, DocumentOptions, SkpBuilder, SkpWriteError, create
 from .edit import open_existing
 from .errors import SkpParseError
 from .instanced_scene import (
@@ -34,6 +35,8 @@ from .instanced_scene import (
 )
 from .model import ArcCurve, SkpFile, SkpModel, loose_edge_runs
 from .scene import Scene, InstanceNode, MeshMetadata, GlbPrimitive, SceneTexture
+
+logging.getLogger("openskp").addHandler(logging.NullHandler())
 
 try:
     __version__: str = _version("openskp")
@@ -57,6 +60,7 @@ __all__: list[str] = [
     "SceneBounds",
     "SkpParseError",
     "create",
+    "DocumentOptions",
     "SkpBuilder",
     "ComponentDefinitionBuilder",
     "SkpWriteError",
@@ -75,8 +79,11 @@ def main() -> None:
     """
     import sys
 
+    if sys.argv[1:2] in (["-h"], ["--help"]):
+        print("usage: openskp [--version] [FILE.skp]")
+        return
     print(f"openskp {__version__}")
-    if len(sys.argv) > 1:
+    if len(sys.argv) > 1 and sys.argv[1] != "--version":
         filepath = sys.argv[1]
         try:
             skp = SkpFile.open(filepath)
