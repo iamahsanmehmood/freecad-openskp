@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-26
+
 - fix: fold the instance matrix's scale term into placements (#19)
 - feat: import SketchUp's component hierarchy (#20)
 - feat: option to make closed components solid (#23)
